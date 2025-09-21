@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+venv.bak/
+venv.old/
+
+# IDEs and editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# Dependencies
+node_modules/
+/frontend/node_modules
+
+# Build artifacts
+build/
+dist/
+/frontend/dist
+/static/react
+
+# Logs and databases
+*.log
+*.sqlite3
+*.db
+faiss_index.bin
+builderror.txt
+
+# Media
+tts_output.mp3
+
+# Environment variables
+.env
+nova.env
+
+# Large directories
+llama-gpu/
+models/
+CodeBase Backups/
+Old SolaceHomeUIv3/
+journal/
+knowledge base/

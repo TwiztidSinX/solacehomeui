@@ -1,0 +1,17 @@
+[
+  {
+    "task": "Organize logs by date",
+    "category": "System Maintenance",
+    "completed": true
+  },
+  {
+    "task": "Write a new sleep line",
+    "category": "Solace",
+    "completed": false
+  },
+  {
+    "task": "Read all chat history, with Tim and add notes to journal.",
+    "category": "Solace",
+    "completed": false
+  }
+]

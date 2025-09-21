@@ -1,0 +1,36 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "web_search",
+      "description": "Searches the web for information on a given query.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "The search query."
+          }
+        },
+        "required": ["query"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "ask_supervisor_for_help",
+      "description": "Asks a supervisor AI for help when you are uncertain or need to perform a web search.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "The user's original query that you need help with."
+          }
+        },
+        "required": ["query"]
+      }
+    }
+  }
+]
