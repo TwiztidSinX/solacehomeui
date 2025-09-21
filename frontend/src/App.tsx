@@ -465,13 +465,17 @@ const App: React.FC = () => {
       return;
     }
 
-    let payload: any = {
+    // Determine thinking mode based on the thinking level.
+    const thinkingLevel = modelConfigOptions.thinking_level || 'none';
+    const thinkingMode = thinkingLevel !== 'none';
+
+    const payload: any = {
       model_path: selectedModel,
       backend: currentBackend,
       system_prompt: systemPrompt,
-      ...modelConfigOptions,
-      thinking_mode: modelConfigOptions.thinking_mode,
-      thinking_level: modelConfigOptions.thinking_level,
+      ...modelConfigOptions, // Spread all options from the state
+      thinking_mode: thinkingMode, // Send the derived boolean
+      thinking_level: thinkingLevel, // Send the selected level
     };
 
     if (currentBackend === 'api') {

@@ -284,34 +284,19 @@ def handle_set_backend(data):
 
 def load_model_task(data, sid):
     """Background task to load a model without blocking."""
-    global current_model, current_model_path_string
+    global current_model, current_model_path_string, current_backend
     with model_lock:
         try:
             if current_model:
-                unload_model(current_model_path_string)
+                unload_model(current_model_path_string, backend=current_backend)
             
-            model_path = data['model_path']
-            provider = data.get('provider') if data.get('backend') == 'api' else None
+            # The 'data' dictionary from the frontend now contains all necessary arguments.
+            # We can pass it directly using the **kwargs syntax.
+            current_model = load_model(**data)
             
-            # Load the model into memory for the current session
-            current_model = load_model(
-                model_path=model_path,
-                backend=data.get('backend', 'llama.cpp'),
-                provider=provider,
-                context_tokens=data.get('context_tokens', 8192),
-                temperature=data.get('temperature', 0.7),
-                gpu_layers=data.get('gpuLayers', 35),
-                system_prompt=data.get('system_prompt', "You are a helpful AI assistant."),
-                quantization=data.get('quantization', 'none'),
-                kv_cache_quant=data.get('kv_cache_quant', 'fp16'),
-                thinking_mode=data.get('thinking_mode', False),
-                device_map=data.get('device_map', 'auto'),
-                torch_dtype=data.get('torch_dtype', 'float16')
-            )
-            current_model_path_string = model_path
+            current_model_path_string = data['model_path']
             
-            # Do NOT save the config here. Only emit that the model is loaded.
-            socketio.emit('model_loaded', {'model': model_path}, room=sid)
+            socketio.emit('model_loaded', {'model': data['model_path']}, room=sid)
         except Exception as e:
             socketio.emit('error', {'message': f"Load failed: {str(e)}"}, room=sid)
             import traceback

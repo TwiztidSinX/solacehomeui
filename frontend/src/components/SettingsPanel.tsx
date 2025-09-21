@@ -141,27 +141,19 @@ const SettingsPanel: React.FC<SettingsPanelProps> = (props) => {
               placeholder="35"
             />
 
-            <label className="block mt-2">KV Cache Quantization</label>
+            <label className="block mt-2">Thinking Level</label>
             <select
-              value={modelConfigOptions.kv_cache_quant || 'fp16'}
+              value={modelConfigOptions.thinking_level || 'none'}
               onChange={(e) =>
-                onModelConfigChange('kv_cache_quant', e.target.value)
+                onModelConfigChange('thinking_level', e.target.value)
               }
               className="w-full p-2 rounded inputfield-background"
             >
-              <option value="fp16">FP16</option>
-              <option value="int8">INT8</option>
-              <option value="int4">INT4</option>
+              <option value="none">None</option>
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
             </select>
-            <label className="block mt-2">Thinking Mode</label>
-            <input
-              type="checkbox"
-              checked={modelConfigOptions.thinking_mode || false}
-              onChange={(e) =>
-                onModelConfigChange('thinking_mode', e.target.checked)
-              }
-              className="form-checkbox h-5 w-5 text-blue-500"
-            />
           </>
         );
 
@@ -224,19 +216,6 @@ const SettingsPanel: React.FC<SettingsPanelProps> = (props) => {
 
             {currentBackend === 'safetensors' && (
               <>
-                <label className="block mt-2">Thinking Level</label>
-                <select
-                  value={modelConfigOptions.thinking_level || 'medium'}
-                  onChange={(e) =>
-                    onModelConfigChange('thinking_level', e.target.value)
-                  }
-                  className="w-full p-2 rounded inputfield-background"
-                >
-                  <option value="low">Low</option>
-                  <option value="medium">Medium</option>
-                  <option value="high">High</option>
-                </select>
-
                 <label className="block mt-2">Use Flash Attention</label>
                 <input
                   type="checkbox"
@@ -274,18 +253,27 @@ const SettingsPanel: React.FC<SettingsPanelProps> = (props) => {
                 </select>
               </>
             )}
+            
+            {(currentBackend === 'ollama' || currentBackend === 'safetensors') && (
+                 <>
+                    <label className="block mt-2">Thinking Level</label>
+                    <select
+                      value={modelConfigOptions.thinking_level || 'none'}
+                      onChange={(e) =>
+                        onModelConfigChange('thinking_level', e.target.value)
+                      }
+                      className="w-full p-2 rounded inputfield-background"
+                    >
+                      <option value="none">None</option>
+                      <option value="low">Low</option>
+                      <option value="medium">Medium</option>
+                      <option value="high">High</option>
+                    </select>
+                 </>
+            )}
 
             {currentBackend === 'ollama' && (
               <>
-                <label className="block mt-2">Thinking Mode</label>
-                <input
-                  type="checkbox"
-                  checked={modelConfigOptions.thinking_mode || false}
-                  onChange={(e) =>
-                    onModelConfigChange('thinking_mode', e.target.checked)
-                  }
-                  className="form-checkbox h-5 w-5 text-blue-500"
-                />
                 <div className="setting-section mt-4">
                   <h3 className="text-lg font-semibold mb-2">Ollama Server</h3>
                   <div className="mb-4">

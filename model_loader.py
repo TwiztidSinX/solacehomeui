@@ -24,7 +24,23 @@ model_load_times = {}
 models_lock = Lock()
 current_backend = "llama.cpp" # or "ollama"
 
-def load_model(model_path, backend="llama.cpp", context_tokens=2048, gpu_layers=0, temperature=0.7, system_prompt="", provider=None, quantization='none', kv_cache_quant='fp16', **kwargs):
+def load_model(
+    model_path, 
+    backend="llama.cpp", 
+    context_tokens=2048, 
+    gpu_layers=0, 
+    temperature=0.7, 
+    system_prompt="", 
+    provider=None, 
+    quantization='none', 
+    kv_cache_quant='fp16',
+    use_flash_attention=False,
+    torch_dtype='auto',
+    thinking_mode=False,
+    thinking_level='medium',
+    device_map='auto',
+    **kwargs # Catch any other unused params
+):
     global models, model_states, current_backend
     with models_lock:
         try:
@@ -45,7 +61,8 @@ def load_model(model_path, backend="llama.cpp", context_tokens=2048, gpu_layers=
             # Store system prompt in model state
             model_states[model_id] = {
                 'status': 'active',
-                'system_prompt': system_prompt or "You are a helpful AI assistant."
+                'system_prompt': system_prompt or "You are a helpful AI assistant.",
+                'context_tokens': context_tokens
             }
 
             print(f"🟢 LOADING MODEL: {model_id} with backend {backend} and provider {provider}")
@@ -103,71 +120,41 @@ def load_model(model_path, backend="llama.cpp", context_tokens=2048, gpu_layers=
 
             elif backend == "safetensors":
                 try:
-                    from transformers import AutoTokenizer, TextStreamer, AutoProcessor, AutoModelForCausalLM, TextIteratorStreamer
-                    from qwen_omni_utils import process_mm_info # Ensure this is available
+                    from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer, BitsAndBytesConfig
                     import torch
                     
                     model_dir = model_path
-                    is_omni_model = 'qwen2.5-omni' in model_dir.lower()
+                    
+                    # --- The Correct, Proven Configuration ---
+                    # Derived from the working multimodal.py
+                    
+                    # 1. Define the compute dtype
+                    compute_dtype = torch.bfloat16
 
-                    if is_omni_model:
-                        from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
-                        print("✨ Detected Qwen 2.5 Omni model. Using specialized loader.")
-                        
-                        processor = Qwen2_5OmniProcessor.from_pretrained(model_dir)
-                        model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
-                            model_dir,
-                            torch_dtype="auto",
-                            device_map="auto",
-                            load_in_4bit=True # Assuming 4-bit for Omni as per old config
-                        )
-                        streamer = TextIteratorStreamer(processor.tokenizer, skip_prompt=True, skip_special_tokens=True)
-                        models[model_id] = (model, processor.tokenizer, streamer, processor)
+                    # 2. Create the precise BitsAndBytesConfig
+                    quantization_config = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_compute_dtype=compute_dtype,
+                        bnb_4bit_use_double_quant=True,
+                    )
+                    print("✅ Applying 4-bit quantization with bfloat16 compute dtype.")
 
-                    else:
-                        # --- Fallback for other SafeTensors models ---
-                        config_path = os.path.join(BASE_DIR, "config.json")
-                        with open(config_path, "r") as f:
-                            all_configs = json.load(f)
-                        model_config = all_configs.get(model_dir, {})
-                        
-                        quantization = model_config.get('quantization', 'none')
-                        torch_dtype_str = model_config.get('torch_dtype', 'float16')
-                        torch_dtype = getattr(torch, torch_dtype_str, torch.float16)
-                        load_in_4bit = (quantization == '4bit')
-                        load_in_8bit = (quantization == '8bit')
-                        use_flash_attention = model_config.get('use_flash_attention', False)
-                        
-                        quantization_config = None
-                        if load_in_4bit:
-                            from transformers import BitsAndBytesConfig
-                            quantization_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch_dtype)
-                        elif load_in_8bit:
-                            from transformers import BitsAndBytesConfig
-                            quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+                    # 3. Load the model with the master dtype and the quantization config
+                    tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+                    
+                    model = AutoModelForCausalLM.from_pretrained(
+                        model_dir,
+                        device_map="auto",
+                        torch_dtype=compute_dtype, # Master dtype switch
+                        quantization_config=quantization_config, # The detailed instructions
+                        trust_remote_code=True
+                    )
+                    
+                    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+                    models[model_id] = (model, tokenizer, streamer, None) 
 
-                        print(f"🔄 Loading generic SafeTensors model from {model_dir}")
-                        processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
-                        tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
-                        
-                        model_kwargs = {
-                            "torch_dtype": torch_dtype,
-                            "device_map": "auto",
-                            "quantization_config": quantization_config,
-                            "trust_remote_code": True
-                        }
-                        if use_flash_attention:
-                            model_kwargs["attn_implementation"] = "flash_attention_2"
-                            print("⚡ Using Flash Attention 2")
-
-                        model = AutoModelForCausalLM.from_pretrained(
-                            model_dir,
-                            **model_kwargs
-                        )
-                        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-                        models[model_id] = (model, tokenizer, streamer, processor)
-
-                    print(f"✅ SafeTensors model loaded successfully!")
+                    print(f"✅ SafeTensors model loaded successfully and correctly quantized!")
                     return models[model_id]
                 except Exception as e:
                     print(f"🔴 SafeTensors load error: {str(e)}")
@@ -900,7 +887,6 @@ Provide the user's original query to the supervisor so it can perform the necess
 
 def stream_ollama(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None, timezone='UTC'):
     try:
-        import re
         from datetime import datetime
         memory_context = get_context_for_model(user_input, model_id=model_id_str)
         system_prompt = model_states.get(model_id_str, {}).get("system_prompt", "You are a helpful AI assistant.")
@@ -912,17 +898,12 @@ def stream_ollama(model_instance, model_id_str, user_input, conversation_history
         system_prompt_with_time = f"{time_message}\n\n{system_prompt}"
 
         messages = build_ollama_prompt_messages(user_input, conversation_history, memory_context, system_prompt_with_time, image_data)
+        messages = manage_context_window(messages, 8192 - 1024)
 
-        # Manage the context window to prevent overflow
-        # Note: Ollama's context is managed by the server, but we can still be proactive
-        messages = manage_context_window(messages, 8192 - 1024) # Assume 8k context, reserve 1k
-
-        # --- DEBUGGING ---
         print("\n--- OLLAMA PROMPT DEBUG ---")
         import json
         print(json.dumps(messages, indent=2))
         print("---------------------------\n")
-        # --- END DEBUGGING ---
 
         stream = ollama._client.chat(
             model=model_instance,
@@ -930,35 +911,16 @@ def stream_ollama(model_instance, model_id_str, user_input, conversation_history
             stream=True
         )
 
-        state = 'reply'
-        accumulated_buffer = ""
+        # Simplified streaming logic
         for chunk in stream:
             if should_stop():
                 yield {'type': 'reply', 'token': "\n[Generation stopped by user]"}
                 break
 
             token = chunk['message']['content']
-            if not token:
-                continue
-
-            accumulated_buffer += token
-            parts = re.split(r'(<think>|<\/think>)', accumulated_buffer)
-
-            accumulated_buffer = parts[-1]
-            processable_parts = parts[:-1]
-
-            for part in processable_parts:
-                if not part:
-                    continue
-                if part == '<think>':
-                    state = 'thought'
-                elif part == '</think>':
-                    state = 'reply'
-                else:
-                    yield {'type': state, 'token': part}
-
-        if accumulated_buffer:
-            yield {'type': state, 'token': accumulated_buffer}
+            if token:
+                # Yield each token immediately as a 'reply'
+                yield {'type': 'reply', 'token': token}
 
     except Exception as e:
         import traceback
@@ -1236,17 +1198,14 @@ def stream_openai_compatible(model_instance, model_id_str, user_input, conversat
 def stream_safetensors(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None, timezone='UTC'):
     """Universal streaming for ALL safetensors models, now with vision support."""
     try:
-        import re
         from transformers import TextIteratorStreamer
         from threading import Thread
         from PIL import Image
         import io
         import base64
-        import torch
         from datetime import datetime
         from qwen_omni_utils import process_mm_info
 
-        # --- 1. Unpack Model and Processor ---
         if len(model_instance) == 4:
             model, tokenizer, _, processor = model_instance
         elif len(model_instance) == 3:
@@ -1255,95 +1214,48 @@ def stream_safetensors(model_instance, model_id_str, user_input, conversation_hi
         else:
             raise ValueError("Invalid model_instance tuple size")
 
-        # --- 2. Get Context and Build Conversation ---
         memory_context = get_context_for_model(user_input, model_id=model_id_str)
         system_prompt = model_states.get(model_id_str, {}).get("system_prompt", "You are a helpful AI assistant.")
         now = datetime.now()
         time_message = f"System Time: {now.strftime('%Y-%m-%d %H:%M:%S')} (Timezone: {timezone})"
-        
         system_prompt_with_time = f"{time_message}\n\n{system_prompt}"
 
-        conversation = [
-            {"role": "system", "content": [{"type": "text", "text": f"{system_prompt_with_time}\nRelevant Memories:\n{memory_context}"}]}
-        ]
+        conversation = [{"role": "system", "content": [{"type": "text", "text": f"{system_prompt_with_time}\nRelevant Memories:\n{memory_context}"}]}]
         conversation.extend(conversation_history)
+        # Get the correct context window size for this model
+        model_context_window = model_states.get(model_id_str, {}).get('context_tokens', 8192)
+        # Reserve 1k tokens for the response
+        conversation = manage_context_window(conversation, model_context_window - 1024)
 
-        # Manage the context window to prevent overflow
-        conversation = manage_context_window(conversation, 8192 - 1024) # Assume 8k context, reserve 1k
-
-        # --- 3. Prepare Multimodal Inputs (if applicable) ---
         if image_data and processor:
             try:
-                # The last message in the history is the current user's message
                 current_user_message = conversation[-1]
-                
-                # Decode the base64 image
                 image_bytes = base64.b64decode(image_data)
                 pil_image = Image.open(io.BytesIO(image_bytes))
-
-                # Reconstruct the user's message content in the Qwen Omni format
-                current_user_message['content'] = [
-                    {"type": "text", "text": current_user_message['content']},
-                    {"type": "image", "image": pil_image}
-                ]
-                
-                # Apply the chat template to the whole conversation
+                current_user_message['content'] = [{"type": "text", "text": current_user_message['content']}, {"type": "image", "image": pil_image}]
                 text_prompt = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
-                
-                # Use the official utility to process multimodal info
-                audios, images, videos = process_mm_info(conversation, use_audio_in_video=False)
-                
-                # Use the processor to prepare both text and image
+                _, images, _ = process_mm_info(conversation, use_audio_in_video=False)
                 inputs = processor(text=text_prompt, images=images, return_tensors="pt").to(model.device)
-
             except Exception as e:
                 yield {'type': 'error', 'token': f"[ERROR processing image: {e}]"}
                 return
         else:
-            # For text-only, build the prompt and tokenize
             model_family = detect_safetensors_model_family(model_id_str)
-            prompt = build_safetensors_prompt(
-                user_input, conversation_history, memory_context, system_prompt_with_time, model_family
-            )
+            prompt = build_safetensors_prompt(user_input, conversation_history, memory_context, system_prompt_with_time, model_family)
             inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
-        # --- 4. Generate Response ---
         streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-        generation_kwargs = {
-            **inputs,
-            "streamer": streamer,
-            "max_new_tokens": 4096,
-            "temperature": 0.7,
-            "do_sample": True,
-            "pad_token_id": tokenizer.eos_token_id,
-        }
-
+        generation_kwargs = {**inputs, "streamer": streamer, "max_new_tokens": 4096, "temperature": 0.7, "do_sample": True, "pad_token_id": tokenizer.eos_token_id}
         thread = Thread(target=model.generate, kwargs=generation_kwargs)
         thread.start()
 
-        # --- 5. Yield Tokens ---
-        state = 'reply'
-        accumulated_buffer = ""
         for token in streamer:
             if should_stop():
                 yield {'type': 'reply', 'token': "\n[Generation stopped by user]"}
                 break
-            
-            accumulated_buffer += token
-            parts = re.split(r'(<think>|<\/think>)', accumulated_buffer)
-            
-            accumulated_buffer = parts[-1]
-            processable_parts = parts[:-1]
-
-            for part in processable_parts:
-                if not part: continue
-                if part == '<think>': state = 'thought'
-                elif part == '</think>': state = 'reply'
-                else: yield {'type': state, 'token': part}
+            if token:
+                yield {'type': 'reply', 'token': token}
         
-        if accumulated_buffer:
-            yield {'type': state, 'token': accumulated_buffer}
-
         thread.join()
 
     except Exception as e:

@@ -1,0 +1,5 @@
+# Previous requirements...
+google-cloud-texttospeech
+google-cloud-speech
+fastapi
+uvicorn
