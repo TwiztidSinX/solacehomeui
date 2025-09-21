@@ -47,3 +47,9 @@ CodeBase Backups/
 Old SolaceHomeUIv3/
 journal/
 knowledge base/
+
+# User-specific text files
+TODO.txt
+NovaPrompt.txt
+SD Prompt info.txt
+templates/backup.txt
