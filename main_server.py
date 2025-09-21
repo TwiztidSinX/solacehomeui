@@ -25,11 +25,9 @@ from scipy.spatial import distance as ssd
 from bson.objectid import ObjectId
 from pymongo.errors import PyMongoError
 from sentence_transformers import SentenceTransformer
-
-from agent import simulate_responses, start_auto_loop_once, set_auto_agent_enabled, extract_intent_and_execute
 from model_loader import get_available_models, load_model, unload_model, stream_gpt
 from upgraded_memory_manager import memory_manager as memory, beliefs_manager as beliefs, db
-from orchestrator import load_orchestrator_model, should_perform_web_search, get_summary_for_title, parse_command
+from orchestrator import load_orchestrator_model, get_summary_for_title, parse_command
 
 # --- Database Setup for Chat History ---
 try:
@@ -228,6 +226,7 @@ def handle_connect():
         emit('models', {'backend': backend, 'models': models})
         emit('configs', model_configs)
         emit('backend_set', {'backend': backend})
+        emit('nova_settings_loaded', nova_settings) # Emit loaded settings
         if current_model_path_string:
             emit('model_loaded', {'model': current_model_path_string})
 
@@ -307,7 +306,13 @@ def handle_load_model(data):
     sid = request.sid
     # The backend is now sent with the request, ensuring the correct one is used.
     backend = data.get('backend', current_backend)
-    print(f"LOAD MODEL REQUEST: Using backend '{backend}'")
+    
+    # --- Hotfix for frontend parameter name mismatch ---
+    if 'gpuLayers' in data:
+        data['gpu_layers'] = data.pop('gpuLayers')
+    # --- End Hotfix ---
+
+    print(f"LOAD MODEL REQUEST: Using backend '{backend}' with data: {data}")
     socketio.start_background_task(load_model_task, data, sid)
 
 # --- New Chat History Socket.IO Handlers ---
@@ -472,7 +477,100 @@ def handle_save_message(data):
     if not _save_message_to_db(data.get('session_id'), data.get('message'), data.get('user_id', 'default_user')):
         emit('error', {'message': 'Could not save message: Session not found.'}, room=sid)
 
-# --- End New Handlers ---
+@socketio.on('chat')
+def handle_chat(data):
+    backend = data.get('backend', current_backend)
+    provider = data.get('provider')
+    timezone = data.get('timezone', 'UTC')
+    user_input = data.get('text', '')
+    
+    # --- Save User Message to DB ---
+    session_id = data.get('session_id')
+    if session_id:
+        user_message = {
+            "sender": data.get('userName', 'User'),
+            "message": user_input,
+            "type": "user",
+            "imageB64": data.get('image_base_64')
+        }
+        _save_message_to_db(session_id, user_message)
+
+    # --- Hybrid Orchestration Logic ---
+    # 1. Always check for slash commands first (instant)
+    command = parse_command(user_input)
+    if command:
+        query = command['query']
+        response_payload = {'type': 'error', 'message': f"Unknown command: {command['command']}"}
+        try:
+            # ... (existing command handling logic) ...
+            if command['command'] == 'search':
+                encoded_query = urllib.parse.quote(query)
+                search_url = f"http://localhost:8088/?q={encoded_query}"
+                response_payload = {'type': 'iframe', 'url': search_url, 'message': f"Searching for: `{query}`"}
+            
+            elif command['command'] == 'youtube':
+                encoded_query = urllib.parse.quote(f"!yt {query}")
+                search_url = f"http://localhost:8088/search?q={encoded_query}&format=json"
+                response = requests.get(search_url, timeout=10).json()
+                first_video = next((r for r in response.get('results', []) if 'youtube.com/watch' in r.get('url', '')), None)
+                if first_video:
+                    video_id = first_video['url'].split('v=')[1].split('&')[0]
+                    response_payload = {'type': 'youtube_embed', 'video_id': video_id, 'message': f"Here is the top YouTube result for `{query}`:"}
+                else:
+                    response_payload = {'type': 'error', 'message': f"No YouTube results found for '{query}'."}
+            
+            elif command['command'] == 'read':
+                response = requests.get(query, timeout=15).text
+                clean_text = re.sub(r'<style.*?>.*?</style>|<script.*?>.*?</script>|<!--.*?-->', '', response, flags=re.DOTALL)
+                clean_text = re.sub(r'<.*?>', ' ', clean_text)
+                clean_text = ' '.join(clean_text.split())
+                summary = summarize_text(clean_text[:8000])
+                response_payload = {'type': 'info', 'message': f"**Summary of {query}:**\n\n{summary}"}
+
+            elif command['command'] == 'calc':
+                answer = summarize_text(f"Calculate the following expression and provide only the numerical answer: {query}")
+                response_payload = {'type': 'info', 'message': f"`{query}` = **{answer}**"}
+
+        except requests.exceptions.RequestException as e:
+            response_payload = {'type': 'error', 'message': f"Command failed due to a network error: {e}"}
+        except Exception as e:
+            response_payload = {'type': 'error', 'message': f"An unexpected error occurred: {e}"}
+        
+        emit('command_response', response_payload)
+        if session_id:
+            _save_message_to_db(session_id, {"sender": "Nova", **response_payload, "type": "ai"})
+        return # Stop further processing
+
+    # 2. If no slash command, check for keywords (fast)
+    ORCHESTRATOR_KEYWORDS = [
+        "search", "what is", "who is", "how to", "current", "latest", 
+        "news", "weather", "price of", "stock", "define", "wiki", 
+        "map of", "look up", "find me"
+    ]
+    
+    should_orchestrate = any(keyword in user_input.lower() for keyword in ORCHESTRATOR_KEYWORDS)
+
+    if should_orchestrate:
+        tool_call = get_tool_call(user_input)
+        if tool_call:
+            # A tool was selected by the orchestrator
+            tool_name = tool_call.get("name")
+            tool_args = tool_call.get("arguments")
+            
+            # Execute the tool
+            tool_result = dispatch_tool(tool_name, tool_args)
+            
+            # Inject the result back into the conversation history for the main model
+            tool_result_message = f"--- Web Search Results ---\n{tool_result}\n--- End Web Search Results ---"
+            data['history'].insert(0, {'sender': 'User', 'message': tool_result_message, 'type': 'user'})
+
+    # 3. If neither, bypass orchestrator and go directly to the main model
+    if not current_model:
+        emit('error', {'message': 'No model loaded.'})
+        return
+    
+    sid = request.sid
+    socketio.start_background_task(stream_response, data, sid)
 
 def stream_response(data, sid):
     global stop_streaming
@@ -484,6 +582,17 @@ def stream_response(data, sid):
     timezone = data.get('timezone', 'UTC')
     session_id = data.get('session_id')
     in_thought_block = False
+
+    # --- Debug Mode ---
+    if data.get('debug_mode'):
+        print("\n--- DEBUG MODE: INCOMING PAYLOAD ---")
+        # Avoid printing massive base64 image strings
+        debug_data = {k: v for k, v in data.items() if k not in ['image_base_64']}
+        if data.get('image_base_64'):
+            debug_data['image_base_64'] = "Image data present (omitted for brevity)"
+        print(json.dumps(debug_data, indent=2))
+        print("-------------------------------------\n")
+    # --- End Debug Mode ---
 
     try:
         socketio.emit('stream_start', {}, room=sid)
@@ -504,7 +613,8 @@ def stream_response(data, sid):
                 conversation_history=data.get('history', []),
                 should_stop=lambda: stop_streaming,
                 backend=backend, provider=provider, image_data=data.get('image_base_64'),
-                timezone=timezone, tools=tools
+                timezone=timezone, tools=tools,
+                debug_mode=data.get('debug_mode', False)
             )
 
             tool_calls = []
@@ -543,7 +653,8 @@ def stream_response(data, sid):
                 conversation_history=data.get('history', []),
                 should_stop=lambda: stop_streaming,
                 backend=backend, provider=provider, image_data=data.get('image_base_64'),
-                timezone=timezone
+                timezone=timezone,
+                debug_mode=data.get('debug_mode', False)
             )
             for chunk in streamer:
                 chunk_type = chunk.get('type')
@@ -591,83 +702,6 @@ def stream_response(data, sid):
             memory.learn_from_text(data['text'], source="user", model_id=current_model_path_string)
         if full_response:
             memory.learn_from_text(full_response, source="nova", model_id=current_model_path_string)
-
-@socketio.on('chat')
-def handle_chat(data):
-    backend = data.get('backend', current_backend)
-    provider = data.get('provider')
-    timezone = data.get('timezone', 'UTC')
-    
-    # --- Save User Message to DB ---
-    session_id = data.get('session_id')
-    if session_id:
-        user_message = {
-            "sender": data.get('userName', 'User'),
-            "message": data.get('text'),
-            "type": "user",
-            "imageB64": data.get('image_base_64')
-        }
-        _save_message_to_db(session_id, user_message)
-
-    # --- Orchestrator Command Check ---
-    command = parse_command(data['text'])
-    if command:
-        query = command['query']
-        response_payload = {'type': 'error', 'message': f"Unknown command: {command['command']}"}
-        try:
-            if command['command'] == 'search':
-                encoded_query = urllib.parse.quote(query)
-                search_url = f"http://localhost:8088/?q={encoded_query}"
-                response_payload = {'type': 'iframe', 'url': search_url, 'message': f"Searching for: `{query}`"}
-            
-            elif command['command'] == 'youtube':
-                encoded_query = urllib.parse.quote(f"!yt {query}")
-                search_url = f"http://localhost:8088/search?q={encoded_query}&format=json"
-                response = requests.get(search_url, timeout=10).json()
-                first_video = next((r for r in response.get('results', []) if 'youtube.com/watch' in r.get('url', '')), None)
-                if first_video:
-                    video_id = first_video['url'].split('v=')[1].split('&')[0]
-                    response_payload = {'type': 'youtube_embed', 'video_id': video_id, 'message': f"Here is the top YouTube result for `{query}`:"}
-                else:
-                    response_payload = {'type': 'error', 'message': f"No YouTube results found for '{query}'."}
-            
-            elif command['command'] == 'read':
-                response = requests.get(query, timeout=15).text
-                # Basic text extraction, can be improved with libraries like BeautifulSoup
-                clean_text = re.sub(r'<style.*?>.*?</style>|<script.*?>.*?</script>|<!--.*?-->', '', response, flags=re.DOTALL)
-                clean_text = re.sub(r'<.*?>', ' ', clean_text)
-                clean_text = ' '.join(clean_text.split())
-                summary = summarize_text(clean_text[:8000]) # Summarize first 8k chars
-                response_payload = {'type': 'info', 'message': f"**Summary of {query}:**\n\n{summary}"}
-
-            elif command['command'] == 'calc':
-                answer = summarize_text(f"Calculate the following expression and provide only the numerical answer: {query}")
-                response_payload = {'type': 'info', 'message': f"`{query}` = **{answer}**"}
-
-            # ... other commands from previous implementation ...
-
-        except requests.exceptions.RequestException as e:
-            response_payload = {'type': 'error', 'message': f"Command failed due to a network error: {e}"}
-        except Exception as e:
-            response_payload = {'type': 'error', 'message': f"An unexpected error occurred: {e}"}
-        
-        emit('command_response', response_payload)
-        if session_id:
-            _save_message_to_db(session_id, {"sender": "Solace", **response_payload, "type": "ai"})
-        return
-
-    # --- Fallback to LLM Chat if no command ---
-    if not current_model:
-        emit('error', {'message': 'No model loaded.'})
-        return
-
-    search_query = should_perform_web_search(data['text'])
-    if search_query:
-        # ... web search logic ...
-        pass
-    
-    sid = request.sid
-    socketio.start_background_task(stream_response, data, sid)
 
 @socketio.on('stop')
 def handle_stop():
@@ -790,6 +824,16 @@ def handle_save_voice_settings(data):
         json.dump(data, f, indent=4)
     emit('voice_settings_saved', {'message': 'Voice settings saved.'})
 
+@socketio.on('save_nova_settings')
+def handle_save_nova_settings(data):
+    """Saves the Nova customization settings."""
+    try:
+        with open('nova_settings.json', 'w') as f:
+            json.dump(data, f, indent=4)
+        emit('nova_settings_saved', {'message': 'Nova settings saved successfully.'})
+    except Exception as e:
+        emit('error', {'message': f'Failed to save Nova settings: {e}'})
+
 @socketio.on('manage_ollama')
 def handle_manage_ollama(data):
     import subprocess
@@ -882,12 +926,22 @@ def migrate_and_load_config():
             json.dump(model_configs, f, indent=4)
         print("Migration complete, config saved.")
 
+def load_nova_settings():
+    """Loads Nova customization settings from JSON file."""
+    try:
+        if os.path.exists('nova_settings.json'):
+            with open('nova_settings.json', 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"⚠️ Could not load nova_settings.json: {e}")
+    return {} # Return empty dict if file doesn't exist or fails to load
+
 if __name__ == "__main__":
     migrate_and_load_config()
+    nova_settings = load_nova_settings()
     load_orchestrator_model()
 
     threading.Thread(target=background_loop, daemon=True, name="NovaMaintenance").start()
-    start_auto_loop_once()
 
     web_ui_thread = threading.Thread(target=lambda: socketio.run(app, host='0.0.0.0', port=5000), daemon=True)
     web_ui_thread.start()

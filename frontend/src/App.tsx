@@ -51,13 +51,19 @@ const App: React.FC = () => {
   const [ollamaKvCache, setOllamaKvCache] = useState('f16');
   const [systemPrompt, setSystemPrompt] = useState('');
   const [userName, setUserName] = useState('User');
-  const [aiName, setAiName] = useState('Solace');
+  const [aiName, setAiName] = useState('Nova');
   const [userAvatar, setUserAvatar] = useState<string | null>(null);
   const [aiAvatar, setAiAvatar] = useState<string | null>(null);
   const [toolSettings, setToolSettings] = useState({
     n8nUrl: '',
     searXngUrl: '',
     serpApiApiKey: '',
+  });
+  const [novaSettings, setNovaSettings] = useState({
+    searxngUrl: '',
+    mediaServerUrl: '',
+    mediaServerApiKey: '',
+    imageGenUrl: '',
   });
   const [ttsSettings, setTtsSettings] = useState({
     type: 'local', // 'local' or 'cloud'
@@ -74,6 +80,7 @@ const App: React.FC = () => {
     apiKey: '',
     model: '',
   });
+  const [debugMode, setDebugMode] = useState(false);
   const [theme, setTheme] = useState({
     primaryColor: '#4a90e2',
     backgroundColor: '#1a1a2e',
@@ -88,15 +95,24 @@ const App: React.FC = () => {
     setTheme(prevTheme => ({ ...prevTheme, [property]: value }));
   };
 
+  const handleNovaSettingsChange = (settings: any) => {
+    setNovaSettings(settings);
+  };
+
+  const handleSaveNovaSettings = () => {
+    if (!socketRef.current) return;
+    socketRef.current.emit('save_nova_settings', novaSettings);
+  };
+
   useEffect(() => {
-    const savedTheme = localStorage.getItem('solace_theme');
+    const savedTheme = localStorage.getItem('nova_theme');
     if (savedTheme) {
       setTheme(JSON.parse(savedTheme));
     }
   }, []);
 
   useEffect(() => {
-    localStorage.setItem('solace_theme', JSON.stringify(theme));
+    localStorage.setItem('nova_theme', JSON.stringify(theme));
     Object.keys(theme).forEach(key => {
       document.documentElement.style.setProperty(`--${key.replace(/([A-Z])/g, '-$1').toLowerCase()}`, theme[key as keyof typeof theme]);
     });
@@ -118,7 +134,7 @@ const App: React.FC = () => {
     setAllConfigs(prevConfigs => {
       const config = prevConfigs[model] || {};
       setSystemPrompt(config.system_prompt || '');
-      setAiName(config.aiName || 'Solace');
+      setAiName(config.aiName || 'Nova');
       setAiAvatar(config.aiAvatar || null);
       setModelConfigOptions(config);
       return prevConfigs; // Return the unchanged state
@@ -147,9 +163,9 @@ const App: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    const storedName = localStorage.getItem('solace_user_name');
+    const storedName = localStorage.getItem('nova_user_name');
     if (storedName) setUserName(storedName);
-    const storedAvatar = localStorage.getItem('solace_user_avatar');
+    const storedAvatar = localStorage.getItem('nova_user_avatar');
     if (storedAvatar) setUserAvatar(storedAvatar);
 
     // The new logic will fetch sessions from the server via sockets.
@@ -369,6 +385,10 @@ const App: React.FC = () => {
       setMessages(prev => [...prev, newMessage]);
     };
 
+    const handleNovaSettingsLoaded = (data: any) => {
+      setNovaSettings(data);
+    };
+
     socket.on('stream_start', handleStreamStart);
     socket.on('stream', handleStream);
     socket.on('stream_end', handleStreamEnd);
@@ -382,6 +402,7 @@ const App: React.FC = () => {
     socket.on('voice_stream_end', handleVoiceStreamEnd);
     socket.on('transcription_result', handleTranscriptionResult);
     socket.on('command_response', handleCommandResponse);
+    socket.on('nova_settings_loaded', handleNovaSettingsLoaded);
 
     return () => {
       socket.disconnect();
@@ -420,7 +441,8 @@ const App: React.FC = () => {
       // --- New DB Fields ---
       session_id: activeChatId,
       userName: userName,
-      aiName: aiName
+      aiName: aiName,
+      debug_mode: debugMode
     };
 
     if (currentBackend === 'api') {
@@ -505,7 +527,7 @@ const App: React.FC = () => {
       reader.onload = (event) => {
         const base64 = event.target?.result as string;
         setUserAvatar(base64);
-        localStorage.setItem('solace_user_avatar', base64);
+        localStorage.setItem('nova_user_avatar', base64);
       };
       reader.readAsDataURL(e.target.files[0]);
     }
@@ -676,6 +698,11 @@ const App: React.FC = () => {
                   }
                   onSaveToolSettings={handleSaveToolSettings}
                   onSaveVoiceSettings={handleSaveVoiceSettings}
+                  novaSettings={novaSettings}
+                  onNovaSettingsChange={handleNovaSettingsChange}
+                  onSaveNovaSettings={handleSaveNovaSettings}
+                  debugMode={debugMode}
+                  onDebugModeChange={setDebugMode}
                 />
               </div>
             </div>

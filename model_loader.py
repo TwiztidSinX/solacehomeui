@@ -2,7 +2,7 @@ import json, os, time, gc, re
 from llama_cpp import Llama, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16
 from llama_cpp.llama_chat_format import get_chat_completion_handler
 import ollama
-ollama._client = ollama.Client(host='http://localhost:11434')
+ollama._client = ollama.Client(host='http://127.0.0.1:11434')
 import google.generativeai as genai
 from threading import Thread, Lock
 import datetime
@@ -601,48 +601,130 @@ def clean_and_normalize_history(conversation_history: list[dict]) -> list[dict]:
             
     return merged
 
-def stream_gpt(model_instance, model_id_str, user_input, conversation_history=None, should_stop=lambda: False, backend='llama.cpp', provider=None, image_data=None, timezone='UTC', tools=None, tool_outputs=None):
-    # --- RAW HISTORY DEBUG ---
-    print("\n--- RAW HISTORY FROM FRONTEND ---")
-    import json
-    print(json.dumps(conversation_history, indent=2))
-    print("---------------------------------\n")
-    # --- END RAW HISTORY DEBUG ---
+# A global to hold the configurations loaded from config.json
+model_configs = {}
 
-    if not model_instance:
-        yield "[ERROR: Model not loaded]"
-        return
+def load_configs():
+    """Loads the model configurations from config.json."""
+    global model_configs
+    try:
+        with open('config.json', 'r') as f:
+            model_configs = json.load(f)
+    except FileNotFoundError:
+        print("config.json not found. Using default settings.")
+        model_configs = {}
+    except json.JSONDecodeError:
+        print("Error decoding config.json. Using default settings.")
+        model_configs = {}
 
-    # Normalize and clean the conversation history to a consistent format
-    safe_history = clean_and_normalize_history(conversation_history or [])
+def get_system_prompt(model_path):
+    """Helper to safely get the system prompt from the loaded configs."""
+    if not model_configs:
+        load_configs()
+    return model_configs.get(model_path, {}).get('system_prompt', '')
 
-    if backend == "llama.cpp":
-        yield from stream_llamacpp(model_instance, model_id_str, user_input, safe_history, should_stop, image_data, timezone, tools, tool_outputs)
-    elif backend == "ollama":
-        yield from stream_ollama(model_instance, model_id_str, user_input, safe_history, should_stop, image_data, timezone)
-    elif backend == "api":
-        if provider == "google":
-            yield from stream_google(model_instance, model_id_str, user_input, safe_history, should_stop, image_data, timezone)
-        elif provider == "openai":
-            yield from stream_openai(model_instance, model_id_str, user_input, safe_history, should_stop, image_data, timezone)
-        elif provider == "anthropic":
-            yield from stream_anthropic(model_instance, model_id_str, user_input, safe_history, should_stop, image_data, timezone)
-        elif provider == "meta":
-            yield from stream_meta(model_instance, model_id_str, user_input, safe_history, should_stop, image_data)
-        elif provider == "xai":
-            yield from stream_xai(model_instance, model_id_str, user_input, safe_history, should_stop, image_data)
-        elif provider == "qwen":
-            yield from stream_qwen(model_instance, model_id_str, user_input, safe_history, should_stop, image_data)
-        elif provider == "deepseek":
-            yield from stream_deepseek(model_instance, model_id_str, user_input, safe_history, should_stop, image_data)
-        elif provider == "perplexity":
-            yield from stream_perplexity(model_instance, model_id_str, user_input, safe_history, should_stop, image_data)
-        elif provider == "openrouter":
-            yield from stream_openrouter(model_instance, model_id_str, user_input, safe_history, should_stop, image_data)
+
+def stream_gpt(model, model_path, user_input, conversation_history, should_stop, backend, provider=None, image_data=None, timezone='UTC', tools=None, debug_mode=False):
+    """
+    Streams a response from a GPT-style model.
+    Handles different backends and prompt formatting.
+    """
+    # --- Prompt Construction ---
+    messages = []
+    
+    if debug_mode:
+        print("\n--- RAW HISTORY FROM FRONTEND ---")
+        print(json.dumps(conversation_history, indent=2))
+        print("---------------------------------\n")
+
+    system_prompt_text = get_system_prompt(model_path)
+    
+    # The frontend history now includes the latest user message, so we use it directly
+    # We also need to normalize the roles from 'sender'/'type' to 'role'
+    normalized_history = []
+    for entry in conversation_history:
+        role = "user" if entry.get("sender", "").lower() == "user" or entry.get("type", "").lower() == "user" else "assistant"
+        content = entry.get("message", "")
+        if content:
+            normalized_history.append({"role": role, "content": content})
+
+    # --- Gemma System Prompt Fix ---
+    is_gemma = 'gemma' in model_path.lower()
+    if is_gemma and system_prompt_text:
+        if normalized_history and normalized_history[0]['role'] == 'user':
+            normalized_history[0]['content'] = f"{system_prompt_text}\n\n{normalized_history[0]['content']}"
         else:
-            yield f"[STREAM ERROR: Provider '{provider}' not implemented for API backend]"
-    elif backend == "safetensors":
-        yield from stream_safetensors(model_instance, model_id_str, user_input, safe_history, should_stop, image_data, timezone)
+            print("⚠️ Gemma model detected, but no initial user message to prepend system prompt to.")
+    elif system_prompt_text:
+        messages.insert(0, {"role": "system", "content": system_prompt_text})
+    
+    messages.extend(normalized_history)
+
+    if debug_mode:
+        print("\n--- FINAL PROMPT TO MODEL ---")
+        print(json.dumps(messages, indent=2))
+        print("-----------------------------\n")
+
+    # --- Model Streaming ---
+    try:
+        if backend == "llama.cpp":
+            response_generator = model.create_chat_completion(
+                messages=messages,
+                temperature=0.7,
+                stream=True,
+            )
+            for chunk in response_generator:
+                if should_stop(): break
+                token = chunk['choices'][0]['delta'].get('content')
+                if token:
+                    yield {'type': 'reply', 'token': token}
+        
+        elif backend == "ollama":
+            # For Ollama, the 'model' is the model name string
+            # Explicitly create a client with the correct host to override any faulty defaults
+            client = ollama.Client(host='http://127.0.0.1:11434')
+
+            # CRITICAL FIX: Ensure the system prompt is the first message for Ollama
+            if not messages or messages[0].get('role') != 'system':
+                messages.insert(0, {"role": "system", "content": system_prompt_text})
+
+            stream = client.chat(
+                model=model,
+                messages=messages,
+                stream=True
+            )
+            for chunk in stream:
+                if should_stop(): break
+                token = chunk['message']['content']
+                if token:
+                    yield {'type': 'reply', 'token': token}
+
+        elif backend == "safetensors":
+            # For safetensors, 'model' is a tuple (model, tokenizer, streamer, processor)
+            _model, tokenizer, streamer, _ = model
+            
+            # Use the tokenizer's chat template for robust and accurate prompt formatting
+            prompt_string = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+            inputs = tokenizer(prompt_string, return_tensors="pt").to(_model.device)
+            generation_kwargs = dict(inputs, streamer=streamer, max_new_tokens=4096)
+            
+            thread = Thread(target=_model.generate, kwargs=generation_kwargs)
+            thread.start()
+
+            for token in streamer:
+                if should_stop(): break
+                if token:
+                    yield {'type': 'reply', 'token': token}
+            thread.join()
+
+        # ... (rest of the function for API backends)
+        
+    except Exception as e:
+        print(f"🔴 Streaming Error: {e}")
+        import traceback
+        traceback.print_exc()
+        yield {'type': 'error', 'token': f"An error occurred: {e}"}
 
 def format_chat(model_family, system_prompt, user_input, conversation_history, memory_context):
     """

@@ -26,119 +26,160 @@ def load_orchestrator_model():
             print(f"FAILED to load Orchestrator Model: {e}")
             orchestrator_model = None
 
-def should_perform_web_search(user_input: str):
+from llama_cpp import Llama
+import os
+import json
+import re
+
+# Import the new tool schema
+from tools import TOOLS_SCHEMA
+
+# --- Project Root ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ORCHESTRATOR_MODEL_PATH = os.path.join(BASE_DIR, "models", "llama", "Qwen3-1.7B-Q8_0.gguf").replace("\\", "/")
+
+orchestrator_model = None
+
+def load_orchestrator_model():
+    """Loads the small Qwen model into RAM for orchestration tasks."""
+    global orchestrator_model
+    if orchestrator_model is None:
+        print("Loading Orchestrator Model...")
+        try:
+            orchestrator_model = Llama(
+                model_path=ORCHESTRATOR_MODEL_PATH,
+                n_ctx=2048,
+                n_gpu_layers=0,  # Force to RAM
+                verbose=False
+            )
+            print("Orchestrator Model Loaded.")
+        except Exception as e:
+            print(f"FAILED to load Orchestrator Model: {e}")
+            orchestrator_model = None
+
+def get_tool_call(user_input: str):
     """
-    Uses the orchestrator model to decide if a web search is necessary.
-    Returns the search query if needed, otherwise None.
+    Uses the orchestrator model to decide if a tool call is necessary.
+    Returns the tool call details if needed, otherwise None.
     """
     if orchestrator_model is None:
-        print("Orchestrator model not loaded. Skipping web search check.")
+        print("Orchestrator model not loaded. Skipping tool call check.")
         return None
-
-    # Define the tool for the model to call
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "web_search",
-                "description": "Performs a web search when the user asks a question that requires up-to-date information or knowledge beyond your internal cutoff.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "The search query.",
-                        }
-                    },
-                    "required": ["query"],
-                },
-            },
-        }
-    ]
 
     # Create the prompt for the orchestrator
     messages = [
-        {"role": "system", "content": "Your sole purpose is to determine if a user's question requires a real-time web search. You must call the `web_search` tool if the user asks about current events, weather, or any topic that requires up-to-the-minute information. Do not answer the question yourself. Only call the tool or do nothing."},
+        {"role": "system", "content": "You are a helpful assistant that decides if a function call is needed to answer the user's question. Use the provided tools to answer questions that require up-to-date information or external capabilities. Do not answer the question yourself, only call a tool if necessary."},
         {"role": "user", "content": user_input}
     ]
 
     try:
         response = orchestrator_model.create_chat_completion(
             messages=messages,
-            tools=tools,
+            tools=TOOLS_SCHEMA,
             tool_choice="auto",
             temperature=0.0
         )
 
-        # --- DEBUGGING: Print the full response from the orchestrator ---
-        # print("--- Orchestrator Full Response ---")
-        # print(json.dumps(response, indent=2))
-        # print("---------------------------------")
-
-        # First, check the standard 'tool_calls' field
         tool_calls = response.get('choices', [{}])[0].get('message', {}).get('tool_calls')
         if tool_calls:
-            for tool_call in tool_calls:
-                if tool_call.get('function', {}).get('name') == 'web_search':
-                    arguments = json.loads(tool_call['function']['arguments'])
-                    query = arguments.get('query')
-                    print(f"Orchestrator decided to search for: {query} (via tool_calls)")
-                    return query
-
-        # Fallback: Check if the tool call is embedded in the 'content' field
-        message_content = response.get('choices', [{}])[0].get('message', {}).get('content', '')
-        if '<tool_call>' in message_content:
-            try:
-                # Extract the JSON part from the content string
-                tool_call_str = message_content.split('<tool_call>')[1].split('</tool_call>')[0].strip()
-                tool_call_json = json.loads(tool_call_str)
-                if tool_call_json.get('name') == 'web_search':
-                    query = tool_call_json.get('arguments', {}).get('query')
-                    if query:
-                        print(f"Orchestrator decided to search for: {query} (via content fallback)")
-                        return query
-            except (json.JSONDecodeError, IndexError) as e:
-                print(f"Failed to parse tool call from content: {e}")
+            # For now, we only handle the first tool call
+            tool_call = tool_calls[0]
+            tool_name = tool_call.get('function', {}).get('name')
+            arguments = json.loads(tool_call.get('function', {}).get('arguments', '{}'))
+            
+            print(f"Orchestrator decided to call tool: {tool_name} with args: {arguments}")
+            return {"name": tool_name, "arguments": arguments}
 
     except Exception as e:
-        print(f"Orchestrator check failed: {e}")
+        print(f"Orchestrator tool call check failed: {e}")
 
     return None
 
 def get_summary_for_title(text: str):
     """
-    Uses the orchestrator model to generate a short, concise title for a chat session.
+    Uses the orchestrator model with a few-shot prompt to generate a short,
+    concise, and correctly formatted title for a chat session.
     """
     if orchestrator_model is None:
         print("Orchestrator model not loaded. Skipping title summary.")
         return "New Chat"
 
+    # A more forceful prompt with a very specific instruction in the system message.
+    prompt = f"""---
+Text: "Hey, can you help me figure out why my Python script for web scraping isn't working? I'm getting a 403 error."
+New Chat Title: "Python Web Scraping 403 Error"
+---
+Text: "what's the weather like in new york city right now?"
+New Chat Title: "New York City Weather Inquiry"
+---
+Text: "Hello again, how are you today?"
+New Chat Title: "Friendly Greeting"
+---
+Text: "{text}"
+New Chat Title:"""
+
     messages = [
-        {"role": "system", "content": "You are an expert at summarizing text into a short, concise title. The title must be no more than 5 words. Do not use punctuation or quotes. Your final line of output should be ONLY the title."},
-        {"role": "user", "content": f"Summarize this text for a chat title: {text}"}
+        {"role": "system", "content": "You are a machine that only generates chat titles. You will be given examples and a final text. Your entire output will be only the final line 'New Chat Title: \"...\"'. You will not think, explain, or say anything else."},
+        {"role": "user", "content": prompt}
     ]
 
     try:
         response = orchestrator_model.create_chat_completion(
             messages=messages,
             temperature=0.0,
-            max_tokens=25
+            max_tokens=75,
+            stop=["---"] # Stop the model from hallucinating more examples
         )
         raw_content = response.get('choices', [{}])[0].get('message', {}).get('content', '').strip()
-        
-        # --- New, More Robust Title Extraction ---
-        # Take the last non-empty line from the output.
-        lines = [line.strip() for line in raw_content.split('\n') if line.strip()]
-        summary = lines[-1] if lines else ""
-        
-        # Clean up any potential model artifacts
-        summary = summary.replace('"', '').replace("'", '').strip()
-        
-        print(f"Orchestrator generated title: '{summary}' from raw: '{raw_content}'")
-        return summary if summary else "Chat Summary"
+
+        # A more specific regex that looks for the exact pattern we want.
+        match = re.search(r'New Chat Title:\s*"(.*?)"', raw_content)
+        if match:
+            title = match.group(1).strip()
+            print(f"Orchestrator generated title via few-shot: '{title}' from raw: '{raw_content}'")
+            return title if title else "Chat Summary"
+        else:
+            # Fallback if the specific regex fails, which might happen if the model omits the label.
+            # We take the last line and strip quotes.
+            last_line = raw_content.splitlines()[-1]
+            title = last_line.replace("New Chat Title:", "").strip().strip('"')
+            print(f"Orchestrator generated title (fallback parsing): '{title}' from raw: '{raw_content}'")
+            return title if title else "Chat Summary"
+
     except Exception as e:
         print(f"Orchestrator title summary failed: {e}")
         return "Chat Summary"
+
+def sanitize_chat_title(title: str):
+    """
+    Checks if a title contains non-ASCII characters and asks the orchestrator to
+    rewrite it in English if necessary.
+    """
+    # Check if any character in the title is outside the standard ASCII range
+    if any(ord(char) > 127 for char in title):
+        print(f"Non-ASCII title detected: '{title}'. Requesting English translation.")
+        
+        messages = [
+            {"role": "system", "content": "You are an expert title translator. The user will provide a title, potentially in another language. Your task is to provide a concise, natural-sounding English equivalent. Respond with ONLY the translated English title and nothing else."},
+            {"role": "user", "content": f"Translate this title to English: \"{title}\""}
+        ]
+
+        try:
+            response = orchestrator_model.create_chat_completion(
+                messages=messages,
+                temperature=0.0,
+                max_tokens=25
+            )
+            new_title = response.get('choices', [{}])[0].get('message', {}).get('content', '').strip().strip('\'"')
+            
+            print(f"Translated title: '{new_title}'")
+            return new_title if new_title else title # Fallback to original title on failure
+        except Exception as e:
+            print(f"Title translation failed: {e}")
+            return title # Fallback to original title on failure
+            
+    # If the title is already ASCII, return it as is
+    return title
 
 def summarize_text(text: str):
     """Uses the orchestrator model to generate a summary of a given text."""

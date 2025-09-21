@@ -3,6 +3,7 @@ import ThemeEditor from './ThemeEditor';
 import ToolSettings from './ToolSettings';
 import TtsPanel from './TtsPanel';
 import SttPanel from './SttPanel';
+import NovaCustomizations from './NovaCustomizations'; // Import the new component
 
 // A generic interface for any model configuration
 interface ModelConfig {
@@ -26,6 +27,7 @@ interface SettingsPanelProps {
   toolSettings: any;
   ttsSettings: any;
   sttSettings: any;
+  novaSettings: any;
 
   // Callbacks
   onBackendChange: (backend: string) => void;
@@ -52,6 +54,10 @@ interface SettingsPanelProps {
   onSttSettingsChange: (settings: any) => void;
   onSaveToolSettings: () => void;
   onSaveVoiceSettings: () => void;
+  onNovaSettingsChange: (settings: any) => void;
+  onSaveNovaSettings: () => void;
+  debugMode: boolean;
+  onDebugModeChange: (enabled: boolean) => void;
 }
 
 const SettingsPanel: React.FC<SettingsPanelProps> = (props) => {
@@ -94,6 +100,11 @@ const SettingsPanel: React.FC<SettingsPanelProps> = (props) => {
     onSttSettingsChange,
     onSaveToolSettings,
     onSaveVoiceSettings,
+    novaSettings,
+    onNovaSettingsChange,
+    onSaveNovaSettings,
+    debugMode,
+    onDebugModeChange,
   } = props;
 
   const renderBackendOptions = () => {
@@ -153,6 +164,19 @@ const SettingsPanel: React.FC<SettingsPanelProps> = (props) => {
               <option value="low">Low</option>
               <option value="medium">Medium</option>
               <option value="high">High</option>
+            </select>
+
+            <label className="block mt-2">KV Cache Quantization</label>
+            <select
+              value={modelConfigOptions.kv_cache_quant || 'fp16'}
+              onChange={(e) =>
+                onModelConfigChange('kv_cache_quant', e.target.value)
+              }
+              className="w-full p-2 rounded inputfield-background"
+            >
+              <option value="fp16">FP16</option>
+              <option value="int8">INT8</option>
+              <option value="int4">INT4</option>
             </select>
           </>
         );
@@ -383,6 +407,16 @@ const SettingsPanel: React.FC<SettingsPanelProps> = (props) => {
                     />
                   </label>
                 </div>
+                <div className="flex items-center justify-between">
+                  <label htmlFor="debug-mode-toggle" className="block mb-1">Debug Mode</label>
+                  <input
+                    type="checkbox"
+                    id="debug-mode-toggle"
+                    checked={debugMode}
+                    onChange={(e) => onDebugModeChange(e.target.checked)}
+                    className="form-checkbox h-5 w-5 text-blue-500"
+                  />
+                </div>
               </div>
             </div>
           </div>
@@ -398,6 +432,11 @@ const SettingsPanel: React.FC<SettingsPanelProps> = (props) => {
               <SttPanel settings={sttSettings} onChange={onSttSettingsChange} onSave={onSaveVoiceSettings} />
             </div>
           </div>
+        </div>
+
+        {/* Nova Customizations Section */}
+        <div className="mt-4">
+          <NovaCustomizations settings={novaSettings} onChange={onNovaSettingsChange} onSave={onSaveNovaSettings} />
         </div>
 
         <div className="bg-gray-800/50 p-4 rounded-lg mt-4" style={{ backgroundColor: 'var(--primary-color)' }}>
