@@ -1,0 +1,19 @@
+{
+    "backend": "your_backend",
+    "path/to/your/model": {
+        "system_prompt": "Your system prompt here.",
+        "kv_cache_quant": "int4",
+        "quantization": "4bit",
+        "aiName": "YourAIName",
+        "aiAvatar": null,
+        "use_flash_attention": false
+    },
+    "another/model/path": {
+        "system_prompt": "Another system prompt.",
+        "gpuLayers": 35,
+        "aiName": "AnotherAIName",
+        "aiAvatar": null,
+        "context_tokens": 8192,
+        "kv_cache_quant": "int4"
+    }
+}
