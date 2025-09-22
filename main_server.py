@@ -546,14 +546,16 @@ def handle_chat(data):
 
     # 2. If no slash command, check for keywords (fast)
     ORCHESTRATOR_KEYWORDS = [
-        "search", "what is", "who is", "how to", "current", "latest", 
-        "news", "weather", "price of", "stock", "define", "wiki", 
-        "map of", "look up", "find me"
+        "search", "what is", "who is", "how to", "current", "latest", "news", 
+        "weather", "price of", "stock", "define", "wiki", "map of", 
+        "look up", "find me", "scrape", "read the article"
     ]
     
+    # More robust check: see if any keyword is a substring of the user input
     should_orchestrate = any(keyword in user_input.lower() for keyword in ORCHESTRATOR_KEYWORDS)
 
     if should_orchestrate:
+        print("Orchestration keywords detected. Checking for tool call...")
         tool_call = get_tool_call(user_input)
         if tool_call:
             # A tool was selected by the orchestrator
@@ -564,8 +566,12 @@ def handle_chat(data):
             tool_result = dispatch_tool(tool_name, tool_args)
             
             # Inject the result back into the conversation history for the main model
-            tool_result_message = f"--- Web Search Results ---\n{tool_result}\n--- End Web Search Results ---"
-            data['history'].insert(0, {'sender': 'User', 'message': tool_result_message, 'type': 'user'})
+            # We'll give it a more descriptive name based on the tool used.
+            result_header = f"--- Result for '{tool_name}' ---"
+            tool_result_message = f"{result_header}\n{tool_result}\n--- End Result ---"
+            
+            # Add the tool result to the *end* of the history for better context flow
+            data['history'].append({'sender': 'User', 'message': tool_result_message, 'type': 'user'})
 
     # 3. If neither, bypass orchestrator and go directly to the main model
     if not current_model:
