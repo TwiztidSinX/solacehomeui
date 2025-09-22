@@ -1,4 +1,6 @@
 import json
+import os
+import urllib.parse
 import requests
 from bs4 import BeautifulSoup
 from duckduckgo_search import DDGS
@@ -64,13 +66,30 @@ TOOLS_SCHEMA = [
 
 def search_web(query: str):
     """
-    The actual Python function that gets called when the model decides to use the 'search_web' tool.
+    Performs a web search using the user's configured SearXNG instance.
     """
     print(f"Executing web search for: {query}")
     try:
-        with DDGS() as ddgs:
-            results = [r['body'] for r in ddgs.text(query, max_results=5)]
-            return "\n".join(results) if results else "No results found."
+        # Load SearXNG URL from settings
+        settings_path = os.path.join(os.path.dirname(__file__), 'nova_settings.json')
+        with open(settings_path, 'r') as f:
+            settings = json.load(f)
+        searxng_url = settings.get('searxngUrl')
+
+        if not searxng_url:
+            return "Error: SearXNG URL is not configured in settings."
+
+        # Construct the full API URL
+        api_url = f"{searxng_url.rstrip('/')}/search?q={urllib.parse.quote(query)}&format=json"
+        
+        response = requests.get(api_url, timeout=10)
+        response.raise_for_status()
+        results = response.json()
+        
+        # Format the results into a readable string for the model
+        snippets = [r.get('content', '') for r in results.get('results', [])[:5]]
+        return "\n".join(snippets) if snippets else "No results found."
+
     except Exception as e:
         print(f"Web search tool failed: {e}")
         return f"Error searching web: {e}"

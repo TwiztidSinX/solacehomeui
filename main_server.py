@@ -28,7 +28,8 @@ from pymongo.errors import PyMongoError
 from sentence_transformers import SentenceTransformer
 from model_loader import get_available_models, load_model, unload_model, stream_gpt
 from upgraded_memory_manager import memory_manager as memory, beliefs_manager as beliefs, db
-from orchestrator import load_orchestrator_model, get_summary_for_title, parse_command
+from orchestrator import load_orchestrator_model, get_summary_for_title, parse_command, get_tool_call, summarize_text
+from tools import dispatch_tool, TOOLS_SCHEMA
 
 # --- Database Setup for Chat History ---
 try:
@@ -499,8 +500,6 @@ def handle_chat(data):
     # --- Hybrid Orchestration Logic ---
     # 1. Always check for slash commands first (instant)
     command = parse_command(user_input)
-    from orchestrator import summarize_text, get_tool_call
-    from tools import dispatch_tool, TOOLS_SCHEMA
     if command:
         query = command['query']
         response_payload = {'type': 'error', 'message': f"Unknown command: {command['command']}", 'sender': 'Nova'}
@@ -565,13 +564,10 @@ def handle_chat(data):
             # Execute the tool
             tool_result = dispatch_tool(tool_name, tool_args)
             
-            # Inject the result back into the conversation history for the main model
-            # We'll give it a more descriptive name based on the tool used.
-            result_header = f"--- Result for '{tool_name}' ---"
-            tool_result_message = f"{result_header}\n{tool_result}\n--- End Result ---"
-            
-            # Add the tool result to the *end* of the history for better context flow
-            data['history'].append({'sender': 'User', 'message': tool_result_message, 'type': 'user'})
+            # Prepend the result to the user's input for the main model
+            user_input = f"--- Tool Result for '{tool_name}' ---\n{tool_result}\n--- End Result ---\n\nPlease use this information to answer my original query: {user_input}"
+            # Update the 'text' in the data payload for the streamer
+            data['text'] = user_input
 
     # 3. If neither, bypass orchestrator and go directly to the main model
     if not current_model:

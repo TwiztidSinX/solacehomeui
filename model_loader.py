@@ -585,11 +585,6 @@ def stream_gpt(model, model_path, user_input, conversation_history, should_stop,
         print("---------------------------------\n")
 
     system_prompt_text = get_system_prompt(model_path)
-
-    # --- Add Thinking Instructions ---
-    if thinking_level and thinking_level != 'none':
-        thinking_instructions = "Before you respond, you must think about the user's query and your response plan. Wrap all of your thoughts in <think>...</think> tags. The user will not see your thoughts."
-        system_prompt_text = f"{thinking_instructions}\n\n{system_prompt_text}"
     
     # The frontend history now includes the latest user message, so we use it directly
     # We also need to normalize the roles from 'sender'/'type' to 'role'
@@ -599,6 +594,16 @@ def stream_gpt(model, model_path, user_input, conversation_history, should_stop,
         content = entry.get("message", "")
         if content:
             normalized_history.append({"role": role, "content": content})
+
+    # --- Add Thinking Instructions (Robust Method) ---
+    if thinking_level and thinking_level != 'none':
+        thinking_instructions = "Before you respond, you must think about the user's query and your response plan. Wrap all of your thoughts in <think>...</think> tags. The user will not see your thoughts."
+        # Prepend to the first user message to ensure it's not ignored by any chat handlers
+        if normalized_history and normalized_history[0]['role'] == 'user':
+            normalized_history[0]['content'] = f"{thinking_instructions}\n\nUser Query: {normalized_history[0]['content']}"
+        else:
+             # Fallback for safety, though this case is unlikely
+            system_prompt_text = f"{thinking_instructions}\n\n{system_prompt_text}"
 
     # --- Gemma System Prompt Fix ---
     is_gemma = 'gemma' in model_path.lower()
