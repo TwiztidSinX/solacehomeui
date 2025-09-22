@@ -15,6 +15,27 @@ import httpx  # For general API calls
 from openai import OpenAI as OpenAIClient
 from upgraded_memory_manager import get_context_for_model
 
+KNOWN_OUTER_WRAPPERS = [
+    (r'^\[INST\](.*)\[/INST\]$', re.DOTALL),                # [INST] ... [/INST]
+    (r'^\s*<\|im_start\|>(.*)<\|im_end\|>\s*$', re.DOTALL), # <|im_start|> ... <|im_end|>
+    (r'^\s*<<SYS>>(.*)<</SYS>>\s*$', re.DOTALL),           # <<SYS>> ... <</SYS>>
+    (r'^\s*<start_of_turn>(.*)<end_of_turn>\s*$', re.DOTALL), # <start_of_turn> ... <end_of_turn>
+]
+
+def strip_outer_template_wrappers(text: str) -> str:
+    """If text is wrapped entirely by a known outer chat template, return inner content."""
+    if not isinstance(text, str):
+        return text
+    s = text.strip()
+    for pattern, flags in KNOWN_OUTER_WRAPPERS:
+        m = re.match(pattern, s, flags)
+        if m:
+            inner = m.group(1).strip()
+            # avoid returning empty accidentally
+            if inner:
+                return inner
+    return text
+
 # --- Project Root ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -27,7 +48,7 @@ current_backend = "llama.cpp" # or "ollama"
 def load_model(
     model_path, 
     backend="llama.cpp", 
-    context_tokens=2048, 
+    context_tokens=32678, 
     gpu_layers=0, 
     temperature=0.7, 
     system_prompt="", 
@@ -68,6 +89,7 @@ def load_model(
             print(f"🟢 LOADING MODEL: {model_id} with backend {backend} and provider {provider}")
 
             if backend == "llama.cpp":
+                model_states[model_id]['uses_chat_handler'] = True
                 model_basename = os.path.basename(model_id).lower()
                 chat_format_name = "llama-2"  # Default
                 if "qwen" in model_basename:
@@ -233,80 +255,6 @@ def detect_model_family(model_instance, model_path: str) -> str:
     if "llama" in name or "vicuna" in name or "alpaca" in name:
         return "llama"
     return "generic"
-
-def build_llamacpp_prompt_string(
-    user_input: str,
-    conversation_history: list[dict],
-    memory_context: str = "None",
-    system_prompt: str = "You are a helpful AI companion.",
-    chat_format: str = "llama2",
-    image_data: str = None
-) -> str:
-    if image_data:
-        # This function should not be called for multimodal input
-        return "[ERROR: build_llamacpp_prompt_string should not be called with image data]"
-    try:
-        if not memory_context or memory_context.strip().lower() in ["none", "null", "[]"]:
-            memory_context = "No relevant memories were found."
-
-        # Prevent accidental nesting by cleaning memory context
-        memory_context = memory_context.replace("messages:", "").strip()
-
-        # Format conversation history cleanly
-        def clean_history():
-            lines = []
-            for msg in conversation_history:
-                role = "user" if msg["role"] == "user" else "assistant"
-                content = msg["content"].strip()
-                lines.append(f"{role}: {content}")
-            return "".join(lines)
-
-        if chat_format == "qwen" or chat_format == "chatml":  # ✅ Handle both under the same string builder
-            return (
-                f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-                f"{clean_history()}"
-                f"<|im_start|>user\n{user_input}<|im_end|>\n"
-                f"<|im_start|>assistant\n"
-            )
-
-        elif chat_format == "llama2":
-            history_lines = ""
-            for msg in conversation_history:
-                role = "User" if msg["role"] == "user" else "Assistant"
-                history_lines += f"{role}: {msg['content'].strip()}\n"
-            return (
-                f"<<SYS>>\n{system_prompt}\n<</SYS>>\n\n"
-                f"Relevant Memories:\n{memory_context}\n\n"
-                f"{history_lines}"
-                f"User: {user_input}\nAssistant:"
-            )
-
-        elif chat_format == "gemma":
-            history_lines = ""
-            for msg in conversation_history:
-                role = "user" if msg["role"] == "user" else "model"
-                history_lines += f"<start_of_turn>{role}\n{msg['content'].strip()}<end_of_turn>\n"
-            return (
-                f"<start_of_turn>system\n{system_prompt}<end_of_turn>\n"
-                f"{history_lines}"
-                f"<start_of_turn>user\n{user_input}<end_of_turn>\n"
-                f"<start_of_turn>model\n"
-            )
-
-        else:  # raw fallback
-            history_lines = ""
-            for msg in conversation_history:
-                role = "User" if msg["role"] == "user" else "Assistant"
-                history_lines += f"{role}: {msg['content'].strip()}\n"
-            return (
-                f"{system_prompt}\n\n"
-                f"Relevant Memories:\n{memory_context}\n\n"
-                f"{history_lines}"
-                f"User: {user_input}\nAssistant:"
-            )
-
-    except Exception as e:
-        return f"[PROMPT BUILD ERROR: {str(e)}]"
 
 def build_ollama_prompt_messages(
     user_input: str,
@@ -623,8 +571,7 @@ def get_system_prompt(model_path):
         load_configs()
     return model_configs.get(model_path, {}).get('system_prompt', '')
 
-
-def stream_gpt(model, model_path, user_input, conversation_history, should_stop, backend, provider=None, image_data=None, timezone='UTC', tools=None, debug_mode=False):
+def stream_gpt(model, model_path, user_input, conversation_history, should_stop, backend, provider=None, image_data=None, timezone='UTC', tools=None, debug_mode=False, thinking_level='medium'):
     """
     Streams a response from a GPT-style model.
     Handles different backends and prompt formatting.
@@ -638,6 +585,11 @@ def stream_gpt(model, model_path, user_input, conversation_history, should_stop,
         print("---------------------------------\n")
 
     system_prompt_text = get_system_prompt(model_path)
+
+    # --- Add Thinking Instructions ---
+    if thinking_level and thinking_level != 'none':
+        thinking_instructions = "Before you respond, you must think about the user's query and your response plan. Wrap all of your thoughts in <think>...</think> tags. The user will not see your thoughts."
+        system_prompt_text = f"{thinking_instructions}\n\n{system_prompt_text}"
     
     # The frontend history now includes the latest user message, so we use it directly
     # We also need to normalize the roles from 'sender'/'type' to 'role'
@@ -668,14 +620,28 @@ def stream_gpt(model, model_path, user_input, conversation_history, should_stop,
     # --- Model Streaming ---
     try:
         if backend == "llama.cpp":
+            # The chat_handler set during model load will correctly format the prompt.
             response_generator = model.create_chat_completion(
                 messages=messages,
                 temperature=0.7,
                 stream=True,
+                tools=tools,
+                tool_choice="auto"
             )
+            # This loop now correctly handles both text and tool call responses from llama.cpp
             for chunk in response_generator:
                 if should_stop(): break
-                token = chunk['choices'][0]['delta'].get('content')
+                delta = chunk['choices'][0].get('delta', {})
+                if not delta: continue
+
+                if 'tool_calls' in delta and delta['tool_calls']:
+                    # NOTE: This handles streaming tool calls. A more robust implementation
+                    # might need to aggregate chunks if a single call is split.
+                    full_tool_call = delta['tool_calls'][0]
+                    yield {'type': 'tool_call', 'tool_call': full_tool_call}
+                    continue
+
+                token = delta.get('content')
                 if token:
                     yield {'type': 'reply', 'token': token}
         
@@ -725,53 +691,6 @@ def stream_gpt(model, model_path, user_input, conversation_history, should_stop,
         import traceback
         traceback.print_exc()
         yield {'type': 'error', 'token': f"An error occurred: {e}"}
-
-def format_chat(model_family, system_prompt, user_input, conversation_history, memory_context):
-    """
-    Returns messages or formatted string depending on model family.
-    """
-
-    if model_family == "openai":
-        return [
-            {"role": "system", "content": system_prompt},
-            *conversation_history,
-            {"role": "assistant", "content": f"Relevant memories:\n{memory_context}"},
-            {"role": "user", "content": user_input},
-        ]
-
-    elif model_family == "qwen":
-        # Qwen prefers <|system|>, <|user|>, <|assistant|>
-        return f"<|system|>{system_prompt}<|user|>{user_input}<|assistant|>"
-
-    elif model_family == "deepseek":
-        # DeepSeek is OpenAI-like but with <think> reasoning blocks
-        return [
-            {"role": "system", "content": system_prompt},
-            *conversation_history,
-            {"role": "user", "content": user_input},
-        ]
-
-    elif model_family == "llama":
-        # llama.cpp default instruct template
-        return f"""<|system|>
-        {system_prompt}
-
-        <|user|>
-        {user_input}
-
-        <|assistant|>
-        """
-
-    elif model_family == "gemma":
-        # Gemma uses special <start_of_turn> tags
-        return f"<start_of_turn>system\n{system_prompt}<end_of_turn>\n<start_of_turn>user\n{user_input}<end_of_turn>\n<start_of_turn>model\n"
-
-    elif model_family == "mistral":
-        return f"[INST] {system_prompt}\n{user_input} [/INST]"
-
-    else:
-        # fallback generic
-        return f"System: {system_prompt}\nUser: {user_input}\nAssistant:"
 
 def stream_google(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None, timezone='UTC'):
     try:
@@ -838,18 +757,10 @@ def stream_llamacpp(model_instance, model_id_str, user_input, conversation_histo
             all_configs = json.load(f)
         config = all_configs.get(model_id_str, {})
 
-        # --- New Reactive Tool Use Prompting ---
-        tool_instructions = ""
-        if tools:
-            tool_instructions = """You have access to a supervisor AI that can help you perform tasks.
-When you receive a user's query, first try to answer it using your own internal knowledge.
-If you are uncertain, do not know the answer, or need to search the web, you MUST use the 'ask_supervisor_for_help' tool.
-Provide the user's original query to the supervisor so it can perform the necessary action."""
-
         now = datetime.now()
         time_message = f"Current Time: {now.strftime('%H:%M')} | Current Date: {now.strftime('%m/%d/%Y')} | User Timezone: {timezone}"
 
-        full_system_prompt = f"{tool_instructions}\n\n{time_message}\n\n{system_prompt}"
+        full_system_prompt = f"{time_message}\n\n{system_prompt}"
         if memory_context and memory_context.strip().lower() not in ["none", "null", "[]"]:
             full_system_prompt += f"\n\nRelevant Memories:\n{memory_context}"
 
@@ -919,7 +830,10 @@ Provide the user's original query to the supervisor so it can perform the necess
             request_params["tool_choice"] = "auto"
 
         stream = model_instance.create_chat_completion(**request_params)
-
+        if model_states.get(model_id_str, {}).get('uses_chat_handler'):
+            for msg in messages:
+                if isinstance(msg.get('content'), str):
+                    msg['content'] = strip_outer_template_wrappers(msg['content'])
         active_tool_calls = {}
         for chunk in stream:
             if should_stop():
@@ -1348,7 +1262,6 @@ def stream_safetensors(model_instance, model_id_str, user_input, conversation_hi
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
 
 def detect_safetensors_model_family(model_path):
     """Universal model family detection for ANY model"""

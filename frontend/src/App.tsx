@@ -372,9 +372,9 @@ const App: React.FC = () => {
     const handleVoiceStream = (data: { audio: ArrayBuffer }) => visualizerRef.current?.receiveAudio(data.audio);
     const handleVoiceStreamEnd = () => visualizerRef.current?.stop();
     const handleTranscriptionResult = (data: { text: string }) => visualizerRef.current?.startProcessing(data.text);
-    const handleCommandResponse = (data: { type: string, message: string, url?: string, video_id?: string, urls?: string[] }) => {
+    const handleCommandResponse = (data: { type: string, message: string, url?: string, video_id?: string, urls?: string[], sender?: string }) => {
       const newMessage: Message = {
-        sender: aiName,
+        sender: data.sender || aiName,
         message: data.message,
         type: data.type === 'error' ? 'error' : 'ai',
         imageB64: null,

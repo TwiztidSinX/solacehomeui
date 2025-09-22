@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import os
+import re
 import struct
 import tempfile
 import threading
@@ -498,15 +499,17 @@ def handle_chat(data):
     # --- Hybrid Orchestration Logic ---
     # 1. Always check for slash commands first (instant)
     command = parse_command(user_input)
+    from orchestrator import summarize_text, get_tool_call
+    from tools import dispatch_tool, TOOLS_SCHEMA
     if command:
         query = command['query']
-        response_payload = {'type': 'error', 'message': f"Unknown command: {command['command']}"}
+        response_payload = {'type': 'error', 'message': f"Unknown command: {command['command']}", 'sender': 'Nova'}
         try:
             # ... (existing command handling logic) ...
             if command['command'] == 'search':
                 encoded_query = urllib.parse.quote(query)
                 search_url = f"http://localhost:8088/?q={encoded_query}"
-                response_payload = {'type': 'iframe', 'url': search_url, 'message': f"Searching for: `{query}`"}
+                response_payload = {'type': 'iframe', 'url': search_url, 'message': f"Searching for: `{query}`", 'sender': 'Nova'}
             
             elif command['command'] == 'youtube':
                 encoded_query = urllib.parse.quote(f"!yt {query}")
@@ -515,9 +518,9 @@ def handle_chat(data):
                 first_video = next((r for r in response.get('results', []) if 'youtube.com/watch' in r.get('url', '')), None)
                 if first_video:
                     video_id = first_video['url'].split('v=')[1].split('&')[0]
-                    response_payload = {'type': 'youtube_embed', 'video_id': video_id, 'message': f"Here is the top YouTube result for `{query}`:"}
+                    response_payload = {'type': 'youtube_embed', 'video_id': video_id, 'message': f"Here is the top YouTube result for `{query}`:", 'sender': 'Nova'}
                 else:
-                    response_payload = {'type': 'error', 'message': f"No YouTube results found for '{query}'."}
+                    response_payload = {'type': 'error', 'message': f"No YouTube results found for '{query}'.", 'sender': 'Nova'}
             
             elif command['command'] == 'read':
                 response = requests.get(query, timeout=15).text
@@ -525,16 +528,16 @@ def handle_chat(data):
                 clean_text = re.sub(r'<.*?>', ' ', clean_text)
                 clean_text = ' '.join(clean_text.split())
                 summary = summarize_text(clean_text[:8000])
-                response_payload = {'type': 'info', 'message': f"**Summary of {query}:**\n\n{summary}"}
+                response_payload = {'type': 'info', 'message': f"**Summary of {query}:**\n\n{summary}", 'sender': 'Nova'}
 
             elif command['command'] == 'calc':
                 answer = summarize_text(f"Calculate the following expression and provide only the numerical answer: {query}")
-                response_payload = {'type': 'info', 'message': f"`{query}` = **{answer}**"}
+                response_payload = {'type': 'info', 'message': f"`{query}` = **{answer}**", 'sender': 'Nova'}
 
         except requests.exceptions.RequestException as e:
-            response_payload = {'type': 'error', 'message': f"Command failed due to a network error: {e}"}
+            response_payload = {'type': 'error', 'message': f"Command failed due to a network error: {e}", 'sender': 'Nova'}
         except Exception as e:
-            response_payload = {'type': 'error', 'message': f"An unexpected error occurred: {e}"}
+            response_payload = {'type': 'error', 'message': f"An unexpected error occurred: {e}", 'sender': 'Nova'}
         
         emit('command_response', response_payload)
         if session_id:
@@ -569,6 +572,10 @@ def handle_chat(data):
         emit('error', {'message': 'No model loaded.'})
         return
     
+    # Get the config for the current model to pass thinking level
+    if current_model_path_string in model_configs:
+        data['thinking_level'] = model_configs[current_model_path_string].get('thinking_level', 'medium')
+
     sid = request.sid
     socketio.start_background_task(stream_response, data, sid)
 
@@ -603,18 +610,14 @@ def stream_response(data, sid):
             model_instance = current_model_path_string
 
         if backend in local_backends:
-            tools = []
-            if os.path.exists('tools.json'):
-                with open('tools.json', 'r') as f:
-                    tools = json.load(f)
-
             model_response_generator = stream_gpt(
                 model_instance, current_model_path_string, data['text'], 
                 conversation_history=data.get('history', []),
                 should_stop=lambda: stop_streaming,
                 backend=backend, provider=provider, image_data=data.get('image_base_64'),
-                timezone=timezone, tools=tools,
-                debug_mode=data.get('debug_mode', False)
+                timezone=timezone, tools=TOOLS_SCHEMA,
+                debug_mode=data.get('debug_mode', False),
+                thinking_level=data.get('thinking_level', 'medium') # Pass thinking level
             )
 
             tool_calls = []
