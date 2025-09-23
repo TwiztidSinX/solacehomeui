@@ -32,6 +32,9 @@ const App: React.FC = () => {
   const streamingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const inThinkingMode = useRef(false);
   const tokenHistory = useRef('');
+  const ttsBufferRef = useRef(''); // Buffer for sentence-based TTS
+  const audioQueueRef = useRef<Blob[]>([]); // Queue for incoming audio chunks
+  const isPlayingAudioRef = useRef(false); // Flag to prevent concurrent playback
 
   // Chat State
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
@@ -40,6 +43,8 @@ const App: React.FC = () => {
   const [isStreaming, setIsStreaming] = useState(false);
   const [imageToSend, setImageToSend] = useState<string | null>(null);
   const [isAgentMode, setIsAgentMode] = useState(false);
+  const [messageInputText, setMessageInputText] = useState(''); // New state for the input
+  const [isHandsFreeMode, setIsHandsFreeMode] = useState(false); // State for speech-to-speech
   
   // Settings State
   const [allConfigs, setAllConfigs] = useState<{ [key: string]: ModelConfig }>({});
@@ -251,18 +256,17 @@ const App: React.FC = () => {
     };
 
     const handleStream = (token: string) => {
-      // Always update the token history for tag detection
+      // This function handles both the visual display of tokens and the TTS buffering.
+      
+      // 1. Update the visual message state (handles <think> tags)
       tokenHistory.current += token;
       if (tokenHistory.current.length > MAX_HISTORY_LENGTH) {
         tokenHistory.current = tokenHistory.current.slice(-MAX_HISTORY_LENGTH);
       }
-
-      // Helper to update the last message in the state
       const updateLastMessage = (updater: (lastMessage: Message) => Message) => {
         setMessages(prev => {
           if (prev.length === 0) return prev;
           const last = prev[prev.length - 1];
-          // Ensure we only update AI messages
           if (last.sender === aiName) {
             const updatedLast = updater({ ...last });
             return [...prev.slice(0, -1), updatedLast];
@@ -270,100 +274,101 @@ const App: React.FC = () => {
           return prev;
         });
       };
-
-      // Check for the end of a thinking block
       if (inThinkingMode.current) {
         for (const endTag of THINKING_END_TOKENS) {
           if (tokenHistory.current.endsWith(endTag)) {
             inThinkingMode.current = false;
-            // Capture content before the tag
-            const tagIndex = token.lastIndexOf(endTag.charAt(0)); // Find start of potential tag in current token
+            const tagIndex = token.lastIndexOf(endTag.charAt(0));
             const contentBeforeTag = tagIndex !== -1 ? token.slice(0, tagIndex) : token;
-            
             if (contentBeforeTag) {
               updateLastMessage(last => {
                 last.thought = (last.thought || '') + contentBeforeTag;
                 return last;
               });
             }
-            tokenHistory.current = ''; // Reset history after tag processing
+            tokenHistory.current = '';
             return;
           }
         }
-        // If still in thinking mode, append the whole token to thought
         updateLastMessage(last => {
           last.thought = (last.thought || '') + token;
-          last.isThinking = true; // Keep thinking flag active
+          last.isThinking = true;
           return last;
         });
         return;
       }
-
-      // Check for the start of a thinking block
       if (!inThinkingMode.current) {
         for (const startTag of THINKING_START_TOKENS) {
           if (tokenHistory.current.endsWith(startTag)) {
             inThinkingMode.current = true;
-            // Capture any regular message content that came *before* the think tag in the same stream packet
             const tagIndex = token.lastIndexOf(startTag.charAt(0));
             const contentBeforeTag = tagIndex !== -1 ? token.slice(0, tagIndex) : '';
-            
             if (contentBeforeTag) {
                updateLastMessage(last => {
                   last.message += contentBeforeTag;
                   return last;
                });
+               if (isHandsFreeMode) ttsBufferRef.current += contentBeforeTag;
             }
-            // Activate thinking mode on the message
             updateLastMessage(last => {
               last.isThinking = true;
               return last;
             });
-            tokenHistory.current = ''; // Reset history
+            tokenHistory.current = '';
             return;
           }
         }
-        // If not starting a thought, append the token to the main message
         updateLastMessage(last => {
           last.message += token;
-          last.isThinking = false; // Explicitly not thinking
+          last.isThinking = false;
           return last;
         });
+        
+        // 2. Handle TTS buffering if in hands-free mode and not thinking
+        if (isHandsFreeMode && !inThinkingMode.current) {
+            ttsBufferRef.current += token;
+            if (/[.!?]/.test(ttsBufferRef.current)) {
+                if (socketRef.current) socketRef.current.emit('tts', { text: ttsBufferRef.current });
+                ttsBufferRef.current = '';
+            }
+        }
       }
     };
 
     const handleStreamEnd = () => {
-      if (streamingTimeoutRef.current) {
-        clearTimeout(streamingTimeoutRef.current);
-      }
+      if (streamingTimeoutRef.current) clearTimeout(streamingTimeoutRef.current);
       setIsStreaming(false);
-      inThinkingMode.current = false; // Ensure thinking mode is off
+      inThinkingMode.current = false;
 
-      // Final update to the message to set isThinking to false
+      // Flush any remaining text in the TTS buffer
+      if (isHandsFreeMode && ttsBufferRef.current.trim()) {
+          if (socketRef.current) socketRef.current.emit('tts', { text: ttsBufferRef.current });
+          ttsBufferRef.current = '';
+      }
+
+      // Finalize the message state and save to DB
       setMessages(prev => {
         if (prev.length === 0) return prev;
         const last = { ...prev[prev.length - 1] };
         if (last.sender === aiName) {
           last.isThinking = false;
-          // Save the final message if it's not empty
           if (last.message.trim() && activeChatId) {
             const messageToSave = {
               sender: aiName,
               message: last.message,
               type: 'ai' as 'ai',
-              // Do not save thought, isThinking, etc.
             };
-            socketRef.current.emit('save_message', {
-              session_id: activeChatId,
-              message: messageToSave
-            });
+            if (socketRef.current) {
+              socketRef.current.emit('save_message', {
+                session_id: activeChatId,
+                message: messageToSave
+              });
+            }
           }
           return [...prev.slice(0, -1), last];
         }
         return prev;
       });
-
-      // Reset token history
       tokenHistory.current = '';
     };
 
@@ -378,9 +383,42 @@ const App: React.FC = () => {
     };
     const handleConfigs = (data: { [key: string]: ModelConfig }) => setAllConfigs(data);
     const handleGraphData = (data: GraphData) => setGraphData(data);
-    const handleVoiceStream = (data: { audio: ArrayBuffer }) => visualizerRef.current?.receiveAudio(data.audio);
-    const handleVoiceStreamEnd = () => visualizerRef.current?.stop();
-    const handleTranscriptionResult = (data: { text: string }) => visualizerRef.current?.startProcessing(data.text);
+    // --- New Audio Playback Queue Logic ---
+    const playNextInQueue = () => {
+        if (audioQueueRef.current.length > 0 && !isPlayingAudioRef.current) {
+            isPlayingAudioRef.current = true;
+            const audioBlob = audioQueueRef.current.shift();
+            if (audioBlob) {
+                const audioUrl = URL.createObjectURL(audioBlob);
+                const audio = new Audio(audioUrl);
+                audio.play();
+                audio.onended = () => {
+                    isPlayingAudioRef.current = false;
+                    playNextInQueue(); // Play the next audio in the queue
+                };
+            }
+        }
+    };
+
+    const handleVoiceStream = (data: { audio: ArrayBuffer }) => {
+      const blob = new Blob([data.audio], { type: 'audio/mpeg' });
+      audioQueueRef.current.push(blob);
+      playNextInQueue(); // Attempt to play immediately
+      if (visualizerRef.current) visualizerRef.current.receiveAudio(data.audio);
+    };
+    
+    const handleVoiceStreamEnd = () => {
+      if (visualizerRef.current) visualizerRef.current.stop();
+    };
+
+    const handleTranscriptionResult = (data: { text: string }) => {
+      if (isHandsFreeMode) {
+        handleSendMessage(data.text);
+      } else {
+        setMessageInputText(data.text);
+      }
+      if (visualizerRef.current) visualizerRef.current.startProcessing(data.text);
+    };
     const handleCommandResponse = (data: { type: string, message: string, url?: string, video_id?: string, urls?: string[], sender?: string }) => {
       const newMessage: Message = {
         sender: data.sender || aiName,
@@ -645,6 +683,8 @@ const App: React.FC = () => {
                   setImage={setImageToSend}
                   isAgentMode={isAgentMode}
                   onAgentModeChange={setIsAgentMode}
+                  message={messageInputText} // Pass the state down
+                  onMessageChange={setMessageInputText} // Pass the setter down
                 />
               </div>
             </div>
@@ -732,7 +772,12 @@ const App: React.FC = () => {
 
       {/* Voice Panel */}
       <div className={`flex-shrink-0 h-full w-80 bg-gray-800/80 backdrop-blur-sm p-4 flex flex-col transform transition-transform duration-300 ease-in-out z-20 ${isVoicePanelOpen ? 'translate-x-0' : 'translate-x-full'}`} style={{ backgroundColor: 'var(--primary-color)' }}>
-        <VoicePanel onClose={() => setIsVoicePanelOpen(false)} />
+        <VoicePanel 
+          onClose={() => setIsVoicePanelOpen(false)} 
+          socket={socketRef.current}
+          isHandsFreeMode={isHandsFreeMode}
+          onHandsFreeModeChange={setIsHandsFreeMode}
+        />
       </div>
     </div>
   );

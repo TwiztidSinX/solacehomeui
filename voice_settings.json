@@ -1,1 +1,17 @@
-{}
+{
+    "tts": {
+        "type": "local",
+        "provider": "openai",
+        "url": "http://localhost:8880/v1",
+        "apiKey": "",
+        "model": "kokoro",
+        "voice": "af_sky+af_bella"
+    },
+    "stt": {
+        "type": "local",
+        "provider": "openai",
+        "url": "",
+        "apiKey": "",
+        "model": ""
+    }
+}

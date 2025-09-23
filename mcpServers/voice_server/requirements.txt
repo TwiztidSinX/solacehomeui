@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-multipart
+coqui-tts
+faster-whisper
+torch
+torchaudio
+pydub
+llama-cpp-python 

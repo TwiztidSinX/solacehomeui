@@ -17,11 +17,16 @@ export class VoiceVisualizer {
   private audioQueue: ArrayBuffer[];
   private isPlaying: boolean;
 
-  constructor() {
-    this.logo = document.getElementById('voice-logo')!;
-    this.dots = document.getElementById('processing-dots')!;
-    this.canvas = document.getElementById('waveform-canvas') as HTMLCanvasElement;
-    this.statusLabel = document.getElementById('voice-status-label')!;
+  constructor(logoEl: HTMLElement, dotsEl: HTMLElement, canvasEl: HTMLCanvasElement, statusLabelEl: HTMLElement) {
+    this.logo = logoEl;
+    this.dots = dotsEl;
+    this.canvas = canvasEl;
+    this.statusLabel = statusLabelEl;
+    
+    if (!this.logo || !this.dots || !this.canvas || !this.statusLabel) {
+      throw new Error("VoiceVisualizer: One or more required DOM elements were not provided.");
+    }
+
     this.canvasCtx = this.canvas.getContext('2d')!;
     this.state = 'idle';
     this.audioContext = null;
@@ -32,7 +37,7 @@ export class VoiceVisualizer {
     this.audioQueue = [];
     this.isPlaying = false;
 
-    this.dots.innerHTML = '<div></div><div></div><div></div>';
+    // The component will be responsible for the initial innerHTML
   }
 
   private _transition(elementToShow: HTMLElement, elementToHide: HTMLElement | null, newLabel: string): Promise<void> {

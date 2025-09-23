@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useRef, useEffect } from 'react';
 
 interface MessageInputProps {
   onSendMessage: (message: string) => void;
@@ -8,10 +8,21 @@ interface MessageInputProps {
   setImage: (image: string | null) => void;
   isAgentMode: boolean;
   onAgentModeChange: (isAgentMode: boolean) => void;
+  message: string;
+  onMessageChange: (message: string) => void;
 }
 
-const MessageInput: React.FC<MessageInputProps> = ({ onSendMessage, onStop, isStreaming, image, setImage, isAgentMode, onAgentModeChange }) => {
-  const [message, setMessage] = useState('');
+const MessageInput: React.FC<MessageInputProps> = ({ 
+  onSendMessage, 
+  onStop, 
+  isStreaming, 
+  image, 
+  setImage, 
+  isAgentMode, 
+  onAgentModeChange,
+  message,
+  onMessageChange
+}) => {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -24,7 +35,7 @@ const MessageInput: React.FC<MessageInputProps> = ({ onSendMessage, onStop, isSt
   const handleSend = () => {
     if (message.trim() || image) {
       onSendMessage(message);
-      setMessage('');
+      onMessageChange(''); // Clear the input in the parent state
     }
   };
 
@@ -75,26 +86,18 @@ const MessageInput: React.FC<MessageInputProps> = ({ onSendMessage, onStop, isSt
             placeholder="Type your message or drop/paste an image..."
             rows={1}
             value={message}
-            onChange={(e) => setMessage(e.target.value)}
+            onChange={(e) => onMessageChange(e.target.value)}
             onKeyDown={handleKeyDown}
             onPaste={handleImagePaste}
             style={{ minHeight: '44px' }}
           />
           <div className="flex items-center ml-4">
-            <label htmlFor="agent-mode-toggle" className="flex items-center cursor-pointer mr-4">
-              <span className="mr-2 text-gray-300 text-sm">Agent Mode</span>
-              <div className="relative">
-                <input 
-                  type="checkbox" 
-                  id="agent-mode-toggle" 
-                  className="sr-only" 
-                  checked={isAgentMode} 
-                  onChange={(e) => onAgentModeChange(e.target.checked)}
-                />
-                <div className="block bg-gray-600 w-10 h-6 rounded-full"></div>
-                <div className={`dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition transform ${isAgentMode ? 'translate-x-full bg-blue-400' : 'translate-x-0'}`}></div>
-              </div>
-            </label>
+            <button
+              onClick={() => onAgentModeChange(!isAgentMode)}
+              className={`mr-4 px-4 py-2 rounded-lg text-white font-semibold transition-colors duration-200 ${isAgentMode ? 'bg-blue-500 hover:bg-blue-600' : 'bg-gray-700 hover:bg-gray-600'}`}
+            >
+              Agent Mode
+            </button>
             {isStreaming ? (
               <button id="stop-button" className="bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-4 rounded-lg" onClick={onStop}>
                 Stop

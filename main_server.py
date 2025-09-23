@@ -150,46 +150,37 @@ def export_graph_json():
     return {"nodes": valid_nodes, "edges": valid_edges}
 
 def text_to_speech_stream(text: str):
-    with open('voice_settings.json', 'r') as f:
-        settings = json.load(f).get('tts', {})
+    """
+    Acts as a client to the dedicated voice server.
+    Forwards the TTS request and streams back the audio response.
+    """
+    try:
+        # Load the voice settings to determine which model to request
+        with open('voice_settings.json', 'r') as f:
+            settings = json.load(f).get('tts', {})
+        
+        # The 'model' field in settings should correspond to the model folder name
+        model_name = settings.get('model', 'Kyutai-TTS-0.75B') 
+        speaker = settings.get('voice') # Pass speaker if specified
 
-    if settings.get('type') == 'local':
-        url = settings.get('url', 'http://localhost:8880/v1/audio/speech')
-        payload = {"text": text, "language": "en"}
-        try:
-            response = requests.post(url, json=payload, stream=True, timeout=30)
-            response.raise_for_status()
-            for chunk in response.iter_content(chunk_size=4096):
-                yield chunk
-        except requests.exceptions.RequestException as e:
-            print(f"❌ Local TTS error: {e}")
-            yield b''
-    elif settings.get('type') == 'cloud':
-        provider = settings.get('provider', 'openai') # Default to openai if not specified
-        if provider == 'openai':
-            api_key = settings.get('apiKey')
-            model = settings.get('model', 'tts-1')
-            voice = settings.get('voice', 'alloy')
-            url = 'https://api.openai.com/v1/audio/speech'
-            headers = {'Authorization': f'Bearer {api_key}'}
-            payload = {'model': model, 'input': text, 'voice': voice, 'response_format': 'mp3'}
-            try:
-                response = requests.post(url, headers=headers, json=payload, stream=True, timeout=30)
-                response.raise_for_status()
-                for chunk in response.iter_content(chunk_size=4096):
-                    yield chunk
-            except requests.exceptions.RequestException as e:
-                print(f"❌ OpenAI TTS error: {e}")
-                yield b''
-        elif provider == 'google':
-            from google.cloud import texttospeech
-            client = texttospeech.TextToSpeechClient()
-            synthesis_input = texttospeech.SynthesisInput(text=text)
-            voice = texttospeech.VoiceSelectionParams(language_code="en-US", ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL)
-            audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3)
-            response = client.synthesize_speech(input=synthesis_input, voice=voice, audio_config=audio_config)
-            yield response.audio_content
-    else:
+        voice_server_url = 'http://localhost:8880/tts'
+        payload = {
+            "text": text,
+            "model_name": model_name,
+            "speaker": speaker
+        }
+        
+        response = requests.post(voice_server_url, json=payload, stream=True, timeout=60)
+        response.raise_for_status()
+        
+        for chunk in response.iter_content(chunk_size=4096):
+            yield chunk
+
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Voice server TTS error: {e}")
+        yield b'' # Return empty bytes on error
+    except Exception as e:
+        print(f"❌ An unexpected error occurred in TTS streaming: {e}")
         yield b''
 
 def listen_for_hotword():
@@ -867,13 +858,24 @@ def handle_tts(data):
 
 @socketio.on('transcribe')
 def handle_transcribe(data):
+    audio_data = data.get('audio')
+    if not audio_data:
+        return
+
     with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as fp:
-        fp.write(data['audio'])
+        fp.write(audio_data)
         audio_path = fp.name
     
-    transcription = transcribe_audio(audio_path)
-    os.remove(audio_path)
-    emit('transcription_result', {'text': transcription})
+    try:
+        transcription = transcribe_audio(audio_path)
+        # After transcription, populate the user's input field
+        # For this, we might need a new event or just send it back as a result
+        emit('transcription_result', {'text': transcription})
+    except Exception as e:
+        print(f"Transcription failed: {e}")
+        emit('error', {'message': f"Transcription failed: {e}"})
+    finally:
+        os.remove(audio_path)
 
 def transcribe_audio(audio_path):
     with open('voice_settings.json', 'r') as f:
