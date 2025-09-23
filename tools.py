@@ -248,7 +248,9 @@ def focus_window(title_substring: str):
             return f"Error: No window found with title containing '{title_substring}'."
         # Get the first matching window and activate it
         win = windows[0]
-        win.activate()
+        # A more reliable way to bring a window to the front on modern Windows
+        win.minimize()
+        win.restore()
         return f"Successfully focused window: {win.title}"
     except Exception as e:
         print(f"Focus window tool failed: {e}")

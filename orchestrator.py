@@ -3,37 +3,8 @@ import os
 import json
 import re
 
-# --- Project Root ---
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ORCHESTRATOR_MODEL_PATH = os.path.join(BASE_DIR, "models", "llama", "Qwen3-1.7B-Q8_0.gguf").replace("\\", "/")
-
-orchestrator_model = None
-
-def load_orchestrator_model():
-    """Loads the small Qwen model into RAM for orchestration tasks."""
-    global orchestrator_model
-    if orchestrator_model is None:
-        print("Loading Orchestrator Model...")
-        try:
-            orchestrator_model = Llama(
-                model_path=ORCHESTRATOR_MODEL_PATH,
-                n_ctx=2048,
-                n_gpu_layers=0,  # Force to RAM
-                verbose=False
-            )
-            print("Orchestrator Model Loaded.")
-        except Exception as e:
-            print(f"FAILED to load Orchestrator Model: {e}")
-            orchestrator_model = None
-
-from llama_cpp import Llama
-import os
-import json
-import re
-
 # Import the new tool schema
-from tools import TOOLS_SCHEMA
-
+from tools import TOOLS_SCHEMA, search_web
 # --- Project Root ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ORCHESTRATOR_MODEL_PATH = os.path.join(BASE_DIR, "models", "llama", "Qwen3-1.7B-Q8_0.gguf").replace("\\", "/")
@@ -48,7 +19,7 @@ def load_orchestrator_model():
         try:
             orchestrator_model = Llama(
                 model_path=ORCHESTRATOR_MODEL_PATH,
-                n_ctx=2048,
+                n_ctx=32768,
                 n_gpu_layers=0,  # Force to RAM
                 verbose=False
             )
@@ -59,41 +30,86 @@ def load_orchestrator_model():
 
 def get_tool_call(user_input: str):
     """
-    Uses the orchestrator model to decide if a tool call is necessary.
+    Uses the orchestrator model to decide if a tool call is necessary by treating
+    the task as a text-to-JSON translation.
     Returns the tool call details if needed, otherwise None.
     """
     if orchestrator_model is None:
         print("Orchestrator model not loaded. Skipping tool call check.")
         return None
 
-    # Create the prompt for the orchestrator
+    # A more direct, machine-like prompt that frames the task as a translation.
+    system_prompt = """Your task is to translate user requests into function calls based on the provided tool descriptions. If a suitable function exists, output the JSON for the function call. If no function is suitable, output the word 'None'.
+
+### Tools Available
+{tools_json}
+
+### Examples
+User: What windows are open on the computer right now?
+Assistant: {{"name": "list_open_windows", "arguments": {{}}}}
+
+User: can you look up the latest news about nvidia?
+Assistant: {{"name": "search_news", "arguments": {{"query": "latest news about nvidia"}}}}
+
+User: bring the discord window to the front
+Assistant: {{"name": "focus_window", "arguments": {{"title_substring": "discord"}}}}
+
+User: Hey how are you doing?
+Assistant: None"""
+
+    # Inject the tool schema directly into the prompt
+    prompt_with_tools = system_prompt.format(tools_json=json.dumps(TOOLS_SCHEMA, indent=2))
+
     messages = [
-        {"role": "system", "content": "You are a helpful assistant that decides if a function call is needed to answer the user's question. Use the provided tools to answer questions that require up-to-date information or external capabilities. Do not answer the question yourself, only call a tool if necessary."},
+        {"role": "system", "content": prompt_with_tools},
         {"role": "user", "content": user_input}
     ]
 
     try:
+        # Simplified call: ask for plain text generation, not a tool call.
         response = orchestrator_model.create_chat_completion(
             messages=messages,
-            tools=TOOLS_SCHEMA,
-            tool_choice="auto",
-            temperature=0.0
+            temperature=0.0,
+            max_tokens=512 # Increased token limit for safety
         )
 
-        tool_calls = response.get('choices', [{}])[0].get('message', {}).get('tool_calls')
-        if tool_calls:
-            # For now, we only handle the first tool call
-            tool_call = tool_calls[0]
-            tool_name = tool_call.get('function', {}).get('name')
-            arguments = json.loads(tool_call.get('function', {}).get('arguments', '{}'))
-            
-            print(f"Orchestrator decided to call tool: {tool_name} with args: {arguments}")
-            return {"name": tool_name, "arguments": arguments}
+        content = response.get('choices', [{}])[0].get('message', {}).get('content', '').strip()
+        
+        print(f"Orchestrator raw output: {content}")
+
+        if content.lower() == 'none':
+            print("Orchestrator decided no tool call is needed.")
+            return None
+        
+        # The model might output multiple JSON objects for sequential tool calls.
+        # We need to find all of them.
+        json_matches = re.finditer(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', content, re.DOTALL)
+        tool_calls = []
+        
+        for match in json_matches:
+            json_string = match.group(0)
+            try:
+                tool_call_data = json.loads(json_string)
+                # Basic validation of the parsed structure
+                if "name" in tool_call_data and "arguments" in tool_call_data:
+                    print(f"Orchestrator parsed tool call: {tool_call_data}")
+                    tool_calls.append(tool_call_data)
+                else:
+                    print(f"Orchestrator generated JSON with missing keys: {json_string}")
+            except json.JSONDecodeError:
+                print(f"Orchestrator generated invalid JSON snippet: {json_string}")
+                continue # Try the next match
+
+        if not tool_calls:
+            print("Orchestrator did not generate any valid tool calls.")
+            return []
+
+        return tool_calls
 
     except Exception as e:
         print(f"Orchestrator tool call check failed: {e}")
 
-    return None
+    return []
 
 def get_summary_for_title(text: str):
     """
@@ -239,7 +255,7 @@ if __name__ == '__main__':
         ]
         for query in test_queries:
             print(f"\n--- Testing Query: '{query}' ---")
-            search_query = should_perform_web_search(query)
+            search_query = search_web(query)
             if search_query:
                 print(f"Result: Web search needed for '{search_query}'")
             else:

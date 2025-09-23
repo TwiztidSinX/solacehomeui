@@ -39,6 +39,7 @@ const App: React.FC = () => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const [imageToSend, setImageToSend] = useState<string | null>(null);
+  const [isAgentMode, setIsAgentMode] = useState(false);
   
   // Settings State
   const [allConfigs, setAllConfigs] = useState<{ [key: string]: ModelConfig }>({});
@@ -250,61 +251,83 @@ const App: React.FC = () => {
     };
 
     const handleStream = (token: string) => {
+      // Always update the token history for tag detection
       tokenHistory.current += token;
       if (tokenHistory.current.length > MAX_HISTORY_LENGTH) {
         tokenHistory.current = tokenHistory.current.slice(-MAX_HISTORY_LENGTH);
       }
 
-      const updateLastMessage = (updater: (lastMessage: Message) => void) => {
+      // Helper to update the last message in the state
+      const updateLastMessage = (updater: (lastMessage: Message) => Message) => {
         setMessages(prev => {
           if (prev.length === 0) return prev;
-          const last = { ...prev[prev.length - 1] };
+          const last = prev[prev.length - 1];
+          // Ensure we only update AI messages
           if (last.sender === aiName) {
-            updater(last);
-            return [...prev.slice(0, -1), last];
+            const updatedLast = updater({ ...last });
+            return [...prev.slice(0, -1), updatedLast];
           }
           return prev;
         });
       };
 
+      // Check for the end of a thinking block
+      if (inThinkingMode.current) {
+        for (const endTag of THINKING_END_TOKENS) {
+          if (tokenHistory.current.endsWith(endTag)) {
+            inThinkingMode.current = false;
+            // Capture content before the tag
+            const tagIndex = token.lastIndexOf(endTag.charAt(0)); // Find start of potential tag in current token
+            const contentBeforeTag = tagIndex !== -1 ? token.slice(0, tagIndex) : token;
+            
+            if (contentBeforeTag) {
+              updateLastMessage(last => {
+                last.thought = (last.thought || '') + contentBeforeTag;
+                return last;
+              });
+            }
+            tokenHistory.current = ''; // Reset history after tag processing
+            return;
+          }
+        }
+        // If still in thinking mode, append the whole token to thought
+        updateLastMessage(last => {
+          last.thought = (last.thought || '') + token;
+          last.isThinking = true; // Keep thinking flag active
+          return last;
+        });
+        return;
+      }
+
+      // Check for the start of a thinking block
       if (!inThinkingMode.current) {
         for (const startTag of THINKING_START_TOKENS) {
           if (tokenHistory.current.endsWith(startTag)) {
             inThinkingMode.current = true;
-            const tagIndex = tokenHistory.current.lastIndexOf(startTag);
-            const contentBeforeTag = tokenHistory.current.slice(0, tagIndex);
+            // Capture any regular message content that came *before* the think tag in the same stream packet
+            const tagIndex = token.lastIndexOf(startTag.charAt(0));
+            const contentBeforeTag = tagIndex !== -1 ? token.slice(0, tagIndex) : '';
+            
             if (contentBeforeTag) {
-                updateLastMessage(last => {
-                    last.message += contentBeforeTag;
-                    last.isThinking = false;
-                });
+               updateLastMessage(last => {
+                  last.message += contentBeforeTag;
+                  return last;
+               });
             }
-            tokenHistory.current = '';
-            updateLastMessage(last => { last.isThinking = true; });
+            // Activate thinking mode on the message
+            updateLastMessage(last => {
+              last.isThinking = true;
+              return last;
+            });
+            tokenHistory.current = ''; // Reset history
             return;
           }
         }
+        // If not starting a thought, append the token to the main message
         updateLastMessage(last => {
-            last.message += token;
-            last.isThinking = false;
-        });
-      } else {
-        for (const endTag of THINKING_END_TOKENS) {
-          if (tokenHistory.current.endsWith(endTag)) {
-            inThinkingMode.current = false;
-            const tagIndex = tokenHistory.current.lastIndexOf(endTag);
-            const contentBeforeTag = tokenHistory.current.slice(0, tagIndex);
-            if (contentBeforeTag) {
-              updateLastMessage(last => { last.thought = (last.thought || '') + contentBeforeTag; });
-            }
-            tokenHistory.current = '';
-            updateLastMessage(last => { last.isThinking = false; });
-            return;
-          }
-        }
-        updateLastMessage(last => {
-            last.thought = (last.thought || '') + token;
-            last.isThinking = true;
+          last.message += token;
+          last.isThinking = false; // Explicitly not thinking
+          return last;
         });
       }
     };
@@ -314,48 +337,34 @@ const App: React.FC = () => {
         clearTimeout(streamingTimeoutRef.current);
       }
       setIsStreaming(false);
+      inThinkingMode.current = false; // Ensure thinking mode is off
 
-      if (tokenHistory.current) {
-          if(inThinkingMode.current) {
-              setMessages(prev => {
-                  const last = prev[prev.length - 1];
-                  if (last?.sender === aiName) {
-                      last.thought = (last.thought || '') + tokenHistory.current;
-                  }
-                  return [...prev];
-              });
-          } else {
-              setMessages(prev => {
-                  const last = prev[prev.length - 1];
-                  if (last?.sender === aiName) {
-                      last.message += tokenHistory.current;
-                  }
-                  return [...prev];
-              });
-          }
-      }
-
-      tokenHistory.current = '';
-      inThinkingMode.current = false;
-
+      // Final update to the message to set isThinking to false
       setMessages(prev => {
-        const last = prev[prev.length - 1];
-        if (last?.sender === aiName) {
+        if (prev.length === 0) return prev;
+        const last = { ...prev[prev.length - 1] };
+        if (last.sender === aiName) {
           last.isThinking = false;
+          // Save the final message if it's not empty
           if (last.message.trim() && activeChatId) {
             const messageToSave = {
               sender: aiName,
               message: last.message,
-              type: 'ai' as 'ai'
+              type: 'ai' as 'ai',
+              // Do not save thought, isThinking, etc.
             };
             socketRef.current.emit('save_message', {
               session_id: activeChatId,
               message: messageToSave
             });
           }
+          return [...prev.slice(0, -1), last];
         }
-        return [...prev];
+        return prev;
       });
+
+      // Reset token history
+      tokenHistory.current = '';
     };
 
     const handleModelUnloaded = () => addMessage('System', 'Model unloaded.', 'info');
@@ -416,50 +425,56 @@ const App: React.FC = () => {
     socketRef.current.emit('set_backend', { backend: 'api', provider: provider });
   };
   const handleSendMessage = (message: string) => {
-    const userMessage: Message = { sender: userName, message, type: 'user', imageB64: imageToSend };
-    const newMessages = [...messages, userMessage];
-    setMessages(newMessages);
-    
-    // Create a clean history for the backend, stripping large image data from previous turns.
-    const historyForBackend = newMessages.map(msg => {
-      // Keep the image only for the very last message being sent
-      if (msg === userMessage) {
-        return msg;
-      }
-      // For all other messages in history, remove the image data.
-      const { imageB64, ...rest } = msg;
-      return rest;
-    });
-
-    const payload: any = { 
-      text: message, 
-      image_base_64: imageToSend, 
-      history: historyForBackend, // Send the clean history
-      backend: currentBackend,
-      model_path: selectedModel,
-      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-      // --- New DB Fields ---
-      session_id: activeChatId,
-      userName: userName,
-      aiName: aiName,
-      debug_mode: debugMode
-    };
-
-    if (currentBackend === 'api') {
-      payload.provider = apiProvider;
-    }
-
-    socketRef.current.emit('chat', payload);
-    setImageToSend(null); // Clear the image from the input area after sending
-
-    // --- Auto-summarize Title on First Message ---
-    if (newMessages.length === 1 && activeChatId) {
-      socketRef.current.emit('summarize_and_rename', {
+    if (isAgentMode) {
+      // Agent Mode: Send a specific command to the orchestrator
+      const agentMessage: Message = { sender: userName, message: `[Agent Command] ${message}`, type: 'user' };
+      setMessages(prev => [...prev, agentMessage]);
+      
+      socketRef.current.emit('agent_command', {
+        text: message,
         session_id: activeChatId,
-        text: message
+        userName: userName,
       });
+
+    } else {
+      // Chat Mode: Send a message with history to the selected model
+      const userMessage: Message = { sender: userName, message, type: 'user', imageB64: imageToSend };
+      const newMessages = [...messages, userMessage];
+      setMessages(newMessages);
+      
+      const historyForBackend = newMessages.map(msg => {
+        if (msg === userMessage) return msg;
+        const { imageB64, ...rest } = msg;
+        return rest;
+      });
+
+      const payload: any = { 
+        text: message, 
+        image_base_64: imageToSend, 
+        history: historyForBackend,
+        backend: currentBackend,
+        model_path: selectedModel,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        session_id: activeChatId,
+        userName: userName,
+        aiName: aiName,
+        debug_mode: debugMode
+      };
+
+      if (currentBackend === 'api') {
+        payload.provider = apiProvider;
+      }
+
+      socketRef.current.emit('chat', payload);
+      setImageToSend(null);
+
+      if (newMessages.length === 1 && activeChatId) {
+        socketRef.current.emit('summarize_and_rename', {
+          session_id: activeChatId,
+          text: message
+        });
+      }
     }
-    // --- End Auto-summarize ---
   };
 
   const handleStop = () => {
@@ -628,6 +643,8 @@ const App: React.FC = () => {
                   isStreaming={isStreaming} 
                   image={imageToSend}
                   setImage={setImageToSend}
+                  isAgentMode={isAgentMode}
+                  onAgentModeChange={setIsAgentMode}
                 />
               </div>
             </div>

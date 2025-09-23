@@ -479,6 +479,91 @@ def handle_save_message(data):
     if not _save_message_to_db(data.get('session_id'), data.get('message'), data.get('user_id', 'default_user')):
         emit('error', {'message': 'Could not save message: Session not found.'}, room=sid)
 
+@socketio.on('agent_command')
+def handle_agent_command(data):
+    """Handles a direct command to the agent/orchestrator."""
+    user_input = data.get('text', '')
+    session_id = data.get('session_id')
+    sid = request.sid
+    
+    if not user_input:
+        return
+
+    # --- Save User's Agent Command to DB ---
+    if session_id:
+        user_message = {
+            "sender": data.get('userName', 'User'),
+            "message": f"[Agent Command] {user_input}",
+            "type": "user"
+        }
+        _save_message_to_db(session_id, user_message)
+
+    def run_agent_task():
+        full_thought = ""
+        final_response = ""
+        try:
+            socketio.emit('stream_start', {}, room=sid)
+            socketio.sleep(0)
+
+            # 1. Get the list of tool calls from the orchestrator
+            tool_calls = get_tool_call(user_input)
+
+            socketio.emit('stream', '<think>', room=sid)
+            socketio.sleep(0)
+
+            if not tool_calls:
+                final_response = "I wasn't able to determine a tool to use for that command."
+                full_thought = "Orchestrator did not select a tool."
+                socketio.emit('stream', full_thought, room=sid)
+                socketio.sleep(0)
+            else:
+                # 2. Iterate through the sequence of tool calls
+                for i, tool_call in enumerate(tool_calls):
+                    tool_name = tool_call.get("name")
+                    tool_args = tool_call.get("arguments")
+                    
+                    thought_for_dispatch = f"Step {i+1}: Executing tool `{tool_name}` with arguments: `{tool_args}`...\n"
+                    full_thought += thought_for_dispatch
+                    socketio.emit('stream', thought_for_dispatch, room=sid)
+                    socketio.sleep(0)
+
+                    # 3. Dispatch the tool and stream the result
+                    tool_result = dispatch_tool(tool_name, tool_args)
+                    result_text = f"Step {i+1} Result: {tool_result}\n"
+                    full_thought += result_text
+                    final_response += result_text # Aggregate results
+                    socketio.emit('stream', result_text, room=sid)
+                    socketio.sleep(0)
+
+            # 4. Stream the final aggregated response
+            socketio.emit('stream', '</think>', room=sid) # Close thinking block
+            # We don't need to stream the final response again as it was streamed step-by-step
+            socketio.sleep(0)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            error_message = f"An error occurred while running the agent command: {e}"
+            # Ensure think tag is closed on error, if it was ever opened
+            socketio.emit('stream', '</think>', room=sid) 
+            socketio.emit('stream', error_message, room=sid)
+            final_response = error_message
+        finally:
+            socketio.emit('stream_end', {}, room=sid)
+            # --- Save Agent's Final Response to DB ---
+            if session_id and final_response:
+                ai_message = {
+                    "sender": "Nova", # Or a dedicated agent name
+                    "message": final_response,
+                    "type": "ai",
+                    "thought": full_thought
+                }
+                _save_message_to_db(session_id, ai_message)
+
+    # Run the agent task in the background
+    socketio.start_background_task(run_agent_task)
+
+
 @socketio.on('chat')
 def handle_chat(data):
     backend = data.get('backend', current_backend)

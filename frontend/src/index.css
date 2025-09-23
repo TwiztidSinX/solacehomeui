@@ -221,4 +221,4 @@ animation: pulse 0.4s ease-out;
 body {
     background-color: var(--background-color);
     color: var(--text-color);
-}
+}.animate-pulse-glow { animation: pulse-glow 2s infinite ease-in-out; } @keyframes pulse-glow { 0%, 100% { box-shadow: 0 0 8px rgba(74, 144, 226, 0.4); } 50% { box-shadow: 0 0 20px rgba(74, 144, 226, 0.8); } } 

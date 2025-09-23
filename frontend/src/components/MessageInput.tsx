@@ -6,9 +6,11 @@ interface MessageInputProps {
   isStreaming: boolean;
   image: string | null;
   setImage: (image: string | null) => void;
+  isAgentMode: boolean;
+  onAgentModeChange: (isAgentMode: boolean) => void;
 }
 
-const MessageInput: React.FC<MessageInputProps> = ({ onSendMessage, onStop, isStreaming, image, setImage }) => {
+const MessageInput: React.FC<MessageInputProps> = ({ onSendMessage, onStop, isStreaming, image, setImage, isAgentMode, onAgentModeChange }) => {
   const [message, setMessage] = useState('');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -78,17 +80,33 @@ const MessageInput: React.FC<MessageInputProps> = ({ onSendMessage, onStop, isSt
             onPaste={handleImagePaste}
             style={{ minHeight: '44px' }}
           />
-          {isStreaming ? (
-            <button id="stop-button" className="ml-4 bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-4 rounded-lg" onClick={onStop}>
-              Stop
-            </button>
-          ) : (
-            <button id="send-button" className="ml-4 bg-blue-500 hover:bg-blue-600 text-white font-bold p-2 rounded-full w-10 h-10 flex items-center justify-center flex-shrink-0" onClick={handleSend}>
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 10l7-7m0 0l7 7m-7-7v18" />
-              </svg>
-            </button>
-          )}
+          <div className="flex items-center ml-4">
+            <label htmlFor="agent-mode-toggle" className="flex items-center cursor-pointer mr-4">
+              <span className="mr-2 text-gray-300 text-sm">Agent Mode</span>
+              <div className="relative">
+                <input 
+                  type="checkbox" 
+                  id="agent-mode-toggle" 
+                  className="sr-only" 
+                  checked={isAgentMode} 
+                  onChange={(e) => onAgentModeChange(e.target.checked)}
+                />
+                <div className="block bg-gray-600 w-10 h-6 rounded-full"></div>
+                <div className={`dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition transform ${isAgentMode ? 'translate-x-full bg-blue-400' : 'translate-x-0'}`}></div>
+              </div>
+            </label>
+            {isStreaming ? (
+              <button id="stop-button" className="bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-4 rounded-lg" onClick={onStop}>
+                Stop
+              </button>
+            ) : (
+              <button id="send-button" className="ml-4 bg-blue-500 hover:bg-blue-600 text-white font-bold p-2 rounded-full w-10 h-10 flex items-center justify-center flex-shrink-0" onClick={handleSend}>
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 10l7-7m0 0l7 7m-7-7v18" />
+                </svg>
+              </button>
+            )}
+          </div>
         </div>
       </div>
     </div>
