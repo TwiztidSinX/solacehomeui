@@ -53,7 +53,8 @@ TODO.txt
 NovaPrompt.txt
 SD Prompt info.txt
 templates/backup.txt
-config.json 
-nova_settings.json
+
 # Voice Server venv  
 mcpServers/voice_server/stt_tts_venv/ 
+*.json
+
