@@ -19,7 +19,7 @@ def load_orchestrator_model():
         try:
             orchestrator_model = Llama(
                 model_path=ORCHESTRATOR_MODEL_PATH,
-                n_ctx=32768,
+                n_ctx=8192,
                 n_gpu_layers=0,  # Force to RAM
                 verbose=False
             )
@@ -55,7 +55,7 @@ User: bring the discord window to the front
 Assistant: {{"name": "focus_window", "arguments": {{"title_substring": "discord"}}}}
 
 User: Hey how are you doing?
-Assistant: None"""
+Assistant: {{"name": "direct_chat", "arguments": {{}}}}"""
 
     # Inject the tool schema directly into the prompt
     prompt_with_tools = system_prompt.format(tools_json=json.dumps(TOOLS_SCHEMA, indent=2))
@@ -103,6 +103,13 @@ Assistant: None"""
         if not tool_calls:
             print("Orchestrator did not generate any valid tool calls.")
             return []
+
+        # Filter out consecutive duplicate tool calls
+        filtered_tool_calls = []
+        for i, current_call in enumerate(tool_calls):
+            if i == 0 or current_call != tool_calls[i-1]:
+                filtered_tool_calls.append(current_call)
+        tool_calls = filtered_tool_calls
 
         return tool_calls
 
@@ -219,6 +226,31 @@ def summarize_text(text: str):
         print(f"Orchestrator summary failed: {e}")
         return "Failed to generate summary."
 
+def get_orchestrator_response(user_input: str, history: list = []):
+    """
+    Generates a direct response from the orchestrator model.
+    """
+    if orchestrator_model is None:
+        return "Orchestrator model not loaded."
+
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant. Keep your responses brief and to the point."},
+    ]
+    messages.extend(history)
+    messages.append({"role": "user", "content": user_input})
+
+    try:
+        response = orchestrator_model.create_chat_completion(
+            messages=messages,
+            temperature=0.7,
+            max_tokens=1024
+        )
+        content = response.get('choices', [{}])[0].get('message', {}).get('content', '').strip()
+        return content
+    except Exception as e:
+        print(f"Orchestrator response generation failed: {e}")
+        return "I'm sorry, I had a problem generating a response."
+
 def parse_command(user_input: str):
     """
     Parses user input for slash commands.
@@ -237,6 +269,8 @@ def parse_command(user_input: str):
         
         if command in valid_commands:
             print(f"Orchestrator parsed command: /{command} with query: '{query}'")
+            if command == 'youtube':
+                return {"command": "youtube", "query": query}
             return {"command": command, "query": query}
     return None
 

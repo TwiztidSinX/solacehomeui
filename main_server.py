@@ -18,17 +18,22 @@ import pyaudio
 import pvporcupine
 import requests
 import torch
-import urllib.parse # <-- Add this import
+import urllib.parse
 from faster_whisper import WhisperModel
-from flask import Flask, render_template, request
+from flask import Flask, render_template, request, send_from_directory
 from flask_socketio import SocketIO, emit
 from scipy.spatial import distance as ssd
 from bson.objectid import ObjectId
 from pymongo.errors import PyMongoError
 from sentence_transformers import SentenceTransformer
-from model_loader import get_available_models, load_model, unload_model, stream_gpt
+from model_loader import (
+    get_available_models, load_model, unload_model, 
+    stream_gpt, stream_llamacpp, stream_ollama, stream_safetensors, 
+    stream_google, stream_openai, stream_anthropic, stream_meta, 
+    stream_xai, stream_qwen, stream_deepseek, stream_perplexity, stream_openrouter
+)
 from upgraded_memory_manager import memory_manager as memory, beliefs_manager as beliefs, db
-from orchestrator import load_orchestrator_model, get_summary_for_title, parse_command, get_tool_call, summarize_text
+from orchestrator import load_orchestrator_model, get_summary_for_title, parse_command, get_tool_call, summarize_text, get_orchestrator_response
 from tools import dispatch_tool, TOOLS_SCHEMA
 
 # --- Database Setup for Chat History ---
@@ -71,7 +76,7 @@ def set_voice_state(listen, speak):
     speak_enabled = speak
     print(f"🎚️ Voice State Updated — Listening: {listen} | Speaking: {speak}")
 
-app = Flask(__name__, static_folder='static/react', static_url_path='/')
+app = Flask(__name__, static_folder='static/react', static_url_path='')
 # Add cache-busting configuration for development
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 app.config['TEMPLATES_AUTO_RELOAD'] = True
@@ -492,6 +497,7 @@ def handle_agent_command(data):
     def run_agent_task():
         full_thought = ""
         final_response = ""
+        orchestrator_name = "Nova"  # Orchestrator always uses "Nova"
         try:
             socketio.emit('stream_start', {}, room=sid)
             socketio.sleep(0)
@@ -522,20 +528,18 @@ def handle_agent_command(data):
                     tool_result = dispatch_tool(tool_name, tool_args)
                     result_text = f"Step {i+1} Result: {tool_result}\n"
                     full_thought += result_text
-                    final_response += result_text # Aggregate results
+                    final_response += result_text
                     socketio.emit('stream', result_text, room=sid)
                     socketio.sleep(0)
 
             # 4. Stream the final aggregated response
-            socketio.emit('stream', '</think>', room=sid) # Close thinking block
-            # We don't need to stream the final response again as it was streamed step-by-step
+            socketio.emit('stream', '</think>', room=sid)
             socketio.sleep(0)
 
         except Exception as e:
             import traceback
             traceback.print_exc()
             error_message = f"An error occurred while running the agent command: {e}"
-            # Ensure think tag is closed on error, if it was ever opened
             socketio.emit('stream', '</think>', room=sid) 
             socketio.emit('stream', error_message, room=sid)
             final_response = error_message
@@ -544,16 +548,14 @@ def handle_agent_command(data):
             # --- Save Agent's Final Response to DB ---
             if session_id and final_response:
                 ai_message = {
-                    "sender": "Nova", # Or a dedicated agent name
+                    "sender": orchestrator_name,  # Always use "Nova" for orchestrator
                     "message": final_response,
                     "type": "ai",
                     "thought": full_thought
                 }
                 _save_message_to_db(session_id, ai_message)
 
-    # Run the agent task in the background
     socketio.start_background_task(run_agent_task)
-
 
 @socketio.on('chat')
 def handle_chat(data):
@@ -577,18 +579,36 @@ def handle_chat(data):
     # 1. Always check for slash commands first (instant)
     command = parse_command(user_input)
     if command:
-        query = command['query']
-        response_payload = {'type': 'error', 'message': f"Unknown command: {command['command']}", 'sender': 'Nova'}
-        try:
-            # ... (existing command handling logic) ...
-            if command['command'] == 'search':
+        query = command.get('query')
+        command_name = command.get('command')
+
+        # List of commands handled by the special iframe/frontend logic
+        frontend_commands = ['search']
+
+        if command_name in frontend_commands:
+            response_payload = {'type': 'error', 'message': f"Unknown command: {command_name}", 'sender': 'Nova'}
+            try:
+                if command_name == 'search':
+                    encoded_query = urllib.parse.quote(query)
+                    search_url = f"http://localhost:8088/?q={encoded_query}"
+                    response_payload = {'type': 'iframe', 'url': search_url, 'message': f"Searching for: `{query}`", 'sender': 'Nova'}
+                
+                emit('command_response', response_payload)
+                if session_id:
+                    _save_message_to_db(session_id, {"sender": "Nova", **response_payload, "type": "ai"})
+                return # Stop further processing
+
+            except Exception as e:
+                response_payload = {'type': 'error', 'message': f"An unexpected error occurred: {e}", 'sender': 'Nova'}
+                emit('command_response', response_payload)
+                if session_id:
+                    _save_message_to_db(session_id, {"sender": "Nova", **response_payload, "type": "ai"})
+                return # Stop further processing
+
+        elif command_name == 'youtube':
+            try:
                 encoded_query = urllib.parse.quote(query)
-                search_url = f"http://localhost:8088/?q={encoded_query}"
-                response_payload = {'type': 'iframe', 'url': search_url, 'message': f"Searching for: `{query}`", 'sender': 'Nova'}
-            
-            elif command['command'] == 'youtube':
-                encoded_query = urllib.parse.quote(f"!yt {query}")
-                search_url = f"http://localhost:8088/search?q={encoded_query}&format=json"
+                search_url = f"http://localhost:8088/search?q={encoded_query}&engines=youtube&format=json"
                 response = requests.get(search_url, timeout=10).json()
                 first_video = next((r for r in response.get('results', []) if 'youtube.com/watch' in r.get('url', '')), None)
                 if first_video:
@@ -596,54 +616,44 @@ def handle_chat(data):
                     response_payload = {'type': 'youtube_embed', 'video_id': video_id, 'message': f"Here is the top YouTube result for `{query}`:", 'sender': 'Nova'}
                 else:
                     response_payload = {'type': 'error', 'message': f"No YouTube results found for '{query}'.", 'sender': 'Nova'}
+            except Exception as e:
+                response_payload = {'type': 'error', 'message': f"An unexpected error occurred: {e}", 'sender': 'Nova'}
             
-            elif command['command'] == 'read':
-                response = requests.get(query, timeout=15).text
-                clean_text = re.sub(r'<style.*?>.*?</style>|<script.*?>.*?</script>|<!--.*?-->', '', response, flags=re.DOTALL)
-                clean_text = re.sub(r'<.*?>', ' ', clean_text)
-                clean_text = ' '.join(clean_text.split())
-                summary = summarize_text(clean_text[:8000])
-                response_payload = {'type': 'info', 'message': f"**Summary of {query}:**\n\n{summary}", 'sender': 'Nova'}
-
-            elif command['command'] == 'calc':
-                answer = summarize_text(f"Calculate the following expression and provide only the numerical answer: {query}")
-                response_payload = {'type': 'info', 'message': f"`{query}` = **{answer}**", 'sender': 'Nova'}
-
-        except requests.exceptions.RequestException as e:
-            response_payload = {'type': 'error', 'message': f"Command failed due to a network error: {e}", 'sender': 'Nova'}
-        except Exception as e:
-            response_payload = {'type': 'error', 'message': f"An unexpected error occurred: {e}", 'sender': 'Nova'}
-        
-        emit('command_response', response_payload)
-        if session_id:
-            _save_message_to_db(session_id, {"sender": "Nova", **response_payload, "type": "ai"})
-        return # Stop further processing
+            emit('command_response', response_payload)
+            if session_id:
+                _save_message_to_db(session_id, {"sender": "aiName", **response_payload, "type": "ai"})
+            return # Stop further processing
 
     # 2. If no slash command, check for keywords (fast)
     ORCHESTRATOR_KEYWORDS = [
-        "search", "what is", "who is", "how to", "current", "latest", "news", 
-        "weather", "price of", "stock", "define", "wiki", "map of", 
-        "look up", "find me", "scrape", "read the article"
+        "latest news", "breaking news", "current events", "today’s news",
+        "weather", "forecast", "temperature", "air quality",
+        "price of", "stock price", "share price", "exchange rate", "crypto price", "market cap",
+        "sports score", "game results", "match score", "league standings",
+        "flight status", "train schedule", "bus times",
+        "traffic", "road conditions"
     ]
-    
-    # More robust check: see if any keyword is a substring of the user input
-    should_orchestrate = any(keyword in user_input.lower() for keyword in ORCHESTRATOR_KEYWORDS)
 
+    should_orchestrate = any(keyword in user_input.lower() for keyword in ORCHESTRATOR_KEYWORDS)
     if should_orchestrate:
         print("Orchestration keywords detected. Checking for tool call...")
-        tool_call = get_tool_call(user_input)
-        if tool_call:
-            # A tool was selected by the orchestrator
+        tool_calls = get_tool_call(user_input)
+        if tool_calls:
+            tool_call = tool_calls[0] # Assuming one tool call for now
             tool_name = tool_call.get("name")
             tool_args = tool_call.get("arguments")
             
-            # Execute the tool
-            tool_result = dispatch_tool(tool_name, tool_args)
-            
-            # Prepend the result to the user's input for the main model
-            user_input = f"--- Tool Result for '{tool_name}' ---\n{tool_result}\n--- End Result ---\n\nPlease use this information to answer my original query: {user_input}"
-            # Update the 'text' in the data payload for the streamer
-            data['text'] = user_input
+            # ONLY DO THIS FOR TOOL CALLS - NOT FOR THE FIRST MESSAGE
+            if tool_name == "direct_chat":
+                print("Orchestrator decided on direct chat, bypassing tool execution and sending to main model.")
+                # Fall through to the main model logic below
+                pass
+            else:
+                # Execute the tool
+                tool_result = dispatch_tool(tool_name, tool_args)
+                # Prepend the tool result to the user input for the main model
+                user_input = f"{user_input}\n\n--- Tool Result for '{tool_name}' ---\n{tool_result}\n--- End Result ---"
+                # Fall through to the main model logic below
 
     # 3. If neither, bypass orchestrator and go directly to the main model
     if not current_model:
@@ -661,107 +671,94 @@ def stream_response(data, sid):
     global stop_streaming
     full_response = ""
     full_thought = ""
-    local_backends = ['llama.cpp', 'ollama', 'safetensors']
-    backend = data.get('backend', current_backend)
-    provider = data.get('provider')
-    timezone = data.get('timezone', 'UTC')
     session_id = data.get('session_id')
     in_thought_block = False
-
-    # --- Debug Mode ---
-    if data.get('debug_mode'):
-        print("\n--- DEBUG MODE: INCOMING PAYLOAD ---")
-        # Avoid printing massive base64 image strings
-        debug_data = {k: v for k, v in data.items() if k not in ['image_base_64']}
-        if data.get('image_base_64'):
-            debug_data['image_base_64'] = "Image data present (omitted for brevity)"
-        print(json.dumps(debug_data, indent=2))
-        print("-------------------------------------\n")
-    # --- End Debug Mode ---
+    current_sender = data.get('aiName', 'Nova')  # Get the actual AI name
 
     try:
         socketio.emit('stream_start', {}, room=sid)
         socketio.sleep(0)
+
+        backend = data.get('backend', current_backend)
+        provider = data.get('provider')
         
-        model_instance = current_model
-        if backend == "ollama":
-            model_instance = current_model_path_string
+        # --- Stream Router ---
+        streamer_map = {
+            "llama.cpp": stream_llamacpp,
+            "ollama": stream_ollama,
+            "safetensors": stream_safetensors,
+            "api": {
+                "google": stream_google,
+                "openai": stream_openai,
+                "anthropic": stream_anthropic,
+                "meta": stream_meta,
+                "xai": stream_xai,
+                "qwen": stream_qwen,
+                "deepseek": stream_deepseek,
+                "perplexity": stream_perplexity,
+                "openrouter": stream_openrouter
+            }
+        }
 
-        if backend in local_backends:
-            model_response_generator = stream_gpt(
-                model_instance, current_model_path_string, data['text'], 
-                conversation_history=data.get('history', []),
-                should_stop=lambda: stop_streaming,
-                backend=backend, provider=provider, image_data=data.get('image_base_64'),
-                timezone=timezone, tools=TOOLS_SCHEMA,
-                debug_mode=data.get('debug_mode', False),
-                thinking_level=data.get('thinking_level', 'medium') # Pass thinking level
-            )
+        streamer = None
+        if backend == 'api':
+            streamer = streamer_map.get('api', {}).get(provider)
+        else:
+            streamer = streamer_map.get(backend)
 
-            tool_calls = []
-            for chunk in model_response_generator:
-                chunk_type = chunk.get('type')
-                token = chunk.get('token', '')
+        if not streamer:
+            raise ValueError(f"No valid streamer found for backend '{backend}' and provider '{provider}'")
 
-                if chunk_type == 'tool_call':
-                    tool_calls.append(chunk.get('tool_call'))
-                elif chunk_type == 'thought':
-                    if not in_thought_block:
-                        socketio.emit('stream', '<think>', room=sid)
-                        in_thought_block = True
-                    full_thought += token
-                    socketio.emit('stream', token, room=sid)
-                elif chunk_type == 'reply':
-                    if in_thought_block:
-                        socketio.emit('stream', '</think>', room=sid)
-                        in_thought_block = False
-                    full_response += token
-                    socketio.emit('stream', token, room=sid)
-                
-                socketio.sleep(0)
-                if stop_streaming: break
+        # --- Prepare Arguments for All Streamers ---
+        args = {
+            "model_instance": current_model if backend != 'ollama' else current_model_path_string,
+            "model_id_str": current_model_path_string,
+            "user_input": data['text'],
+            "conversation_history": data.get('history', []),
+            "should_stop": lambda: stop_streaming,
+            "image_data": data.get('image_base_64'),
+            "timezone": data.get('timezone', 'UTC'),
+            "debug_mode": data.get('debug_mode', False)
+        }
+        
+        # Add backend-specific arguments
+        if backend == 'llama.cpp':
+            args["tools"] = TOOLS_SCHEMA
+        
+        model_response_generator = streamer(**args)
+
+        # --- Universal Response Handling with Consistent Thinking Blocks ---
+        for chunk in model_response_generator:
+            if stop_streaming:
+                break
             
-            if in_thought_block: # Close any open thought tag
-                socketio.emit('stream', '</think>', room=sid)
-                in_thought_block = False
-            
-            if tool_calls:
-                # Handle tool calls...
+            chunk_type = chunk.get('type')
+            token = chunk.get('token', '')
+
+            if chunk_type == 'tool_call':
+                # Handle tool calls if needed
                 pass
-        else: # API Backends
-            streamer = stream_gpt(
-                model_instance, current_model_path_string, data['text'], 
-                conversation_history=data.get('history', []),
-                should_stop=lambda: stop_streaming,
-                backend=backend, provider=provider, image_data=data.get('image_base_64'),
-                timezone=timezone,
-                debug_mode=data.get('debug_mode', False)
-            )
-            for chunk in streamer:
-                chunk_type = chunk.get('type')
-                token = chunk.get('token', '')
+            elif chunk_type == 'thought':
+                if not in_thought_block:
+                    socketio.emit('stream', '<think>', room=sid)
+                    in_thought_block = True
+                full_thought += token
+                socketio.emit('stream', token, room=sid)
+            elif chunk_type == 'reply':
+                if in_thought_block:
+                    socketio.emit('stream', '</think>', room=sid)
+                    in_thought_block = False
+                full_response += token
+                socketio.emit('stream', {'token': token, 'sender': current_sender}, room=sid)
+            elif chunk_type == 'error':
+                socketio.emit('error', {'message': token}, room=sid)
 
-                if chunk_type == 'thought':
-                    if not in_thought_block:
-                        socketio.emit('stream', '<think>', room=sid)
-                        in_thought_block = True
-                    full_thought += token
-                    socketio.emit('stream', token, room=sid)
-                elif chunk_type == 'reply':
-                    if in_thought_block:
-                        socketio.emit('stream', '</think>', room=sid)
-                        in_thought_block = False
-                    full_response += token
-                    socketio.emit('stream', token, room=sid)
+            socketio.sleep(0)
 
-                socketio.sleep(0)
-                if stop_streaming: break
-            
-            if in_thought_block: # Close any open thought tag
-                socketio.emit('stream', '</think>', room=sid)
-                in_thought_block = False
+        # Ensure thinking block is closed at the end
+        if in_thought_block:
+            socketio.emit('stream', '</think>', room=sid)
 
-        socketio.emit('stream_end', {}, room=sid)
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -770,19 +767,24 @@ def stream_response(data, sid):
         with stop_lock:
             stop_streaming = False
         
+        socketio.emit('stream_end', {}, room=sid)
+        
+        # Fix: Use the actual sender name instead of hardcoding "Nova"
         if full_response and session_id:
             ai_message = {
-                "sender": data.get('aiName', 'Solace'),
+                "sender": current_sender,  # Use the dynamic AI name
                 "message": full_response,
                 "type": "ai",
                 "thought": full_thought
             }
             _save_message_to_db(session_id, ai_message)
 
+        # Fix: Use correct source names for memory learning
         if data.get('text'):
             memory.learn_from_text(data['text'], source="user", model_id=current_model_path_string)
         if full_response:
-            memory.learn_from_text(full_response, source="nova", model_id=current_model_path_string)
+            # Use the actual AI name instead of hardcoded "nova"
+            memory.learn_from_text(full_response, source=current_sender.lower(), model_id=current_model_path_string)
 
 @socketio.on('stop')
 def handle_stop():
@@ -958,10 +960,22 @@ def handle_manage_ollama(data):
         
         emit('ollama_status', {'status': 'running', 'env': env_vars})
         print("✅ Ollama server is restarting in the background.")
-
-@app.route('/')
-def index():
-    return app.send_static_file('index.html')
+print(f"📂 Static folder being used: {app.static_folder}")
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def serve(path):
+    print(f"📦 Request for path: '{path}'")
+    
+    static_file_path = os.path.join(app.static_folder, path)
+    print(f"📁 Looking for file: {static_file_path}")
+    print(f"📁 File exists: {os.path.exists(static_file_path)}")
+    
+    if path != "" and os.path.exists(static_file_path) and os.path.isfile(static_file_path):
+        print(f"✅ Serving static file: {path}")
+        return send_from_directory(app.static_folder, path)
+    
+    print(f"🎯 Serving index.html for React routing (path: {path})")
+    return send_from_directory(app.static_folder, 'index.html')
 
 def background_loop():
     logger.info("🔄 Maintenance thread started")
@@ -1033,13 +1047,12 @@ if __name__ == "__main__":
     nova_settings = load_nova_settings()
     load_orchestrator_model()
 
+    # Start maintenance thread
     threading.Thread(target=background_loop, daemon=True, name="NovaMaintenance").start()
 
-    web_ui_thread = threading.Thread(target=lambda: socketio.run(app, host='0.0.0.0', port=5000), daemon=True)
-    web_ui_thread.start()
-    print("WebUI server started in background thread.")
+    # Debug: confirm static folder
+    print(f"📂 Static folder being used: {app.static_folder}")
 
-    webbrowser.open("http://localhost:5000")
-
-    while True:
-        time.sleep(1)
+    # Run directly instead of in a thread
+    print("🚀 Starting WebUI on http://localhost:5000")
+    socketio.run(app, host="0.0.0.0", port=5000, debug=False)

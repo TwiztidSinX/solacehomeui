@@ -14,3 +14,4 @@ call llama-gpu\Scripts\activate.bat
 REM Run Nova
 echo --- Starting Solace Home UI ---
 python main_server.py
+pause

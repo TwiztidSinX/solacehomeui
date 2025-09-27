@@ -1,6 +1,6 @@
 {
-  "searxngUrl": "",
-  "mediaServerUrl": "",
-  "mediaServerApiKey": "",
-  "imageGenUrl": ""
+    "searxngUrl": "http://127.0.0.1:8088",
+    "mediaServerUrl": "",
+    "mediaServerApiKey": "",
+    "imageGenUrl": ""
 }

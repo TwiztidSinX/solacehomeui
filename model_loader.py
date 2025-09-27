@@ -56,7 +56,7 @@ def load_model(
     quantization='none', 
     kv_cache_quant='fp16',
     use_flash_attention=False,
-    torch_dtype='auto',
+    dtype='auto',
     thinking_mode=False,
     thinking_level='medium',
     device_map='auto',
@@ -142,41 +142,95 @@ def load_model(
 
             elif backend == "safetensors":
                 try:
-                    from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer, BitsAndBytesConfig
+                    from transformers import AutoTokenizer, TextStreamer, AutoProcessor, AutoModelForCausalLM, TextIteratorStreamer
+                    from qwen_omni_utils import process_mm_info # Ensure this is available
                     import torch
                     
                     model_dir = model_path
-                    
-                    # --- The Correct, Proven Configuration ---
-                    # Derived from the working multimodal.py
-                    
-                    # 1. Define the compute dtype
-                    compute_dtype = torch.bfloat16
+                    is_omni_model = 'qwen2.5-omni' in model_dir.lower()
+                    is_gpt_oss = 'gpt-oss' in model_dir.lower()
 
-                    # 2. Create the precise BitsAndBytesConfig
-                    quantization_config = BitsAndBytesConfig(
-                        load_in_4bit=True,
-                        bnb_4bit_quant_type="nf4",
-                        bnb_4bit_compute_dtype=compute_dtype,
-                        bnb_4bit_use_double_quant=True,
-                    )
-                    print("✅ Applying 4-bit quantization with bfloat16 compute dtype.")
+                    if is_omni_model:
+                        from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
+                        print("✨ Detected Qwen 2.5 Omni model. Using specialized loader.")
+                        
+                        processor = Qwen2_5OmniProcessor.from_pretrained(model_dir)
+                        model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
+                            model_dir,
+                            dtype="auto",
+                            device_map="auto",
+                            load_in_4bit=True # Assuming 4-bit for Omni as per old config
+                        )
+                        streamer = TextIteratorStreamer(processor.tokenizer, skip_prompt=True, skip_special_tokens=True)
+                        models[model_id] = (model, processor.tokenizer, streamer, processor)
+                        
+                    elif is_gpt_oss:
+                        from transformers import kernels # Corrected typo from kernals
+                        print("🔍 DETECTED GPT-OSS MODEL (MXFP4 QUANTIZED) - USING SPECIALIZED LOADER")
+                        try:
+                            # CRITICAL: NO BITSANDBYTES CONFIGURATION (MXFP4 is baked-in)
+                            tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+                            processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
+                            
+                            # Load WITHOUT quantization config (MXFP4 is already baked in)
+                            model = AutoModelForCausalLM.from_pretrained(
+                                model_dir,
+                                dtype="auto",  # Handles MXFP4 automatically
+                                device_map="auto",
+                                trust_remote_code=True,
+                                # NO quantization_config here - GPT-OSS uses MXFP4, not BitsAndBytes
+                            )
+                            
+                            # GPT-OSS specific streamer settings (from examples)
+                            streamer = TextIteratorStreamer(
+                                tokenizer,
+                                skip_prompt=True,
+                                skip_special_tokens=True,
+                                max_new_tokens=256  # Matches examples
+                            )
+                            
+                            # Store with same structure as your Qwen2.5 Omni handler
+                            models[model_id] = (model, tokenizer, streamer, processor)
+                            print("✅ GPT-OSS model loaded successfully with MXFP4 compatibility")
+                        except Exception as e:
+                            print(f"🔴 GPT-OSS load error: {str(e)}")
+                            raise e
 
-                    # 3. Load the model with the master dtype and the quantization config
-                    tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
-                    
-                    model = AutoModelForCausalLM.from_pretrained(
-                        model_dir,
-                        device_map="auto",
-                        torch_dtype=compute_dtype, # Master dtype switch
-                        quantization_config=quantization_config, # The detailed instructions
-                        trust_remote_code=True
-                    )
-                    
-                    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-                    models[model_id] = (model, tokenizer, streamer, None) 
+                    else:
+                        # --- Fallback for other SafeTensors models ---
+                        config_path = os.path.join(BASE_DIR, "config.json")
+                        with open(config_path, "r") as f:
+                            all_configs = json.load(f)
+                        model_config = all_configs.get(model_dir, {})
+                        
+                        quantization = model_config.get('quantization', 'none')
+                        dtype_str = model_config.get('dtype', 'float16')
+                        dtype = getattr(torch, dtype_str, torch.float16)
+                        load_in_4bit = (quantization == '4bit')
+                        load_in_8bit = (quantization == '8bit')
+                        
+                        quantization_config = None
+                        if load_in_4bit:
+                            from transformers import BitsAndBytesConfig
+                            quantization_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=dtype)
+                        elif load_in_8bit:
+                            from transformers import BitsAndBytesConfig
+                            quantization_config = BitsAndBytesConfig(load_in_8bit=True)
 
-                    print(f"✅ SafeTensors model loaded successfully and correctly quantized!")
+                        print(f"🔄 Loading generic SafeTensors model from {model_dir}")
+                        processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
+                        tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+                        model = AutoModelForCausalLM.from_pretrained(
+                            model_dir,
+                            dtype=dtype,
+                            device_map="auto",
+                            quantization_config=quantization_config,
+                            trust_remote_code=True
+                        )
+                        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+                        models[model_id] = (model, tokenizer, streamer, processor)
+
+                    print(f"✅ SafeTensors model loaded successfully!")
                     return models[model_id]
                 except Exception as e:
                     print(f"🔴 SafeTensors load error: {str(e)}")
@@ -500,17 +554,24 @@ def validate_gpt_oss_model(model_dir):
     print("✅ GPT-OSS model validation passed")
     return True
 
-def clean_and_normalize_history(conversation_history: list[dict]) -> list[dict]:
+def clean_and_normalize_history(conversation_history: list[dict], user_input: str = None) -> list[dict]:
     """
-    Converts frontend message format to a backend-compatible format AND
-    merges consecutive messages from the same role to ensure alternation.
+    Converts frontend message format to a backend-compatible format, merges
+    consecutive messages from the same role, and appends the latest user input.
     """
     if not conversation_history:
-        return []
-    
+        conversation_history = []
+
+    # Create a mutable copy to avoid modifying the original list
+    history_copy = [msg.copy() for msg in conversation_history]
+
+    # Append the current user input if it exists
+    if user_input:
+        history_copy.append({'type': 'user', 'message': user_input})
+
     # First, normalize the roles and filter out irrelevant messages
     normalized = []
-    for msg in conversation_history:
+    for msg in history_copy:
         role = ""
         if msg.get('type') == 'user':
             role = 'user'
@@ -536,8 +597,6 @@ def clean_and_normalize_history(conversation_history: list[dict]) -> list[dict]:
             # Merge images (if any)
             if 'image' in normalized[i]:
                 if 'image' in merged[-1]:
-                    # This case is ambiguous, but we'll just append for now
-                    # A more robust solution might handle multiple images differently
                     if isinstance(merged[-1]['image'], list):
                         merged[-1]['image'].append(normalized[i]['image'])
                     else:
@@ -571,6 +630,56 @@ def get_system_prompt(model_path):
         load_configs()
     return model_configs.get(model_path, {}).get('system_prompt', '')
 
+def stream_google(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None, timezone='UTC'):
+    try:
+        from datetime import datetime
+        from PIL import Image
+        import io
+        import base64
+
+        memory_context = get_context_for_model(user_input, model_id=model_id_str)
+        
+        now = datetime.now()
+        time_message = f"This is a system message. Do not refer to this message unless asked. This message is to give you a live update of the Current Date and Time. The User's Timezone is {timezone}. The Current time is {now.strftime('%H:%M')} and The Current Date is {now.strftime('%m/%d/%Y')}."
+        
+        # Inject time message into the history
+        conversation_history.insert(0, {"role": "system", "content": time_message})
+        
+        # Manage the context window
+        conversation_history = manage_context_window(conversation_history, 32768 - 2048) # Gemini 1.5 Pro has 32k context
+
+        # Add the current image to the last user message
+        if image_data:
+            for msg in reversed(conversation_history):
+                if msg['role'] == 'user':
+                    if 'image' not in msg:
+                         msg['image'] = []
+                    msg['image'].append(image_data)
+                    break
+
+        system_prompt = model_states.get(model_id_str, {}).get("system_prompt", "You are a helpful AI assistant.")
+        messages = build_gemini_prompt(user_input, conversation_history, memory_context, image_data, system_prompt)
+
+        stream = model_instance.generate_content(
+            messages,
+            generation_config=genai.types.GenerationConfig(temperature=0.7),
+            stream=True
+        )
+
+        for chunk in stream:
+            if should_stop():
+                yield {'type': 'reply', 'token': "\n[Generation stopped by user]"}
+                break
+            # The final chunk may not have any parts, causing chunk.text to fail.
+            if chunk.parts and hasattr(chunk.parts[0], 'text'):
+                yield {'type': 'reply', 'token': chunk.text}
+
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"--- GOOGLE STREAM ERROR --- \n{error_details}\n--------------------------")
+        yield {'type': 'error', 'token': f"[STREAM ERROR (Google): {repr(e)} - Check logs for details]"}
+
 def stream_gpt(model, model_path, user_input, conversation_history, should_stop, backend, provider=None, image_data=None, timezone='UTC', tools=None, debug_mode=False, thinking_level='medium'):
     """
     Streams a response from a GPT-style model.
@@ -592,18 +701,9 @@ def stream_gpt(model, model_path, user_input, conversation_history, should_stop,
     for entry in conversation_history:
         role = "user" if entry.get("sender", "").lower() == "user" or entry.get("type", "").lower() == "user" else "assistant"
         content = entry.get("message", "")
+        print("Point 1")
         if content:
             normalized_history.append({"role": role, "content": content})
-
-    # --- Add Thinking Instructions (Robust Method) ---
-    if thinking_level and thinking_level != 'none':
-        thinking_instructions = "Before you respond, you must think about the user's query and your response plan. Wrap all of your thoughts in <think>...</think> tags. The user will not see your thoughts."
-        # Prepend to the first user message to ensure it's not ignored by any chat handlers
-        if normalized_history and normalized_history[0]['role'] == 'user':
-            normalized_history[0]['content'] = f"{thinking_instructions}\n\nUser Query: {normalized_history[0]['content']}"
-        else:
-             # Fallback for safety, though this case is unlikely
-            system_prompt_text = f"{thinking_instructions}\n\n{system_prompt_text}"
 
     # --- Gemma System Prompt Fix ---
     is_gemma = 'gemma' in model_path.lower()
@@ -617,6 +717,10 @@ def stream_gpt(model, model_path, user_input, conversation_history, should_stop,
     
     messages.extend(normalized_history)
 
+    # CRITICAL FIX: Append the current user input to the messages list
+    if user_input:
+        messages.append({"role": "user", "content": user_input})
+    print("Point 2")
     if debug_mode:
         print("\n--- FINAL PROMPT TO MODEL ---")
         print(json.dumps(messages, indent=2))
@@ -633,6 +737,7 @@ def stream_gpt(model, model_path, user_input, conversation_history, should_stop,
                 tools=tools,
                 tool_choice="auto"
             )
+            print("Point 3")
             # This loop now correctly handles both text and tool call responses from llama.cpp
             for chunk in response_generator:
                 if should_stop(): break
@@ -688,8 +793,6 @@ def stream_gpt(model, model_path, user_input, conversation_history, should_stop,
                 if token:
                     yield {'type': 'reply', 'token': token}
             thread.join()
-
-        # ... (rest of the function for API backends)
         
     except Exception as e:
         print(f"🔴 Streaming Error: {e}")
@@ -697,105 +800,34 @@ def stream_gpt(model, model_path, user_input, conversation_history, should_stop,
         traceback.print_exc()
         yield {'type': 'error', 'token': f"An error occurred: {e}"}
 
-def stream_google(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None, timezone='UTC'):
-    try:
-        from datetime import datetime
-        from PIL import Image
-        import io
-        import base64
-
-        memory_context = get_context_for_model(user_input, model_id=model_id_str)
-        
-        now = datetime.now()
-        time_message = f"This is a system message. Do not refer to this message unless asked. This message is to give you a live update of the Current Date and Time. The User's Timezone is {timezone}. The Current time is {now.strftime('%H:%M')} and The Current Date is {now.strftime('%m/%d/%Y')}."
-        
-        # Inject time message into the history
-        conversation_history.insert(0, {"role": "system", "content": time_message})
-        
-        # Manage the context window
-        conversation_history = manage_context_window(conversation_history, 32768 - 2048) # Gemini 1.5 Pro has 32k context
-
-        # Add the current image to the last user message
-        if image_data:
-            for msg in reversed(conversation_history):
-                if msg['role'] == 'user':
-                    if 'image' not in msg:
-                         msg['image'] = []
-                    msg['image'].append(image_data)
-                    break
-
-        system_prompt = model_states.get(model_id_str, {}).get("system_prompt", "You are a helpful AI assistant.")
-        messages = build_gemini_prompt(user_input, conversation_history, memory_context, image_data, system_prompt)
-
-        stream = model_instance.generate_content(
-            messages,
-            generation_config=genai.types.GenerationConfig(temperature=0.7),
-            stream=True
-        )
-
-        for chunk in stream:
-            if should_stop():
-                yield {'type': 'reply', 'token': "\n[Generation stopped by user]"}
-                break
-            # The final chunk may not have any parts, causing chunk.text to fail.
-            if chunk.parts and hasattr(chunk.parts[0], 'text'):
-                yield {'type': 'reply', 'token': chunk.text}
-
-    except Exception as e:
-        import traceback
-        error_details = traceback.format_exc()
-        print(f"--- GOOGLE STREAM ERROR --- \n{error_details}\n--------------------------")
-        yield {'type': 'error', 'token': f"[STREAM ERROR (Google): {repr(e)} - Check logs for details]"}
-
 def stream_llamacpp(model_instance, model_id_str, user_input, conversation_history, should_stop,
-                    image_data=None, timezone='UTC', tools=None, tool_outputs=None):
+                    image_data=None, timezone='UTC', tools=None, tool_outputs=None, debug_mode=False):
     try:
         import re
         import json
         from datetime import datetime
         memory_context = get_context_for_model(user_input, model_id=model_id_str)
-
-        # Load system prompt and config
         system_prompt = model_states.get(model_id_str, {}).get("system_prompt", "You are a helpful AI assistant.")
         config_path = os.path.join(BASE_DIR, "config.json")
         with open(config_path, "r", encoding="utf-8-sig") as f:
             all_configs = json.load(f)
         config = all_configs.get(model_id_str, {})
-
         now = datetime.now()
         time_message = f"Current Time: {now.strftime('%H:%M')} | Current Date: {now.strftime('%m/%d/%Y')} | User Timezone: {timezone}"
-
         full_system_prompt = f"{time_message}\n\n{system_prompt}"
         if memory_context and memory_context.strip().lower() not in ["none", "null", "[]"]:
             full_system_prompt += f"\n\nRelevant Memories:\n{memory_context}"
 
-        # --- MODIFIED LOGIC V2 ---
-        # If the history already contains messages (e.g., from the orchestrator),
-        # prepend the system context to the first message to avoid role conflicts.
-        if conversation_history:
-            # Combine system prompt with the content of the first message
-            conversation_history[0]['content'] = f"{full_system_prompt}\n\n--- User Request ---\n{conversation_history[0]['content']}"
-            messages = conversation_history
-        # If the history is empty, create a new system message. This is the standard
-        # case for the first turn of a conversation.
-        else:
-            messages = [{"role": "system", "content": full_system_prompt}]
-            # Since we are not extending with history, we need to add the user input here for non-history cases.
-            # This part of the logic seems to be missing, let's assume the user_input is added later or should be here.
-            # For now, let's stick to the prompt builder's responsibility. The calling function adds the user input.
-        # --- END MODIFIED LOGIC V2 ---
+        # 1. Build the core message list
+        messages = clean_and_normalize_history(conversation_history, user_input)
 
-        # The user_input is now expected to be the last item in conversation_history
-        # Let's ensure the calling function `stream_gpt` handles this correctly.
-        # The logic in `stream_gpt` normalizes history, and the user_input is passed separately.
-        # The prompt builders should combine them. Let's adjust.
-
-        # If history is not empty AND starts with a user message (from orchestrator), it contains web search results.
-        if conversation_history and conversation_history[0]['role'] == 'user':
-            # Extract the web search results from the first message.
-            web_search_context = conversation_history.pop(0)['content']
-            
-            # Prepend a forceful instruction and the web context to the main system prompt.
+        # 2. Prepend system and memory prompts
+        if memory_context and memory_context.strip().lower() not in ["none", "null", "[]"]:
+            messages.insert(0, {"role": "system", "content": f"Relevant Memories:\n{memory_context}"})
+        
+        # Handle web search results
+        if conversation_history and conversation_history[0].get("role") == "user" and "web_search" in conversation_history[0].get("content", ""):
+            web_search_context = conversation_history.pop(0)["content"]
             full_system_prompt = (
                 "You have been provided with the following real-time web search results to answer the user's query. "
                 "You MUST use this information to form your answer and ignore any conflicting internal knowledge.\n\n"
@@ -803,8 +835,12 @@ def stream_llamacpp(model_instance, model_id_str, user_input, conversation_histo
                 f"{full_system_prompt}"
             )
         
-        messages = [{"role": "system", "content": full_system_prompt}]
-        messages.extend(conversation_history)
+        messages.insert(0, {"role": "system", "content": full_system_prompt})
+
+        if debug_mode:
+            print("\n--- EXACT PROMPT SENT TO MODEL (llama.cpp) ---")
+            print(json.dumps(messages, indent=2))
+            print("==============================================")
 
         if tool_outputs:
             for tool_output in tool_outputs:
@@ -812,6 +848,7 @@ def stream_llamacpp(model_instance, model_id_str, user_input, conversation_histo
                     "role": "tool",
                     "content": json.dumps(tool_output['output'])
                 })
+
 
         # Stricter Context Window Management: Use only 40% of the configured context for history.
         total_context_tokens = config.get('context_tokens', 8192)
@@ -835,6 +872,7 @@ def stream_llamacpp(model_instance, model_id_str, user_input, conversation_histo
             request_params["tool_choice"] = "auto"
 
         stream = model_instance.create_chat_completion(**request_params)
+        yield {"type": "reply", "token": "<think>\n"}
         if model_states.get(model_id_str, {}).get('uses_chat_handler'):
             for msg in messages:
                 if isinstance(msg.get('content'), str):
@@ -849,7 +887,12 @@ def stream_llamacpp(model_instance, model_id_str, user_input, conversation_histo
             if not delta: continue
 
             if delta.get("content"):
-                yield {'type': 'reply', 'token': delta["content"]}
+                token = delta["content"]
+                if token == "</think>":
+                    # Close block neatly and maybe add spacing
+                    yield {"type": "reply", "token": "</think>\n\n"}
+                else:
+                    yield {"type": "reply", "token": token}
 
             if delta.get("tool_calls"):
                 for tool_call_chunk in delta["tool_calls"]:
@@ -865,6 +908,8 @@ def stream_llamacpp(model_instance, model_id_str, user_input, conversation_histo
                         active_tool_calls[index]['function']['name'] = tool_call_chunk["function"]["name"]
                     if tool_call_chunk.get("function", {}).get("arguments"):
                         active_tool_calls[index]['function']['arguments'] += tool_call_chunk["function"]["arguments"]
+
+        yield {"type": "reply", "token": "</think>\n\n"}
         
         for index, tool_call in active_tool_calls.items():
             try:
@@ -886,7 +931,7 @@ def stream_llamacpp(model_instance, model_id_str, user_input, conversation_histo
         traceback.print_exc()
         yield {'type': 'error', 'token': f"[STREAM ERROR (llama.cpp): {str(e)}]"}
 
-def stream_ollama(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None, timezone='UTC'):
+def stream_ollama(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None, timezone='UTC', debug_mode=False):
     try:
         from datetime import datetime
         memory_context = get_context_for_model(user_input, model_id=model_id_str)
@@ -898,13 +943,22 @@ def stream_ollama(model_instance, model_id_str, user_input, conversation_history
         # Prepend the time message to the system prompt for Ollama
         system_prompt_with_time = f"{time_message}\n\n{system_prompt}"
 
-        messages = build_ollama_prompt_messages(user_input, conversation_history, memory_context, system_prompt_with_time, image_data)
+        # Build the messages list using the unified history function
+        messages = clean_and_normalize_history(conversation_history, user_input)
+
+        # Prepend the system prompts
+        if memory_context and memory_context.strip().lower() not in ["none", "null", "[]"]:
+            messages.insert(0, {"role": "system", "content": f"Relevant Memories:\n{memory_context}"})
+        messages.insert(0, {"role": "system", "content": system_prompt_with_time})
+
+        # Manage context window
         messages = manage_context_window(messages, 8192 - 1024)
 
-        print("\n--- OLLAMA PROMPT DEBUG ---")
-        import json
-        print(json.dumps(messages, indent=2))
-        print("---------------------------\n")
+        if debug_mode:
+            print("\n--- OLLAMA PROMPT DEBUG ---")
+            import json
+            print(json.dumps(messages, indent=2))
+            print("---------------------------\n")
 
         stream = ollama._client.chat(
             model=model_instance,
@@ -927,6 +981,119 @@ def stream_ollama(model_instance, model_id_str, user_input, conversation_history
         import traceback
         traceback.print_exc()
         yield {'type': 'error', 'token': f"[STREAM ERROR (Ollama): {str(e)}]"}
+    finally:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+def stream_safetensors(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None, timezone='UTC', debug_mode=False):
+    """Universal streaming for ALL safetensors models with proper thinking block support."""
+    try:
+        from transformers import TextIteratorStreamer
+        from threading import Thread
+        from PIL import Image
+        import io
+        import base64
+        from datetime import datetime
+        from qwen_omni_utils import process_mm_info
+
+        if len(model_instance) == 4:
+            model, tokenizer, _, processor = model_instance
+        elif len(model_instance) == 3:
+            model, tokenizer, _ = model_instance
+            processor = None
+        else:
+            raise ValueError("Invalid model_instance tuple size")
+
+        memory_context = get_context_for_model(user_input, model_id=model_id_str)
+        system_prompt = model_states.get(model_id_str, {}).get("system_prompt", "You are a helpful AI assistant.")
+        now = datetime.now()
+        time_message = f"System Time: {now.strftime('%Y-%m-%d %H:%M:%S')} (Timezone: {timezone})"
+        system_prompt_with_time = f"{time_message}\n\n{system_prompt}"
+
+        # 1. Build the core message list
+        messages = clean_and_normalize_history(conversation_history, user_input)
+
+        # 2. Prepend system and memory prompts
+        if memory_context and memory_context.strip().lower() not in ["none", "null", "[]"]:
+            messages.insert(0, {"role": "system", "content": f"Relevant Memories:\n{memory_context}"})
+        messages.insert(0, {"role": "system", "content": system_prompt_with_time})
+
+        # 3. Manage context window
+        model_context_window = model_states.get(model_id_str, {}).get('context_tokens', 8192)
+        messages = manage_context_window(messages, model_context_window - 1024)
+
+        if debug_mode:
+            print("\n--- SafeTensors PROMPT DEBUG ---")
+            print(json.dumps(messages, indent=2))
+            print("--------------------------------\n")
+
+        # 4. Handle vision/image data (if applicable)
+        if image_data and processor:
+            try:
+                for msg in reversed(messages):
+                    if msg['role'] == 'user':
+                        if isinstance(msg['content'], str):
+                            msg['content'] = [{"type": "text", "text": msg['content']}]
+                        image_bytes = base64.b64decode(image_data)
+                        pil_image = Image.open(io.BytesIO(image_bytes))
+                        msg['content'].append({"type": "image", "image": pil_image})
+                        break
+                
+                text_prompt = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+                _, images, _ = process_mm_info(messages, use_audio_in_video=False)
+                inputs = processor(text=text_prompt, images=images, return_tensors="pt").to(model.device)
+
+            except Exception as e:
+                yield {'type': 'error', 'token': f"[ERROR processing image: {e}]"}
+                return
+        else:
+            # 5. For text-only, apply the tokenizer's chat template
+            prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+        generation_kwargs = {**inputs, "streamer": streamer, "max_new_tokens": 4096, "temperature": 0.7, "do_sample": True, "pad_token_id": tokenizer.eos_token_id}
+        thread = Thread(target=model.generate, kwargs=generation_kwargs)
+        thread.start()
+
+        # Improved thinking block detection
+        thinking_buffer = ""
+        in_think_block = False
+        
+        for token in streamer:
+            if should_stop():
+                yield {'type': 'reply', 'token': "\n[Generation stopped by user]"}
+                break
+                
+            if token:
+                # Buffer tokens to detect thinking patterns
+                thinking_buffer += token
+                if len(thinking_buffer) > 100:  # Keep buffer manageable
+                    thinking_buffer = thinking_buffer[-50:]
+                
+                # Detect thinking block patterns
+                if not in_think_block:
+                    if any(marker in thinking_buffer.lower() for marker in ['<think>', 'thinking:', 'reasoning:', 'step']):
+                        in_think_block = True
+                        yield {'type': 'thought', 'token': token}
+                    else:
+                        yield {'type': 'reply', 'token': token}
+                else:
+                    # Inside thinking block
+                    if any(marker in thinking_buffer.lower() for marker in ['</think>', 'final answer:', 'answer:', 'conclusion:']):
+                        in_think_block = False
+                        yield {'type': 'thought', 'token': token}
+                        yield {'type': 'reply', 'token': '\n'}  # Add separation
+                    else:
+                        yield {'type': 'thought', 'token': token}
+        
+        thread.join()
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        yield {'type': 'error', 'token': f"[STREAM ERROR (SafeTensors): {str(e)} ]"}
     finally:
         gc.collect()
         if torch.cuda.is_available():
@@ -1195,78 +1362,6 @@ def stream_openai_compatible(model_instance, model_id_str, user_input, conversat
 
     except Exception as e:
         yield {'type': 'error', 'token': f"[STREAM ERROR ({api_key_env}): {str(e)}]"}
-
-def stream_safetensors(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None, timezone='UTC'):
-    """Universal streaming for ALL safetensors models, now with vision support."""
-    try:
-        from transformers import TextIteratorStreamer
-        from threading import Thread
-        from PIL import Image
-        import io
-        import base64
-        from datetime import datetime
-        from qwen_omni_utils import process_mm_info
-
-        if len(model_instance) == 4:
-            model, tokenizer, _, processor = model_instance
-        elif len(model_instance) == 3:
-            model, tokenizer, _ = model_instance
-            processor = None
-        else:
-            raise ValueError("Invalid model_instance tuple size")
-
-        memory_context = get_context_for_model(user_input, model_id=model_id_str)
-        system_prompt = model_states.get(model_id_str, {}).get("system_prompt", "You are a helpful AI assistant.")
-        now = datetime.now()
-        time_message = f"System Time: {now.strftime('%Y-%m-%d %H:%M:%S')} (Timezone: {timezone})"
-        system_prompt_with_time = f"{time_message}\n\n{system_prompt}"
-
-        conversation = [{"role": "system", "content": [{"type": "text", "text": f"{system_prompt_with_time}\nRelevant Memories:\n{memory_context}"}]}]
-        conversation.extend(conversation_history)
-        # Get the correct context window size for this model
-        model_context_window = model_states.get(model_id_str, {}).get('context_tokens', 8192)
-        # Reserve 1k tokens for the response
-        conversation = manage_context_window(conversation, model_context_window - 1024)
-
-        if image_data and processor:
-            try:
-                current_user_message = conversation[-1]
-                image_bytes = base64.b64decode(image_data)
-                pil_image = Image.open(io.BytesIO(image_bytes))
-                current_user_message['content'] = [{"type": "text", "text": current_user_message['content']}, {"type": "image", "image": pil_image}]
-                text_prompt = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
-                _, images, _ = process_mm_info(conversation, use_audio_in_video=False)
-                inputs = processor(text=text_prompt, images=images, return_tensors="pt").to(model.device)
-            except Exception as e:
-                yield {'type': 'error', 'token': f"[ERROR processing image: {e}]"}
-                return
-        else:
-            model_family = detect_safetensors_model_family(model_id_str)
-            prompt = build_safetensors_prompt(user_input, conversation_history, memory_context, system_prompt_with_time, model_family)
-            inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-
-        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-        generation_kwargs = {**inputs, "streamer": streamer, "max_new_tokens": 4096, "temperature": 0.7, "do_sample": True, "pad_token_id": tokenizer.eos_token_id}
-        thread = Thread(target=model.generate, kwargs=generation_kwargs)
-        thread.start()
-
-        for token in streamer:
-            if should_stop():
-                yield {'type': 'reply', 'token': "\n[Generation stopped by user]"}
-                break
-            if token:
-                yield {'type': 'reply', 'token': token}
-        
-        thread.join()
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        yield {'type': 'error', 'token': f"[STREAM ERROR (SafeTensors): {str(e)} ]"}
-    finally:
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
 def detect_safetensors_model_family(model_path):
     """Universal model family detection for ANY model"""

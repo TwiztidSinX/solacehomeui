@@ -16,6 +16,24 @@ TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
+            "name": "direct_chat",
+            "description": "Engages in a direct conversation with the user. Use this when the user wants to chat, ask a question, or give a command that doesn't match any other tool.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "The user's message to respond to."
+                    }
+                },
+                "required": ["message"]
+            }
+        }
+    },
+
+    {
+        "type": "function",
+        "function": {
             "name": "search_web",
             "description": "Performs a web search using DuckDuckGo for general queries.",
             "parameters": {
@@ -164,6 +182,15 @@ TOOLS_SCHEMA = [
 
 # --- Tool Implementations (for the backend) ---
 
+def direct_chat(message: str):
+    """
+    A placeholder for direct chat. The orchestrator will handle this specially.
+    """
+    # The orchestrator should see this and just return the response to the user.
+    # This function's return value might not even be used.
+    return message
+
+
 def search_web(query: str):
     """
     Performs a web search using the user's configured SearXNG instance.
@@ -185,14 +212,16 @@ def search_web(query: str):
         response = requests.get(api_url, timeout=10)
         response.raise_for_status()
         results = response.json()
-        
-        # Format the results into a readable string for the model
+
+        # Always return snippets for now
         snippets = [r.get('content', '') for r in results.get('results', [])[:5]]
         return "\n".join(snippets) if snippets else "No results found."
 
     except Exception as e:
         print(f"Web search tool failed: {e}")
         return f"Error searching web: {e}"
+
+
 
 def search_news(query: str):
     """
@@ -330,6 +359,7 @@ def type_screen_text(text: str):
 # --- Tool Dispatcher ---
 
 TOOL_REGISTRY = {
+    "direct_chat": direct_chat,
     "search_web": search_web,
     "search_news": search_news,
     "scrape_website": scrape_website,

@@ -42,7 +42,8 @@ const App: React.FC = () => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const [imageToSend, setImageToSend] = useState<string | null>(null);
-  const [isAgentMode, setIsAgentMode] = useState(false);
+  const [isAgentMode, setIsAgentMode] = useState<boolean>(false);
+  const [isOrchestratorMode, setIsOrchestratorMode] = useState<boolean>(false); // New state
   const [messageInputText, setMessageInputText] = useState(''); // New state for the input
   const [isHandsFreeMode, setIsHandsFreeMode] = useState(false); // State for speech-to-speech
   
@@ -70,6 +71,7 @@ const App: React.FC = () => {
     mediaServerUrl: '',
     mediaServerApiKey: '',
     imageGenUrl: '',
+    aiName: 'Nova', // Add aiName here
   });
   const [ttsSettings, setTtsSettings] = useState({
     type: 'local', // 'local' or 'cloud'
@@ -133,7 +135,7 @@ const App: React.FC = () => {
   const addMessage = useCallback((sender: string, message: string, type: Message['type'] = 'ai', imageB64: string | null = null) => {
     const newMessage: Message = { sender, message, type, imageB64 };
     setMessages(prev => [...prev, newMessage]);
-  }, []);
+  }, [setMessages]); // <--- Add setMessages to dependency array
 
   const handleModelChange = useCallback((model: string) => {
     setSelectedModel(model);
@@ -252,7 +254,14 @@ const App: React.FC = () => {
       setIsStreaming(true);
       inThinkingMode.current = false;
       tokenHistory.current = '';
-      setMessages(prev => [...prev, { sender: aiName, message: '', type: 'ai', thought: '', isThinking: false, imageB64: null }]);
+      setMessages(prev => [...prev, { 
+        sender: aiName,  // Use aiName state instead of hardcoded "Nova"
+        message: '', 
+        type: 'ai', 
+        thought: '', 
+        isThinking: false, 
+        imageB64: null 
+      }]);
     };
 
     const handleStream = (token: string) => {
@@ -267,7 +276,7 @@ const App: React.FC = () => {
         setMessages(prev => {
           if (prev.length === 0) return prev;
           const last = prev[prev.length - 1];
-          if (last.sender === aiName) {
+          if (last.sender === aiName) {  // Use aiName instead of hardcoded "Nova"
             const updatedLast = updater({ ...last });
             return [...prev.slice(0, -1), updatedLast];
           }
@@ -413,7 +422,8 @@ const App: React.FC = () => {
 
     const handleTranscriptionResult = (data: { text: string }) => {
       if (isHandsFreeMode) {
-        handleSendMessage(data.text);
+        setMessageInputText(data.text); // Set the input text
+        handleSendMessage(); // Call handleSendMessage without arguments
       } else {
         setMessageInputText(data.text);
       }
@@ -421,7 +431,7 @@ const App: React.FC = () => {
     };
     const handleCommandResponse = (data: { type: string, message: string, url?: string, video_id?: string, urls?: string[], sender?: string }) => {
       const newMessage: Message = {
-        sender: data.sender || aiName,
+        sender: data.sender || 'Nova',
         message: data.message,
         type: data.type === 'error' ? 'error' : 'ai',
         imageB64: null,
@@ -462,56 +472,37 @@ const App: React.FC = () => {
     setSelectedModel('');
     socketRef.current.emit('set_backend', { backend: 'api', provider: provider });
   };
-  const handleSendMessage = (message: string) => {
-    if (isAgentMode) {
-      // Agent Mode: Send a specific command to the orchestrator
-      const agentMessage: Message = { sender: userName, message: `[Agent Command] ${message}`, type: 'user' };
-      setMessages(prev => [...prev, agentMessage]);
-      
-      socketRef.current.emit('agent_command', {
-        text: message,
-        session_id: activeChatId,
+  const handleSendMessage = () => {
+    const currentMessage = messageInputText; // Use the state variable
+    if (currentMessage.trim() || imageToSend) {
+      // Add user's message to chat immediately for display
+      addMessage(userName, currentMessage, 'user', imageToSend); // Re-add this line
+
+      const currentChatSession = chatSessions.find(session => session._id === activeChatId); // Define here
+      const messagePayload: any = {
+        text: currentMessage,
+        history: currentChatSession?.messages || [],
+        session_id: currentChatSession?._id,
         userName: userName,
-      });
-
-    } else {
-      // Chat Mode: Send a message with history to the selected model
-      const userMessage: Message = { sender: userName, message, type: 'user', imageB64: imageToSend };
-      const newMessages = [...messages, userMessage];
-      setMessages(newMessages);
-      
-      const historyForBackend = newMessages.map(msg => {
-        if (msg === userMessage) return msg;
-        const { imageB64, ...rest } = msg;
-        return rest;
-      });
-
-      const payload: any = { 
-        text: message, 
-        image_base_64: imageToSend, 
-        history: historyForBackend,
-        backend: currentBackend,
-        model_path: selectedModel,
+        aiName: novaSettings.aiName,
+        backend: currentBackend, // Use currentBackend state
+        provider: apiProvider, // Use apiProvider state
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-        session_id: activeChatId,
-        userName: userName,
-        aiName: aiName,
-        debug_mode: debugMode
       };
 
-      if (currentBackend === 'api') {
-        payload.provider = apiProvider;
+      if (imageToSend) {
+        messagePayload.image_base_64 = imageToSend;
+        setImageToSend(null);
       }
 
-      socketRef.current.emit('chat', payload);
-      setImageToSend(null);
-
-      if (newMessages.length === 1 && activeChatId) {
-        socketRef.current.emit('summarize_and_rename', {
-          session_id: activeChatId,
-          text: message
-        });
+      if (isAgentMode) {
+        socketRef.current.emit('agent_command', messagePayload);
+      } else if (isOrchestratorMode) {
+        socketRef.current.emit('chat', { ...messagePayload, isOrchestratorMode: true });
+      } else {
+        socketRef.current.emit('chat', messagePayload);
       }
+      setMessageInputText(''); // Clear the input after sending
     }
   };
 
@@ -681,8 +672,10 @@ const App: React.FC = () => {
                   isStreaming={isStreaming} 
                   image={imageToSend}
                   setImage={setImageToSend}
-                  isAgentMode={isAgentMode}
-                  onAgentModeChange={setIsAgentMode}
+                            isAgentMode={isAgentMode}
+                            onAgentModeChange={setIsAgentMode}
+                            isOrchestratorMode={isOrchestratorMode} // New prop
+                            onOrchestratorModeChange={setIsOrchestratorMode} // New prop
                   message={messageInputText} // Pass the state down
                   onMessageChange={setMessageInputText} // Pass the setter down
                 />
