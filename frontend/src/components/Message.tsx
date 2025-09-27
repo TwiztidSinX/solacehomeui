@@ -14,6 +14,7 @@ interface MessageProps {
   iframeUrl?: string;
   youtubeVideoId?: string;
   imageGalleryUrls?: string[];
+  imageUrl?: string;
 }
 
 const formatMarkdown = (content: string) => {
@@ -53,6 +54,7 @@ const Message: React.FC<MessageProps> = ({
   iframeUrl,
   youtubeVideoId,
   imageGalleryUrls,
+  imageUrl,
 }) => {
   useEffect(() => {
     // This re-highlights blocks when message content changes (e.g., streaming)
@@ -72,7 +74,18 @@ const Message: React.FC<MessageProps> = ({
   };
 
   const renderMessageContent = () => {
+    if (imageUrl) {
+      return <img src={imageUrl} alt="Generated image" className="mt-2 rounded-lg max-w-md" />;
+    }
     if (iframeUrl) {
+      if (iframeUrl.includes('/stream?')) {
+        return (
+          <video controls autoPlay className="w-full rounded-lg">
+            <source src={iframeUrl} type="video/mp4" />
+            Your browser does not support the video tag.
+          </video>
+        );
+      }
       return (
         <div className="w-full">
           <div className="bg-gray-900/80 text-white p-2 rounded-t-lg flex justify-between items-center">

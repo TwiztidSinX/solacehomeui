@@ -177,6 +177,49 @@ TOOLS_SCHEMA = [
                 "required": ["text"],
             },
         },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_image",
+            "description": "Generates an image using AI image generation models like Stable Diffusion via ComfyUI or Automatic1111.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "The prompt describing the image to generate.",
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "The specific model to use for generation.",
+                        "default": "default"
+                    }
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browse_media",
+            "description": "Browses and plays media content from Jellyfin/Plex/Emby media servers.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "description": "The media category to browse (movies, tvshows, music, etc).",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Specific title or search query for media.",
+                    }
+                },
+                "required": ["category"],
+            },
+        },
     }
 ]
 
@@ -189,7 +232,6 @@ def direct_chat(message: str):
     # The orchestrator should see this and just return the response to the user.
     # This function's return value might not even be used.
     return message
-
 
 def search_web(query: str):
     """
@@ -220,8 +262,6 @@ def search_web(query: str):
     except Exception as e:
         print(f"Web search tool failed: {e}")
         return f"Error searching web: {e}"
-
-
 
 def search_news(query: str):
     """
@@ -355,6 +395,61 @@ def type_screen_text(text: str):
         print(f"Type screen text tool failed: {e}")
         return f"Error typing text: {e}"
 
+# Add the new tool implementations:
+def generate_image(prompt: str, model: str = "default"):
+    """
+    Generates an image using ComfyUI/A1111 and returns the image data.
+    """
+    print(f"Executing generate_image with prompt: {prompt}, model: {model}")
+    try:
+        # Load media server settings
+        settings_path = os.path.join(os.path.dirname(__file__), 'nova_settings.json')
+        with open(settings_path, 'r') as f:
+            settings = json.load(f)
+        
+        image_gen_url = settings.get('imageGenUrl')
+        if not image_gen_url:
+            return "Error: Image generation URL is not configured in settings."
+
+        # For now, return a command response that will trigger the frontend UI
+        # The actual image generation will be handled by the frontend
+        return {
+            "type": "image_generation",
+            "prompt": prompt,
+            "model": model,
+            "message": f"Ready to generate image with prompt: '{prompt}'. Opening image generation panel..."
+        }
+
+    except Exception as e:
+        print(f"Image generation tool failed: {e}")
+        return f"Error generating image: {e}"
+
+def browse_media(category: str, query: str = ""):
+    """
+    Browses media content from Jellyfin/Plex/Emby.
+    """
+    print(f"Executing browse_media with category: {category}, query: {query}")
+    try:
+        # Load media server settings
+        settings_path = os.path.join(os.path.dirname(__file__), 'nova_settings.json')
+        with open(settings_path, 'r') as f:
+            settings = json.load(f)
+        
+        media_server_url = settings.get('mediaServerUrl')
+        if not media_server_url:
+            return "Error: Media server URL is not configured in settings."
+
+        # Return a command response that will trigger the frontend media browser
+        return {
+            "type": "media_browser",
+            "category": category,
+            "query": query,
+            "message": f"Opening media browser for {category}..."
+        }
+
+    except Exception as e:
+        print(f"Media browsing tool failed: {e}")
+        return f"Error browsing media: {e}"
 
 # --- Tool Dispatcher ---
 
@@ -370,6 +465,8 @@ TOOL_REGISTRY = {
     "get_active_window_info": get_active_window_info,
     "read_screen_text": read_screen_text,
     "type_screen_text": type_screen_text,
+    "generate_image": generate_image,
+    "browse_media": browse_media,
 }
 
 def dispatch_tool(tool_name: str, arguments: dict):

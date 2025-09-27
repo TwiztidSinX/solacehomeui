@@ -618,12 +618,44 @@ def handle_chat(data):
                     response_payload = {'type': 'error', 'message': f"No YouTube results found for '{query}'.", 'sender': 'Nova'}
             except Exception as e:
                 response_payload = {'type': 'error', 'message': f"An unexpected error occurred: {e}", 'sender': 'Nova'}
-            
-            emit('command_response', response_payload)
-            if session_id:
-                _save_message_to_db(session_id, {"sender": "aiName", **response_payload, "type": "ai"})
-            return # Stop further processing
+        elif command_name == 'image':
+            try:
+                response_payload = {
+                    'type': 'image_generation', 
+                    'message': f"Opening image generator for: '{query}'",
+                    'prompt': query,
+                    'sender': 'Nova'
+                }
+                emit('command_response', response_payload)
+                if session_id:
+                    _save_message_to_db(session_id, {"sender": "Nova", **response_payload, "type": "ai"})
+                return
+            except Exception as e:
+                response_payload = {'type': 'error', 'message': f"An unexpected error occurred: {e}", 'sender': 'Nova'}
+                emit('command_response', response_payload)
+                if session_id:
+                    _save_message_to_db(session_id, {"sender": "Nova", **response_payload, "type": "ai"})
+                return
 
+        elif command_name == 'media':
+            try:
+                response_payload = {
+                    'type': 'media_browser', 
+                    'message': f"Opening media browser for: '{query}'",
+                    'query': query,
+                    'sender': 'Nova'
+                }
+                emit('command_response', response_payload)
+                if session_id:
+                    _save_message_to_db(session_id, {"sender": "Nova", **response_payload, "type": "ai"})
+                return
+            except Exception as e:
+                response_payload = {'type': 'error', 'message': f"An unexpected error occurred: {e}", 'sender': 'Nova'}
+                emit('command_response', response_payload)
+                if session_id:
+                    _save_message_to_db(session_id, {"sender": "Nova", **response_payload, "type": "ai"})
+                return
+            
     # 2. If no slash command, check for keywords (fast)
     ORCHESTRATOR_KEYWORDS = [
         "latest news", "breaking news", "current events", "today’s news",
@@ -976,6 +1008,208 @@ def serve(path):
     
     print(f"🎯 Serving index.html for React routing (path: {path})")
     return send_from_directory(app.static_folder, 'index.html')
+
+import websockets
+import uuid
+
+# ... (rest of the imports)
+
+async def get_image(prompt, image_gen_url):
+    server_address = image_gen_url.replace('http://', '').replace('https://', '').split('/')[0]
+    client_id = str(uuid.uuid4())
+
+    ws_url = f"ws://{server_address}/ws?clientId={client_id}"
+    async with websockets.connect(ws_url) as websocket:
+        response = requests.post(f"http://{server_address}/prompt", json=prompt)
+        prompt_id = response.json()['prompt_id']
+
+        while True:
+            out = await websocket.recv()
+            if isinstance(out, str):
+                message = json.loads(out)
+                if message['type'] == 'executing':
+                    data = message['data']
+                    if data['node'] is None and data['prompt_id'] == prompt_id:
+                        break  # Execution is done
+        
+        history_response = requests.get(f"http://{server_address}/history/{prompt_id}")
+        history = history_response.json()
+        
+        for o in history[prompt_id]['outputs']:
+            for node_id in history[prompt_id]['outputs']:
+                node_output = history[prompt_id]['outputs'][node_id]
+                if 'images' in node_output:
+                    for image in node_output['images']:
+                        image_url = f"http://{server_address}/view?filename={image['filename']}&subfolder={image['subfolder']}&type={image['type']}"
+                        return image_url
+    return None
+
+@socketio.on('generate_image')
+def handle_generate_image(data):
+    """Handles image generation requests by sending a prompt to a ComfyUI server."""
+    def task():
+        try:
+            prompt = data.get('prompt')
+            settings = data.get('settings', {})
+            session_id = data.get('session_id')
+
+            # Load image generation URL from settings
+            with open('nova_settings.json', 'r') as f:
+                nova_settings = json.load(f)
+            image_gen_url = nova_settings.get('imageGenUrl')
+
+            if not image_gen_url:
+                emit('error', {'message': 'Image generation URL not configured in nova_settings.json'})
+                return
+
+            # Qwen-Image ComfyUI API prompt workflow
+            comfy_prompt = {
+                "39": {
+                    "inputs": {
+                        "vae_name": "qwen_image_vae.safetensors"
+                    },
+                    "class_type": "VAELoader"
+                },
+                "38": {
+                    "inputs": {
+                        "clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+                        "type": "qwen_image",
+                        "device": "default"
+                    },
+                    "class_type": "CLIPLoader"
+                },
+                "58": {
+                    "inputs": {
+                        "width": settings.get('width', 512),
+                        "height": settings.get('height', 512),
+                        "batch_size": 1
+                    },
+                    "class_type": "EmptySD3LatentImage"
+                },
+                "6": {
+                    "inputs": {
+                        "text": prompt,
+                        "clip": ["38", 0]
+                    },
+                    "class_type": "CLIPTextEncode"
+                },
+                "7": {
+                    "inputs": {
+                        "text": "",
+                        "clip": ["38", 0]
+                    },
+                    "class_type": "CLIPTextEncode"
+                },
+                "60": {
+                    "inputs": {
+                        "filename_prefix": "SolaceHomeUI",
+                        "images": ["8", 0]
+                    },
+                    "class_type": "SaveImage"
+                },
+                "66": {
+                    "inputs": {
+                        "model": ["73", 0],
+                        "shift": 3.1
+                    },
+                    "class_type": "ModelSamplingAuraFlow"
+                },
+                "73": {
+                    "inputs": {
+                        "model": ["37", 0],
+                        "lora_name": "Qwen-Image-Lightning-8steps-V1.0.safetensors",
+                        "strength_model": 1.0
+                    },
+                    "class_type": "LoraLoaderModelOnly"
+                },
+                "8": {
+                    "inputs": {
+                        "samples": ["3", 0],
+                        "vae": ["39", 0]
+                    },
+                    "class_type": "VAEDecode"
+                },
+                "3": {
+                    "inputs": {
+                        "model": ["66", 0],
+                        "positive": ["6", 0],
+                        "negative": ["7", 0],
+                        "latent_image": ["58", 0],
+                        "seed": random.randint(0, 999999999999999),
+                        "steps": settings.get('steps', 8),
+                        "cfg": settings.get('cfgScale', 2.5),
+                        "sampler_name": "euler",
+                        "scheduler": "simple",
+                        "denoise": 1.0
+                    },
+                    "class_type": "KSampler"
+                },
+                "37": {
+                    "inputs": {
+                        "unet_name": "qwen_image_fp8_e4m3fn.safetensors",
+                        "weight_dtype": "default"
+                    },
+                    "class_type": "UNETLoader"
+                }
+            }
+
+            image_url = asyncio.run(get_image({'prompt': comfy_prompt}, image_gen_url))
+
+            if image_url:
+                result = {
+                    'type': 'image_generated',
+                    'message': f'Generated image for: "{prompt}"',
+                    'image_url': image_url,
+                    'prompt': prompt
+                }
+            else:
+                result = {
+                    'type': 'error',
+                    'message': 'Failed to generate image.',
+                }
+            
+            emit('command_response', result)
+            if session_id:
+                _save_message_to_db(session_id, {"sender": "Nova", **result, "type": "ai"})
+
+        except Exception as e:
+            emit('error', {'message': f'Image generation failed: {str(e)}'})
+
+    socketio.start_background_task(target=task)
+
+
+@socketio.on('play_media')
+def handle_play_media(data):
+    """Handles media playback requests by returning an embeddable URL."""
+    try:
+        media_id = data.get('mediaId')
+        session_id = data.get('session_id')
+
+        # Load media server settings
+        with open('nova_settings.json', 'r') as f:
+            nova_settings = json.load(f)
+        media_server_url = nova_settings.get('mediaServerUrl')
+        media_server_api_key = nova_settings.get('mediaServerApiKey')
+
+        if not media_server_url or not media_server_api_key:
+            emit('error', {'message': 'Media server URL or API key not configured in nova_settings.json'})
+            return
+
+        # Construct the Jellyfin direct stream URL
+        embed_url = f"{media_server_url.rstrip('/')}/Videos/{media_id}/stream?api_key={media_server_api_key}"
+
+        result = {
+            'type': 'media_embed',
+            'message': f'Playing media item {media_id}.',
+            'embed_url': embed_url
+        }
+        
+        emit('command_response', result)
+        if session_id:
+            _save_message_to_db(session_id, {"sender": "Nova", **result, "type": "ai"})
+            
+    except Exception as e:
+        emit('error', {'message': f'Media playback failed: {str(e)}'})
 
 def background_loop():
     logger.info("🔄 Maintenance thread started")

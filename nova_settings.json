@@ -1,6 +1,6 @@
 {
     "searxngUrl": "http://127.0.0.1:8088",
-    "mediaServerUrl": "",
-    "mediaServerApiKey": "",
+    "mediaServerUrl": "http://localhost:8096",
+    "mediaServerApiKey": "84b04029129e4ee3955d133025d9ef25",
     "imageGenUrl": ""
 }

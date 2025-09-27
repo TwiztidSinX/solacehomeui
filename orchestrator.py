@@ -264,13 +264,18 @@ def parse_command(user_input: str):
         # Define all valid commands
         valid_commands = [
             "search", "youtube", "go", "read", "image", 
-            "map", "wiki", "weather", "calc", "define", "play"
+            "map", "wiki", "weather", "calc", "define", "play",
+            "media"
         ]
         
         if command in valid_commands:
             print(f"Orchestrator parsed command: /{command} with query: '{query}'")
             if command == 'youtube':
                 return {"command": "youtube", "query": query}
+            elif command == 'image':
+                return {"command": "image", "query": query}
+            elif command == 'media':
+                return {"command": "media", "query": query}
             return {"command": command, "query": query}
     return None
 

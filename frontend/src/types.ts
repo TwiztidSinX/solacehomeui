@@ -8,4 +8,5 @@ export interface Message {
   iframeUrl?: string;
   youtubeVideoId?: string;
   imageGalleryUrls?: string[];
+  imageUrl?: string;
 }

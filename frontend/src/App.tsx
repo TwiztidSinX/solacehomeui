@@ -8,6 +8,8 @@ import VoicePanel from './components/VoicePanel';
 import MemoryGraph from './components/MemoryGraph';
 import { type Message } from './types';
 import { VoiceVisualizer } from './VoiceVisualizer';
+import ImageGenerator from './components/ImageGenerator';
+import MediaBrowser from './components/MediaBrowser';
 
 // Type definitions
 interface ChatSession {
@@ -46,6 +48,10 @@ const App: React.FC = () => {
   const [isOrchestratorMode, setIsOrchestratorMode] = useState<boolean>(false); // New state
   const [messageInputText, setMessageInputText] = useState(''); // New state for the input
   const [isHandsFreeMode, setIsHandsFreeMode] = useState(false); // State for speech-to-speech
+  const [showImageGenerator, setShowImageGenerator] = useState(false);
+  const [showMediaBrowser, setShowMediaBrowser] = useState(false);
+  const [imageGenerationPrompt, setImageGenerationPrompt] = useState('');
+  const [mediaBrowserQuery, setMediaBrowserQuery] = useState('');
   
   // Settings State
   const [allConfigs, setAllConfigs] = useState<{ [key: string]: ModelConfig }>({});
@@ -429,17 +435,37 @@ const App: React.FC = () => {
       }
       if (visualizerRef.current) visualizerRef.current.startProcessing(data.text);
     };
-    const handleCommandResponse = (data: { type: string, message: string, url?: string, video_id?: string, urls?: string[], sender?: string }) => {
-      const newMessage: Message = {
-        sender: data.sender || 'Nova',
-        message: data.message,
-        type: data.type === 'error' ? 'error' : 'ai',
-        imageB64: null,
-        iframeUrl: data.type === 'iframe' ? data.url : undefined,
-        youtubeVideoId: data.type === 'youtube_embed' ? data.video_id : undefined,
-        imageGalleryUrls: data.type === 'image_gallery' ? data.urls : undefined,
-      };
-      setMessages(prev => [...prev, newMessage]);
+    const handleCommandResponse = (data: { 
+        type: string, 
+        message: string, 
+        url?: string, 
+        embed_url?: string, 
+        video_id?: string, 
+        urls?: string[], 
+        sender?: string,
+        prompt?: string,
+        query?: string,
+        image_url?: string
+    }) => {
+        if (data.type === 'image_generation') {
+            setImageGenerationPrompt(data.prompt || '');
+            setShowImageGenerator(true);
+        } else if (data.type === 'media_browser') {
+            setMediaBrowserQuery(data.query || '');
+            setShowMediaBrowser(true);
+        }
+        
+        const newMessage: Message = {
+            sender: data.sender || 'Nova',
+            message: data.message,
+            type: data.type === 'error' ? 'error' : 'ai',
+            imageB64: null,
+            iframeUrl: data.type === 'iframe' ? data.url : data.type === 'media_embed' ? data.embed_url : undefined,
+            youtubeVideoId: data.type === 'youtube_embed' ? data.video_id : undefined,
+            imageGalleryUrls: data.type === 'image_gallery' ? data.urls : undefined,
+            imageUrl: data.type === 'image_generated' ? data.image_url : undefined,
+        };
+        setMessages(prev => [...prev, newMessage]);
     };
 
     const handleNovaSettingsLoaded = (data: any) => {
@@ -524,7 +550,30 @@ const App: React.FC = () => {
     setAvailableModels([]);
     socketRef.current.emit('set_backend', { backend });
   };
+  // Add handler functions for image generation and media playback
+  const handleGenerateImage = (prompt: string, model: string, settings: any) => {
+      // Send request to your image generation API
+      if (socketRef.current) {
+          socketRef.current.emit('generate_image', {
+              prompt,
+              model,
+              settings,
+              session_id: activeChatId
+          });
+      }
+  };
 
+  const handlePlayMedia = (mediaId: string, mediaType: string) => {
+      // Send request to your media server API
+      if (socketRef.current) {
+          socketRef.current.emit('play_media', {
+              mediaId,
+              mediaType,
+              session_id: activeChatId
+          });
+          setShowMediaBrowser(false);
+      }
+  };
   const handleLoadModel = () => {
     if (!selectedModel) {
       addMessage('System', 'No model selected', 'error');
@@ -772,8 +821,28 @@ const App: React.FC = () => {
           onHandsFreeModeChange={setIsHandsFreeMode}
         />
       </div>
+
+      {/* Image Generator Modal */}
+      {showImageGenerator && (
+        <ImageGenerator
+          prompt={imageGenerationPrompt}
+          onGenerate={handleGenerateImage}
+          onClose={() => setShowImageGenerator(false)}
+        />
+      )}
+
+      {/* Media Browser Modal */}
+      {showMediaBrowser && (
+        <MediaBrowser
+          query={mediaBrowserQuery}
+          onPlay={handlePlayMedia}
+          onClose={() => setShowMediaBrowser(false)}
+          settings={novaSettings} // Pass novaSettings
+        />
+      )}
     </div>
   );
 };
+
 
 export default App;
