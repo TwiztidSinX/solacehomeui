@@ -58,3 +58,5 @@ templates/backup.txt
 mcpServers/voice_server/stt_tts_venv/ 
 *.json
 
+bugtesting.txt
+nova_settings.json

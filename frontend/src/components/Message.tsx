@@ -65,14 +65,6 @@ const Message: React.FC<MessageProps> = ({
 
   const isUser = type === 'user';
 
-  const messageClass = 'p-4 rounded-lg glass max-w-6xl w-full'; // Expanded width for embeds
-  const messageStyle = {
-    backgroundColor:
-      isUser
-        ? 'var(--user-message-color)'
-        : 'var(--ai-message-color)',
-  };
-
   const renderMessageContent = () => {
     if (imageUrl) {
       return <img src={imageUrl} alt="Generated image" className="mt-2 rounded-lg max-w-md" />;
@@ -80,14 +72,14 @@ const Message: React.FC<MessageProps> = ({
     if (iframeUrl) {
       if (iframeUrl.includes('/stream?')) {
         return (
-          <video controls autoPlay className="w-full rounded-lg">
+          <video controls autoPlay className="w-full rounded-lg mt-2">
             <source src={iframeUrl} type="video/mp4" />
             Your browser does not support the video tag.
           </video>
         );
       }
       return (
-        <div className="w-full">
+        <div className="w-full mt-2">
           <div className="bg-gray-900/80 text-white p-2 rounded-t-lg flex justify-between items-center">
             <span className="text-sm truncate">{iframeUrl}</span>
             <a href={iframeUrl} target="_blank" rel="noopener noreferrer" className="ml-4 px-2 py-1 text-xs bg-blue-600 hover:bg-blue-700 rounded">
@@ -114,21 +106,22 @@ const Message: React.FC<MessageProps> = ({
           frameBorder="0"
           allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
           allowFullScreen
-          className="rounded-lg"
+          className="rounded-lg mt-2"
         ></iframe>
       );
     }
     if (imageGalleryUrls) {
       return (
-        <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+        <div className="grid grid-cols-2 md:grid-cols-3 gap-2 mt-2">
           {imageGalleryUrls.map((url, index) => (
             <img key={index} src={url} alt={`Search result ${index + 1}`} className="rounded-lg object-cover h-40 w-full" />
           ))}
         </div>
       )
     }
+    // For standard text messages, apply markdown and handle user-uploaded images.
     return (
-      <>
+      <div className="message-content-container">
         <div
           className="message-content"
           dangerouslySetInnerHTML={{ __html: formatMarkdown(message) }}
@@ -140,42 +133,48 @@ const Message: React.FC<MessageProps> = ({
             alt="User upload"
           />
         )}
-      </>
+      </div>
     );
   };
 
-  const messageBody = (
-    <div className={messageClass} style={messageStyle}>
+  if (isUser) {
+    return (
+      <div className="flex justify-end w-full">
+        <div className="flex items-start gap-3">
+          {/* User Message Bubble */}
+          <div 
+            className="p-3 rounded-lg glass" 
+            style={{ backgroundColor: 'var(--user-message-color)', maxWidth: '75ch' }}
+          >
+            {renderMessageContent()}
+          </div>
+          {/* User Avatar */}
+          <img 
+            src={avatar || '/default-user.png'} 
+            alt="User Avatar" 
+            className="w-8 h-8 rounded-full object-cover" 
+          />
+        </div>
+      </div>
+    );
+  }
+
+  // AI Message Panel
+  return (
+    <div className="flex items-start gap-4 w-full">
+      {/* AI Avatar */}
+      <img 
+        src={avatar || '/nova-logo.png'} 
+        alt="AI Avatar" 
+        className="w-8 h-8 rounded-full object-cover" 
+      />
+      {/* AI Message Panel Content */}
+      <div className="flex-1 min-w-0 pt-1">
         <p className="font-bold">{sender}</p>
         {(isThinking || thought) && (
           <ThoughtBubble isThinking={isThinking} thought={thought} />
         )}
         {renderMessageContent()}
-      </div>
-  );
-
-  const avatarImage = (
-     <img
-        src={avatar || (isUser ? '/default-user.png' : '/nova-logo.png')}
-        alt="Avatar"
-        className="w-8 h-8 rounded-full object-cover flex-shrink-0"
-      />
-  );
-
-  return (
-    <div className={`w-full flex ${isUser ? 'justify-end' : 'justify-start'}`}>
-      <div className="flex items-start gap-4 max-w-full">
-        {isUser ? (
-            <>
-                {messageBody}
-                {avatarImage}
-            </>
-        ) : (
-            <>
-                {avatarImage}
-                {messageBody}
-            </>
-        )}
       </div>
     </div>
   );

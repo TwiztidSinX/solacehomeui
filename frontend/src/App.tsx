@@ -45,7 +45,6 @@ const App: React.FC = () => {
   const [isStreaming, setIsStreaming] = useState(false);
   const [imageToSend, setImageToSend] = useState<string | null>(null);
   const [isAgentMode, setIsAgentMode] = useState<boolean>(false);
-  const [isOrchestratorMode, setIsOrchestratorMode] = useState<boolean>(false); // New state
   const [messageInputText, setMessageInputText] = useState(''); // New state for the input
   const [isHandsFreeMode, setIsHandsFreeMode] = useState(false); // State for speech-to-speech
   const [showImageGenerator, setShowImageGenerator] = useState(false);
@@ -143,17 +142,30 @@ const App: React.FC = () => {
     setMessages(prev => [...prev, newMessage]);
   }, [setMessages]); // <--- Add setMessages to dependency array
 
+  const applyConfigForModel = useCallback((modelPath: string, configs: { [key: string]: ModelConfig }) => {
+    console.log(`[DEBUG] Applying config for model: ${modelPath}`);
+    if (modelPath && configs[modelPath]) {
+      const config = configs[modelPath];
+      const newName = config.aiName || 'Nova';
+      console.log(`[DEBUG] Found config. Setting aiName to: ${newName}`);
+      setAiName(newName);
+      setAiAvatar(config.aiAvatar || null);
+      setSystemPrompt(config.system_prompt || '');
+      setModelConfigOptions(config);
+    } else {
+      console.log(`[DEBUG] No config found. Resetting aiName to 'Nova'.`);
+      // If no config exists for the selected model, reset to defaults.
+      setAiName('Nova');
+      setAiAvatar(null);
+      setSystemPrompt('');
+      setModelConfigOptions({});
+    }
+  }, []); // Empty dependency array as it's a self-contained utility
+
   const handleModelChange = useCallback((model: string) => {
     setSelectedModel(model);
-    setAllConfigs(prevConfigs => {
-      const config = prevConfigs[model] || {};
-      setSystemPrompt(config.system_prompt || '');
-      setAiName(config.aiName || 'Nova');
-      setAiAvatar(config.aiAvatar || null);
-      setModelConfigOptions(config);
-      return prevConfigs; // Return the unchanged state
-    });
-  }, []);
+    applyConfigForModel(model, allConfigs);
+  }, [allConfigs, applyConfigForModel]);
 
   const newChat = useCallback(() => {
     const modelName = selectedModel.split(/[/\\]/).pop() || 'New Chat';
@@ -256,12 +268,14 @@ const App: React.FC = () => {
     const THINKING_START_TOKENS = ['<think>', '<|thinking|>', '<｜thinking｜>'];
     const THINKING_END_TOKENS = ['</think>', '<|/thinking|>', '<｜/thinking｜>'];
 
-    const handleStreamStart = () => {
+    const handleStreamStart = (data: { sender?: string }) => {
+      const senderName = data?.sender || aiName; // Use sender from backend, fallback to state
+      console.log(`[DEBUG] handleStreamStart: Creating new AI message bubble for sender: "${senderName}".`);
       setIsStreaming(true);
       inThinkingMode.current = false;
       tokenHistory.current = '';
       setMessages(prev => [...prev, { 
-        sender: aiName,  // Use aiName state instead of hardcoded "Nova"
+        sender: senderName,  // Use the name from the backend
         message: '', 
         type: 'ai', 
         thought: '', 
@@ -270,11 +284,19 @@ const App: React.FC = () => {
       }]);
     };
 
-    const handleStream = (token: string) => {
+    const handleStream = (token: any) => {
+      // Explicitly convert token to string to prevent [objectObject] spamming
+      const processedToken = String(token);
+
+      // If the token is literally '[Output]', ignore it.
+      if (processedToken === '[Output]') {
+        return;
+      }
+
       // This function handles both the visual display of tokens and the TTS buffering.
       
       // 1. Update the visual message state (handles <think> tags)
-      tokenHistory.current += token;
+      tokenHistory.current += processedToken;
       if (tokenHistory.current.length > MAX_HISTORY_LENGTH) {
         tokenHistory.current = tokenHistory.current.slice(-MAX_HISTORY_LENGTH);
       }
@@ -291,10 +313,10 @@ const App: React.FC = () => {
       };
       if (inThinkingMode.current) {
         for (const endTag of THINKING_END_TOKENS) {
-          if (tokenHistory.current.endsWith(endTag)) {
+          if (tokenHistory.current.trim().endsWith(endTag)) {
             inThinkingMode.current = false;
-            const tagIndex = token.lastIndexOf(endTag.charAt(0));
-            const contentBeforeTag = tagIndex !== -1 ? token.slice(0, tagIndex) : token;
+            const tagIndex = processedToken.lastIndexOf(endTag.charAt(0));
+            const contentBeforeTag = tagIndex !== -1 ? processedToken.slice(0, tagIndex) : processedToken;
             if (contentBeforeTag) {
               updateLastMessage(last => {
                 last.thought = (last.thought || '') + contentBeforeTag;
@@ -306,7 +328,7 @@ const App: React.FC = () => {
           }
         }
         updateLastMessage(last => {
-          last.thought = (last.thought || '') + token;
+          last.thought = (last.thought || '') + processedToken;
           last.isThinking = true;
           return last;
         });
@@ -316,8 +338,8 @@ const App: React.FC = () => {
         for (const startTag of THINKING_START_TOKENS) {
           if (tokenHistory.current.endsWith(startTag)) {
             inThinkingMode.current = true;
-            const tagIndex = token.lastIndexOf(startTag.charAt(0));
-            const contentBeforeTag = tagIndex !== -1 ? token.slice(0, tagIndex) : '';
+            const tagIndex = processedToken.lastIndexOf(startTag.charAt(0));
+            const contentBeforeTag = tagIndex !== -1 ? processedToken.slice(0, tagIndex) : '';
             if (contentBeforeTag) {
                updateLastMessage(last => {
                   last.message += contentBeforeTag;
@@ -334,14 +356,14 @@ const App: React.FC = () => {
           }
         }
         updateLastMessage(last => {
-          last.message += token;
+          last.message += processedToken;
           last.isThinking = false;
           return last;
         });
         
         // 2. Handle TTS buffering if in hands-free mode and not thinking
         if (isHandsFreeMode && !inThinkingMode.current) {
-            ttsBufferRef.current += token;
+            ttsBufferRef.current += processedToken;
             if (/[.!?]/.test(ttsBufferRef.current)) {
                 if (socketRef.current) socketRef.current.emit('tts', { text: ttsBufferRef.current });
                 ttsBufferRef.current = '';
@@ -396,7 +418,13 @@ const App: React.FC = () => {
         handleModelChange(data.models[0]);
       }
     };
-    const handleConfigs = (data: { [key: string]: ModelConfig }) => setAllConfigs(data);
+    const handleConfigs = (data: { [key: string]: ModelConfig }) => {
+      setAllConfigs(data);
+      // Re-apply config for the current model in case configs loaded after the model was selected.
+      if (selectedModel) {
+        applyConfigForModel(selectedModel, data);
+      }
+    };
     const handleGraphData = (data: GraphData) => setGraphData(data);
     // --- New Audio Playback Queue Logic ---
     const playNextInQueue = () => {
@@ -450,22 +478,54 @@ const App: React.FC = () => {
         if (data.type === 'image_generation') {
             setImageGenerationPrompt(data.prompt || '');
             setShowImageGenerator(true);
+            return; // Don't add a message for this, it's a UI action
         } else if (data.type === 'media_browser') {
             setMediaBrowserQuery(data.query || '');
             setShowMediaBrowser(true);
+            return; // Don't add a message for this, it's a UI action
         }
-        
-        const newMessage: Message = {
-            sender: data.sender || 'Nova',
-            message: data.message,
-            type: data.type === 'error' ? 'error' : 'ai',
-            imageB64: null,
-            iframeUrl: data.type === 'iframe' ? data.url : data.type === 'media_embed' ? data.embed_url : undefined,
-            youtubeVideoId: data.type === 'youtube_embed' ? data.video_id : undefined,
-            imageGalleryUrls: data.type === 'image_gallery' ? data.urls : undefined,
-            imageUrl: data.type === 'image_generated' ? data.image_url : undefined,
-        };
-        setMessages(prev => [...prev, newMessage]);
+
+        setMessages(prev => {
+            const lastMessage = prev[prev.length - 1];
+            // Check if the last message is from the AI and is currently streaming or thinking
+            if (lastMessage && lastMessage.sender === aiName && (isStreaming || lastMessage.isThinking)) {
+                const updatedLastMessage = { ...lastMessage };
+
+                // Append or set the message content
+                if (data.message) {
+                    updatedLastMessage.message = (updatedLastMessage.message || '') + data.message;
+                }
+
+                // Update specific command response fields
+                if (data.type === 'iframe') {
+                    updatedLastMessage.iframeUrl = data.url;
+                } else if (data.type === 'media_embed') {
+                    updatedLastMessage.iframeUrl = data.embed_url;
+                } else if (data.type === 'youtube_embed') {
+                    updatedLastMessage.youtubeVideoId = data.video_id;
+                } else if (data.type === 'image_gallery') {
+                    updatedLastMessage.imageGalleryUrls = data.urls;
+                } else if (data.type === 'image_generated') {
+                    updatedLastMessage.imageUrl = data.image_url;
+                }
+                updatedLastMessage.type = data.type === 'error' ? 'error' : 'ai';
+
+                return [...prev.slice(0, -1), updatedLastMessage];
+            } else {
+                // If not streaming or not an AI message, create a new message
+                const newMessage: Message = {
+                    sender: data.sender || aiName,
+                    message: data.message,
+                    type: data.type === 'error' ? 'error' : 'ai',
+                    imageB64: null,
+                    iframeUrl: data.type === 'iframe' ? data.url : data.type === 'media_embed' ? data.embed_url : undefined,
+                    youtubeVideoId: data.type === 'youtube_embed' ? data.video_id : undefined,
+                    imageGalleryUrls: data.type === 'image_gallery' ? data.urls : undefined,
+                    imageUrl: data.type === 'image_generated' ? data.image_url : undefined,
+                };
+                return [...prev, newMessage];
+            }
+        });
     };
 
     const handleNovaSettingsLoaded = (data: any) => {
@@ -501,16 +561,30 @@ const App: React.FC = () => {
   const handleSendMessage = () => {
     const currentMessage = messageInputText; // Use the state variable
     if (currentMessage.trim() || imageToSend) {
+      // Check if this is the first message in the session to trigger rename
+      // This check must happen *before* the new message is added to the state.
+      if (messages.length === 0 && currentMessage.trim()) {
+        socketRef.current.emit('summarize_and_rename', {
+          session_id: activeChatId,
+          text: currentMessage,
+          user_id: 'default_user' // Assuming a default user for now
+        });
+      }
+
       // Add user's message to chat immediately for display
       addMessage(userName, currentMessage, 'user', imageToSend); // Re-add this line
 
-      const currentChatSession = chatSessions.find(session => session._id === activeChatId); // Define here
+      // Create a clean version of the history that doesn't include the model's thought process.
+      const historyForModel = messages.map(({ thought, ...rest }) => rest);
+
+      console.log(`[DEBUG] handleSendMessage: Current aiName from state is "${aiName}". Sending this to backend.`);
+
       const messagePayload: any = {
         text: currentMessage,
-        history: currentChatSession?.messages || [],
-        session_id: currentChatSession?._id,
+        history: historyForModel, // Use the cleaned history
+        session_id: activeChatId,
         userName: userName,
-        aiName: novaSettings.aiName,
+        aiName: aiName, // Use the model-specific aiName from state
         backend: currentBackend, // Use currentBackend state
         provider: apiProvider, // Use apiProvider state
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
@@ -523,8 +597,6 @@ const App: React.FC = () => {
 
       if (isAgentMode) {
         socketRef.current.emit('agent_command', messagePayload);
-      } else if (isOrchestratorMode) {
-        socketRef.current.emit('chat', { ...messagePayload, isOrchestratorMode: true });
       } else {
         socketRef.current.emit('chat', messagePayload);
       }
@@ -723,8 +795,6 @@ const App: React.FC = () => {
                   setImage={setImageToSend}
                             isAgentMode={isAgentMode}
                             onAgentModeChange={setIsAgentMode}
-                            isOrchestratorMode={isOrchestratorMode} // New prop
-                            onOrchestratorModeChange={setIsOrchestratorMode} // New prop
                   message={messageInputText} // Pass the state down
                   onMessageChange={setMessageInputText} // Pass the setter down
                 />

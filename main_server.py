@@ -284,16 +284,19 @@ def load_model_task(data, sid):
     global current_model, current_model_path_string, current_backend
     with model_lock:
         try:
+            # If a model is already loaded, unload it using the proper task.
             if current_model:
-                unload_model(current_model_path_string, backend=current_backend)
+                print("Unloading existing model before loading new one...")
+                # This is a blocking call within the locked task, which is what we want.
+                unload_model_task(sid)
             
-            # The 'data' dictionary from the frontend now contains all necessary arguments.
-            # We can pass it directly using the **kwargs syntax.
+            print("Loading new model...")
             current_model = load_model(**data)
-            
             current_model_path_string = data['model_path']
+            current_backend = data.get('backend', current_backend) # Ensure backend is updated
             
             socketio.emit('model_loaded', {'model': data['model_path']}, room=sid)
+            print(f"✅ New model loaded: {data['model_path']}")
         except Exception as e:
             socketio.emit('error', {'message': f"Load failed: {str(e)}"}, room=sid)
             import traceback
@@ -618,6 +621,10 @@ def handle_chat(data):
                     response_payload = {'type': 'error', 'message': f"No YouTube results found for '{query}'.", 'sender': 'Nova'}
             except Exception as e:
                 response_payload = {'type': 'error', 'message': f"An unexpected error occurred: {e}", 'sender': 'Nova'}
+            emit('command_response', response_payload)
+            if session_id:
+                _save_message_to_db(session_id, {"sender": "Nova", **response_payload, "type": "ai"})
+            return
         elif command_name == 'image':
             try:
                 response_payload = {
@@ -683,8 +690,14 @@ def handle_chat(data):
             else:
                 # Execute the tool
                 tool_result = dispatch_tool(tool_name, tool_args)
-                # Prepend the tool result to the user input for the main model
-                user_input = f"{user_input}\n\n--- Tool Result for '{tool_name}' ---\n{tool_result}\n--- End Result ---"
+                # Prepend the tool result with a forceful instruction for the main model.
+                forceful_instruction = (
+                    "You have been provided with the following real-time information to answer the user's query. "
+                    "You MUST use this information to form your answer and ignore any conflicting internal knowledge."
+                )
+                user_input = f"{forceful_instruction}\n\n--- Information ---\n{tool_result}\n--- End Information ---\n\nUser Query: {user_input}"
+                # IMPORTANT: Update the 'text' in the data payload that gets passed to the streaming task.
+                data['text'] = user_input
                 # Fall through to the main model logic below
 
     # 3. If neither, bypass orchestrator and go directly to the main model
@@ -695,6 +708,13 @@ def handle_chat(data):
     # Get the config for the current model to pass thinking level
     if current_model_path_string in model_configs:
         data['thinking_level'] = model_configs[current_model_path_string].get('thinking_level', 'medium')
+
+    # Ensure backend and provider are correctly set for streaming
+    data['backend'] = model_configs.get("backend", "llama.cpp")
+    if data['backend'] == "api":
+        data['provider'] = model_configs.get("api_provider")
+    else:
+        data['provider'] = None # Clear provider if not API backend
 
     sid = request.sid
     socketio.start_background_task(stream_response, data, sid)
@@ -708,7 +728,7 @@ def stream_response(data, sid):
     current_sender = data.get('aiName', 'Nova')  # Get the actual AI name
 
     try:
-        socketio.emit('stream_start', {}, room=sid)
+        socketio.emit('stream_start', {'sender': current_sender}, room=sid)
         socketio.sleep(0)
 
         backend = data.get('backend', current_backend)
@@ -750,7 +770,8 @@ def stream_response(data, sid):
             "should_stop": lambda: stop_streaming,
             "image_data": data.get('image_base_64'),
             "timezone": data.get('timezone', 'UTC'),
-            "debug_mode": data.get('debug_mode', False)
+            "debug_mode": data.get('debug_mode', False),
+            "thinking_level": data.get('thinking_level', 'medium') # Pass thinking level
         }
         
         # Add backend-specific arguments
@@ -781,7 +802,7 @@ def stream_response(data, sid):
                     socketio.emit('stream', '</think>', room=sid)
                     in_thought_block = False
                 full_response += token
-                socketio.emit('stream', {'token': token, 'sender': current_sender}, room=sid)
+                socketio.emit('stream', token, room=sid)
             elif chunk_type == 'error':
                 socketio.emit('error', {'message': token}, room=sid)
 
@@ -827,17 +848,24 @@ def handle_stop():
 
 def unload_model_task(sid):
     """Background task to unload a model without blocking."""
-    global current_model, current_model_path_string
+    global current_model, current_model_path_string, current_backend
     with model_lock:
-        if current_model_path_string:
+        if current_model and current_model_path_string:
             model_path_to_unload = current_model_path_string
             backend_to_unload = current_backend
-            if unload_model(model_path_to_unload, backend=backend_to_unload):
-                current_model = None
-                current_model_path_string = None
+            model_to_unload = current_model
+
+            print(f"[DEBUG] Unloading task: current_model object id is {id(model_to_unload)}")
+
+            # Set globals to None *before* cleanup to break the main reference
+            current_model = None
+            current_model_path_string = None
+            
+            if unload_model(model_to_unload, model_path_to_unload, backend=backend_to_unload):
                 socketio.emit('model_unloaded', {'model': model_path_to_unload}, room=sid)
-                print(f"✅ Model unloaded and globals cleared: {model_path_to_unload}")
+                print(f"✅ Globals cleared and unload process finished for: {model_path_to_unload}")
             else:
+                # This block might not be reachable if unload_model always returns True
                 socketio.emit('error', {'message': f'Failed to unload model: {model_path_to_unload}'}, room=sid)
         else:
             socketio.emit('error', {'message': 'No model is currently loaded.'}, room=sid)

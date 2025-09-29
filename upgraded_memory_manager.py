@@ -119,6 +119,12 @@ class Memory:
                 logger.warning(f"Memory content too short: '{content}'")
                 return None
                 
+            # Check for duplicate memory before inserting
+            existing_memory = self.collection.find_one({"content": content, "metadata.model_id": model_id})
+            if existing_memory:
+                logger.warning(f"Duplicate memory skipped: {content[:50]}... (model: {model_id})")
+                return None
+                
             embedding = self.model.encode([content])[0]
             emotion = analyze_emotion(content)
             score = self._calculate_memory_score(content)
@@ -344,7 +350,7 @@ class Memory:
         
         for fact in facts:
             score = self._calculate_memory_score(fact)
-            if force or score >= 45:
+            if force or score >= 60:
                 if self.add_memory(fact, source=source, model_id=model_id):
                     remembered_count += 1
                     

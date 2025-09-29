@@ -79,11 +79,24 @@ def load_model(
                 model_states[mid] = 'unloaded'
             gc.collect()
 
-            # Store system prompt in model state
+            # --- Thinking Style Classification ---
+            model_name_lower = model_id.lower()
+            thinking_style = 'none' # Default
+            
+            simple_thinking_keywords = ["magistral", "deepseek-r1", "deepseek-v3.1"]
+            advanced_thinking_keywords = ["gpt-oss", "qwen2.5-omni"] # As per user, qwen3-2507 is advanced
+
+            if any(keyword in model_name_lower for keyword in advanced_thinking_keywords) or ('qwen' in model_name_lower and '2507' in model_name_lower):
+                thinking_style = 'advanced'
+            elif any(keyword in model_name_lower for keyword in simple_thinking_keywords) or ('qwen' in model_name_lower and 'thinking' in model_name_lower):
+                thinking_style = 'simple'
+
+            # Store system prompt and thinking style in model state
             model_states[model_id] = {
                 'status': 'active',
                 'system_prompt': system_prompt or "You are a helpful AI assistant.",
-                'context_tokens': context_tokens
+                'context_tokens': context_tokens,
+                'thinking_style': thinking_style
             }
 
             print(f"🟢 LOADING MODEL: {model_id} with backend {backend} and provider {provider}")
@@ -244,49 +257,64 @@ def load_model(
             traceback.print_exc()
             return None
         
-def unload_model(model_path, backend="llama.cpp"):
-    global current_model, current_model_path_string
+def unload_model(model_obj, model_path, backend="llama.cpp"):
+    global models, model_states
     model_id = model_path.replace("\\", "/")
     with models_lock:
-        if model_id in models:
-            print(f"🟡 Unloading model: {model_id} from backend {backend}")
+        models.pop(model_id, None)
+        model_states.pop(model_id, None)
+        print(f"🟡 Unloading model: {model_id} from backend {backend}")
 
-            if backend == "ollama":
-                try:
-                    # To unload, we can send a request with keep_alive: 0
-                    # The ollama library does not expose a direct unload.
-                    # We will use a direct http request.
-                    import requests
-                    requests.post('http://localhost:11434/api/generate', json={"model": model_id, "keep_alive": 0})
-                    print(f"✅ Sent unload request to Ollama for model: {model_id}")
-                except Exception as e:
-                    print(f"⚠️ Could not send unload request to Ollama: {e}")
-            
-                        # Special handling for SafeTensors models
-            if backend == "safetensors" and isinstance(models[model_id], tuple):
-                model_tuple = models[model_id]
-                # Explicitly delete components to free memory
-                for item in model_tuple:
-                    del item
-                del models[model_id]
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            else:
-                del models[model_id]
-
-            model_states.pop(model_id, None)
-            
-            # Final cleanup
-            gc.collect()
+        # Safetensors backend
+        if backend == "safetensors" and model_obj and isinstance(model_obj, tuple):
+            model, tokenizer, streamer, processor = model_obj
             if torch.cuda.is_available():
+                print("[DEBUG] VRAM summary before unload:")
+                print(torch.cuda.memory_summary(device=None, abbreviated=True))
+            model.to('cpu')
+            del model
+            del tokenizer
+            del streamer
+            del processor
+            del model_obj
+
+        # Ollama (just signal)
+        elif backend == "ollama":
+            try:
+                import requests
+                payload = {"model": model_id, "prompt": "Unloading model", "keep_alive": 0}
+                requests.post('http://localhost:11434/api/generate', json=payload, timeout=0.5)
+            except Exception as e:
+                print("ℹ️ Ollama unload issue:", e)
+
+        else:
+            # For llama.cpp or other models loaded in memory
+            if model_obj is not None:
+                del model_obj
+
+        # Force cleanup
+        print("Running final garbage collection...")
+        gc.collect()
+
+        if torch.cuda.is_available():
+            # first, move any remaining tensors or buffers off GPU if possible
+            try:
                 torch.cuda.empty_cache()
-            
-            current_model = None
-            current_model_path_string = None
-            print(f"✅ MODEL UNLOADED: {model_id}")
-            return True
-    return False
+            except Exception as e:
+                print("⚠️ empty_cache error:", e)
+
+            # reset memory tracking stats
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except Exception as e:
+                # newer versions may not expose it
+                pass
+
+            print("[DEBUG] VRAM summary after unload attempt:")
+            print(torch.cuda.memory_summary(device=None, abbreviated=True))
+
+        print(f"✅ Model unload process attempted for: {model_id}")
+        return True
 
 def detect_model_family(model_instance, model_path: str) -> str:
     """Detect model family from GGUF metadata or fallback to filename."""
@@ -801,13 +829,32 @@ def stream_gpt(model, model_path, user_input, conversation_history, should_stop,
         yield {'type': 'error', 'token': f"An error occurred: {e}"}
 
 def stream_llamacpp(model_instance, model_id_str, user_input, conversation_history, should_stop,
-                    image_data=None, timezone='UTC', tools=None, tool_outputs=None, debug_mode=False):
+                    image_data=None, timezone='UTC', tools=None, tool_outputs=None, debug_mode=False, thinking_level='medium'):
     try:
         import re
         import json
         from datetime import datetime
         memory_context = get_context_for_model(user_input, model_id=model_id_str)
-        system_prompt = model_states.get(model_id_str, {}).get("system_prompt", "You are a helpful AI assistant.")
+        
+        # --- Hybrid Thinking Logic ---
+        model_state = model_states.get(model_id_str, {})
+        system_prompt = model_state.get("system_prompt", "You are a helpful AI assistant.")
+        thinking_style = model_state.get("thinking_style", "none")
+        force_think_prepend = False
+
+        if thinking_style in ['simple', 'advanced']:
+            force_think_prepend = True
+
+        if thinking_style == 'advanced':
+            thinking_instructions = {
+                "low": "Provide a direct answer with minimal reasoning. Avoid verbose chains of thought.",
+                "medium": "Briefly outline key reasoning steps, then give the final answer.",
+                "high": "Think step by step. Provide a short summary of the reasoning, then the final answer."
+            }
+            if thinking_level in thinking_instructions:
+                system_prompt += f"\n\n--- Reasoning Instructions ---\n{thinking_instructions[thinking_level]}"
+        # --- End Hybrid Logic ---
+
         config_path = os.path.join(BASE_DIR, "config.json")
         with open(config_path, "r", encoding="utf-8-sig") as f:
             all_configs = json.load(f)
@@ -815,24 +862,16 @@ def stream_llamacpp(model_instance, model_id_str, user_input, conversation_histo
         now = datetime.now()
         time_message = f"Current Time: {now.strftime('%H:%M')} | Current Date: {now.strftime('%m/%d/%Y')} | User Timezone: {timezone}"
         full_system_prompt = f"{time_message}\n\n{system_prompt}"
-        if memory_context and memory_context.strip().lower() not in ["none", "null", "[]"]:
-            full_system_prompt += f"\n\nRelevant Memories:\n{memory_context}"
 
-        # 1. Build the core message list
         messages = clean_and_normalize_history(conversation_history, user_input)
 
-        # 2. Prepend system and memory prompts
         if memory_context and memory_context.strip().lower() not in ["none", "null", "[]"]:
             messages.insert(0, {"role": "system", "content": f"Relevant Memories:\n{memory_context}"})
         
-        # Handle web search results
         if conversation_history and conversation_history[0].get("role") == "user" and "web_search" in conversation_history[0].get("content", ""):
             web_search_context = conversation_history.pop(0)["content"]
             full_system_prompt = (
-                "You have been provided with the following real-time web search results to answer the user's query. "
-                "You MUST use this information to form your answer and ignore any conflicting internal knowledge.\n\n"
-                f"--- Web Search Results ---\n{web_search_context}\n--- End Web Search Results ---\n\n"
-                f"{full_system_prompt}"
+                "You have been provided with the following real-time web search results..."
             )
         
         messages.insert(0, {"role": "system", "content": full_system_prompt})
@@ -849,8 +888,6 @@ def stream_llamacpp(model_instance, model_id_str, user_input, conversation_histo
                     "content": json.dumps(tool_output['output'])
                 })
 
-
-        # Stricter Context Window Management: Use only 40% of the configured context for history.
         total_context_tokens = config.get('context_tokens', 8192)
         max_tokens_for_history = int(total_context_tokens * 0.4)
         messages = manage_context_window(messages, max_tokens_for_history)
@@ -872,11 +909,10 @@ def stream_llamacpp(model_instance, model_id_str, user_input, conversation_histo
             request_params["tool_choice"] = "auto"
 
         stream = model_instance.create_chat_completion(**request_params)
-        yield {"type": "reply", "token": "<think>\n"}
-        if model_states.get(model_id_str, {}).get('uses_chat_handler'):
-            for msg in messages:
-                if isinstance(msg.get('content'), str):
-                    msg['content'] = strip_outer_template_wrappers(msg['content'])
+        
+        if force_think_prepend:
+            yield {'type': 'reply', 'token': '<think>'}
+
         active_tool_calls = {}
         for chunk in stream:
             if should_stop():
@@ -887,12 +923,7 @@ def stream_llamacpp(model_instance, model_id_str, user_input, conversation_histo
             if not delta: continue
 
             if delta.get("content"):
-                token = delta["content"]
-                if token == "</think>":
-                    # Close block neatly and maybe add spacing
-                    yield {"type": "reply", "token": "</think>\n\n"}
-                else:
-                    yield {"type": "reply", "token": token}
+                yield {'type': 'reply', 'token': str(delta["content"])}
 
             if delta.get("tool_calls"):
                 for tool_call_chunk in delta["tool_calls"]:
@@ -908,8 +939,6 @@ def stream_llamacpp(model_instance, model_id_str, user_input, conversation_histo
                         active_tool_calls[index]['function']['name'] = tool_call_chunk["function"]["name"]
                     if tool_call_chunk.get("function", {}).get("arguments"):
                         active_tool_calls[index]['function']['arguments'] += tool_call_chunk["function"]["arguments"]
-
-        yield {"type": "reply", "token": "</think>\n\n"}
         
         for index, tool_call in active_tool_calls.items():
             try:
@@ -931,32 +960,43 @@ def stream_llamacpp(model_instance, model_id_str, user_input, conversation_histo
         traceback.print_exc()
         yield {'type': 'error', 'token': f"[STREAM ERROR (llama.cpp): {str(e)}]"}
 
-def stream_ollama(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None, timezone='UTC', debug_mode=False):
+def stream_ollama(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None, timezone='UTC', debug_mode=False, thinking_level='medium'):
     try:
         from datetime import datetime
+        import json
         memory_context = get_context_for_model(user_input, model_id=model_id_str)
-        system_prompt = model_states.get(model_id_str, {}).get("system_prompt", "You are a helpful AI assistant.")
+        
+        # --- Hybrid Thinking Logic ---
+        model_state = model_states.get(model_id_str, {})
+        system_prompt = model_state.get("system_prompt", "You are a helpful AI assistant.")
+        thinking_style = model_state.get("thinking_style", "none")
+
+        if thinking_style == 'advanced':
+            thinking_instructions = {
+                "low": "Provide a direct answer with minimal reasoning. Avoid verbose chains of thought.",
+                "medium": "Briefly outline key reasoning steps, then give the final answer.",
+                "high": "Think step by step. Provide a short summary of the reasoning, then the final answer."
+            }
+            if thinking_level in thinking_instructions:
+                system_prompt += f"\n\n--- Reasoning Instructions ---\n{thinking_instructions[thinking_level]}"
+        # Per user request, we don't force-prepend <think> for Ollama.
+        # --- End Hybrid Logic ---
 
         now = datetime.now()
         time_message = f"This is a system message. Do not refer to this message unless asked. This message is to give you a live update of the Current Date and Time. The User's Timezone is {timezone}. The Current time is {now.strftime('%H:%M')} and The Current Date is {now.strftime('%m/%d/%Y')}."
 
-        # Prepend the time message to the system prompt for Ollama
         system_prompt_with_time = f"{time_message}\n\n{system_prompt}"
 
-        # Build the messages list using the unified history function
         messages = clean_and_normalize_history(conversation_history, user_input)
 
-        # Prepend the system prompts
         if memory_context and memory_context.strip().lower() not in ["none", "null", "[]"]:
             messages.insert(0, {"role": "system", "content": f"Relevant Memories:\n{memory_context}"})
         messages.insert(0, {"role": "system", "content": system_prompt_with_time})
 
-        # Manage context window
         messages = manage_context_window(messages, 8192 - 1024)
 
         if debug_mode:
             print("\n--- OLLAMA PROMPT DEBUG ---")
-            import json
             print(json.dumps(messages, indent=2))
             print("---------------------------\n")
 
@@ -966,15 +1006,13 @@ def stream_ollama(model_instance, model_id_str, user_input, conversation_history
             stream=True
         )
 
-        # Simplified streaming logic
         for chunk in stream:
             if should_stop():
                 yield {'type': 'reply', 'token': "\n[Generation stopped by user]"}
                 break
 
-            token = chunk['message']['content']
+            token = str(chunk['message']['content'])
             if token:
-                # Yield each token immediately as a 'reply'
                 yield {'type': 'reply', 'token': token}
 
     except Exception as e:
@@ -986,8 +1024,8 @@ def stream_ollama(model_instance, model_id_str, user_input, conversation_history
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-def stream_safetensors(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None, timezone='UTC', debug_mode=False):
-    """Universal streaming for ALL safetensors models with proper thinking block support."""
+def stream_safetensors(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None, timezone='UTC', debug_mode=False, thinking_level='medium'):
+    """Universal streaming for ALL safetensors models with hybrid thinking support."""
     try:
         from transformers import TextIteratorStreamer
         from threading import Thread
@@ -996,6 +1034,7 @@ def stream_safetensors(model_instance, model_id_str, user_input, conversation_hi
         import base64
         from datetime import datetime
         from qwen_omni_utils import process_mm_info
+        import json
 
         if len(model_instance) == 4:
             model, tokenizer, _, processor = model_instance
@@ -1006,20 +1045,36 @@ def stream_safetensors(model_instance, model_id_str, user_input, conversation_hi
             raise ValueError("Invalid model_instance tuple size")
 
         memory_context = get_context_for_model(user_input, model_id=model_id_str)
-        system_prompt = model_states.get(model_id_str, {}).get("system_prompt", "You are a helpful AI assistant.")
+        
+        # --- Hybrid Thinking Logic ---
+        model_state = model_states.get(model_id_str, {})
+        system_prompt = model_state.get("system_prompt", "You are a helpful AI assistant.")
+        thinking_style = model_state.get("thinking_style", "none")
+        force_think_prepend = False
+
+        if thinking_style in ['simple', 'advanced']:
+            force_think_prepend = True
+        
+        if thinking_style == 'advanced':
+            thinking_instructions = {
+                "low": "Provide a direct answer with minimal reasoning. Avoid verbose chains of thought.",
+                "medium": "Briefly outline key reasoning steps, then give the final answer.",
+                "high": "Think step by step. Provide a short summary of the reasoning, then the final answer."
+            }
+            if thinking_level in thinking_instructions:
+                system_prompt += f"\n\n--- Reasoning Instructions ---\n{thinking_instructions[thinking_level]}"
+        # --- End Hybrid Logic ---
+
         now = datetime.now()
         time_message = f"System Time: {now.strftime('%Y-%m-%d %H:%M:%S')} (Timezone: {timezone})"
         system_prompt_with_time = f"{time_message}\n\n{system_prompt}"
 
-        # 1. Build the core message list
         messages = clean_and_normalize_history(conversation_history, user_input)
 
-        # 2. Prepend system and memory prompts
         if memory_context and memory_context.strip().lower() not in ["none", "null", "[]"]:
             messages.insert(0, {"role": "system", "content": f"Relevant Memories:\n{memory_context}"})
         messages.insert(0, {"role": "system", "content": system_prompt_with_time})
 
-        # 3. Manage context window
         model_context_window = model_states.get(model_id_str, {}).get('context_tokens', 8192)
         messages = manage_context_window(messages, model_context_window - 1024)
 
@@ -1028,7 +1083,6 @@ def stream_safetensors(model_instance, model_id_str, user_input, conversation_hi
             print(json.dumps(messages, indent=2))
             print("--------------------------------\n")
 
-        # 4. Handle vision/image data (if applicable)
         if image_data and processor:
             try:
                 for msg in reversed(messages):
@@ -1048,7 +1102,6 @@ def stream_safetensors(model_instance, model_id_str, user_input, conversation_hi
                 yield {'type': 'error', 'token': f"[ERROR processing image: {e}]"}
                 return
         else:
-            # 5. For text-only, apply the tokenizer's chat template
             prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
@@ -1057,36 +1110,16 @@ def stream_safetensors(model_instance, model_id_str, user_input, conversation_hi
         thread = Thread(target=model.generate, kwargs=generation_kwargs)
         thread.start()
 
-        # Improved thinking block detection
-        thinking_buffer = ""
-        in_think_block = False
-        
+        if force_think_prepend:
+            yield {'type': 'reply', 'token': '<think>'}
+
         for token in streamer:
             if should_stop():
                 yield {'type': 'reply', 'token': "\n[Generation stopped by user]"}
                 break
-                
+            
             if token:
-                # Buffer tokens to detect thinking patterns
-                thinking_buffer += token
-                if len(thinking_buffer) > 100:  # Keep buffer manageable
-                    thinking_buffer = thinking_buffer[-50:]
-                
-                # Detect thinking block patterns
-                if not in_think_block:
-                    if any(marker in thinking_buffer.lower() for marker in ['<think>', 'thinking:', 'reasoning:', 'step']):
-                        in_think_block = True
-                        yield {'type': 'thought', 'token': token}
-                    else:
-                        yield {'type': 'reply', 'token': token}
-                else:
-                    # Inside thinking block
-                    if any(marker in thinking_buffer.lower() for marker in ['</think>', 'final answer:', 'answer:', 'conclusion:']):
-                        in_think_block = False
-                        yield {'type': 'thought', 'token': token}
-                        yield {'type': 'reply', 'token': '\n'}  # Add separation
-                    else:
-                        yield {'type': 'thought', 'token': token}
+                yield {'type': 'reply', 'token': str(token)}
         
         thread.join()
 
@@ -1141,7 +1174,7 @@ def stream_google(model_instance, model_id_str, user_input, conversation_history
                 break
             # The final chunk may not have any parts, causing chunk.text to fail.
             if chunk.parts and hasattr(chunk.parts[0], 'text'):
-                yield {'type': 'reply', 'token': chunk.text}
+                yield {'type': 'reply', 'token': str(chunk.parts[0].text)}
 
     except Exception as e:
         import traceback
@@ -1193,7 +1226,7 @@ def stream_openai(model_instance, model_id_str, user_input, conversation_history
                 break
             delta = chunk.choices[0].delta.content
             if delta:
-                yield {'type': 'reply', 'token': delta}
+                yield {'type': 'reply', 'token': str(delta)}
     except Exception as e:
         yield {'type': 'error', 'token': f"[STREAM ERROR (OpenAI): {str(e)}]"}
 
@@ -1225,7 +1258,7 @@ def stream_anthropic(model_instance, model_id_str, user_input, conversation_hist
                 if should_stop():
                     yield {'type': 'reply', 'token': "\n[Generation stopped by user]"}
                     break
-                yield {'type': 'reply', 'token': text}
+                yield {'type': 'reply', 'token': str(text)}
 
     except Exception as e:
         yield {'type': 'error', 'token': f"[STREAM ERROR (Anthropic): {str(e)}]"}
@@ -1358,7 +1391,7 @@ def stream_openai_compatible(model_instance, model_id_str, user_input, conversat
                 yield {'type': 'reply', 'token': "\n[Generation stopped by user]"}
                 break
             if chunk.choices[0].delta.content:
-                yield {'type': 'reply', 'token': chunk.choices[0].delta.content}
+                yield {'type': 'reply', 'token': str(chunk.choices[0].delta.content)}
 
     except Exception as e:
         yield {'type': 'error', 'token': f"[STREAM ERROR ({api_key_env}): {str(e)}]"}

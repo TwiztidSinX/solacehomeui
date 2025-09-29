@@ -8,8 +8,6 @@ interface MessageInputProps {
   setImage: (image: string | null) => void;
   isAgentMode: boolean;
   onAgentModeChange: (isAgentMode: boolean) => void;
-  isOrchestratorMode: boolean; // New prop
-  onOrchestratorModeChange: (isOrchestratorMode: boolean) => void; // New prop
   message: string;
   onMessageChange: (message: string) => void;
 }
@@ -22,8 +20,6 @@ const MessageInput: React.FC<MessageInputProps> = ({
   setImage, 
   isAgentMode, 
   onAgentModeChange,
-  isOrchestratorMode, // New prop
-  onOrchestratorModeChange, // New prop
   message,
   onMessageChange
 }) => {
@@ -101,12 +97,6 @@ const MessageInput: React.FC<MessageInputProps> = ({
               className={`mr-4 px-4 py-2 rounded-lg text-white font-semibold transition-colors duration-200 ${isAgentMode ? 'bg-blue-500 hover:bg-blue-600' : 'bg-gray-700 hover:bg-gray-600'}`}
             >
               Agent Mode
-            </button>
-            <button // New button
-              onClick={() => onOrchestratorModeChange(!isOrchestratorMode)}
-              className={`mr-4 px-4 py-2 rounded-lg text-white font-semibold transition-colors duration-200 ${isOrchestratorMode ? 'bg-purple-500 hover:bg-purple-600' : 'bg-gray-700 hover:bg-gray-600'}`}
-            >
-              Orchestrator Chat
             </button>
             {isStreaming ? (
               <button id="stop-button" className="bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-4 rounded-lg" onClick={onStop}>
