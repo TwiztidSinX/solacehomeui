@@ -1,5 +1,5 @@
 {
     "n8nUrl": "",
-    "searXngUrl": "https://searx.stream",
+    "searXngUrl": "http://localhost:8088",
     "serpApiApiKey": ""
 }

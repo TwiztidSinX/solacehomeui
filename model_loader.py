@@ -1,6 +1,6 @@
 import json, os, time, gc, re
 from llama_cpp import Llama, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16
-from llama_cpp.llama_chat_format import get_chat_completion_handler
+from llama_cpp.llama_chat_format import Jinja2ChatFormatter, get_chat_completion_handler
 import ollama
 ollama._client = ollama.Client(host='http://127.0.0.1:11434')
 import google.generativeai as genai
@@ -14,7 +14,7 @@ from groq import Groq  # For Meta Llama models
 import httpx  # For general API calls
 from openai import OpenAI as OpenAIClient
 from upgraded_memory_manager import get_context_for_model
-
+import requests
 KNOWN_OUTER_WRAPPERS = [
     (r'^\[INST\](.*)\[/INST\]$', re.DOTALL),                # [INST] ... [/INST]
     (r'^\s*<\|im_start\|>(.*)<\|im_end\|>\s*$', re.DOTALL), # <|im_start|> ... <|im_end|>
@@ -38,6 +38,194 @@ def strip_outer_template_wrappers(text: str) -> str:
 
 # --- Project Root ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# --- Custom Chat Templates ---
+LFM2_TEMPLATE = """<|startoftext|>{% for message in messages %}{% if message['role'] == 'system' %}<|im_start|>system
+{{ message['content'] }}<|im_end|>
+{% elif message['role'] == 'user' %}<|im_start|>user
+{{ message['content'] }}<|im_end|>
+{% elif message['role'] == 'assistant' %}<|im_start|>assistant
+{{ message['content'] }}<|im_end|>
+{% endif %}{% endfor %}<|im_start|>assistant
+"""
+
+APRIEL_TEMPLATE = """{%- set available_tools_string, thought_instructions, add_tool_id, tool_output_format = '', '', true, "default" -%}
+
+{%- if tools is not none and tools|length > 0 -%}
+    {%- set available_tools_string -%}
+You are provided with function signatures within <available_tools></available_tools> XML tags. You may call one or more functions to assist with the user query. Don't make assumptions about the arguments. You should infer the argument values from previous user responses and the system message. Here are the available tools:
+<available_tools>
+{% for tool in tools %}
+{{ tool|string }}
+{% endfor %}
+</available_tools>
+{%- endset -%}
+{%- endif -%}
+{%- if tool_output_format is none or tool_output_format == "default" -%}
+{%- set tool_output_instructions -%}
+Return all function calls as a list of json objects within <tool_call></tool_call> XML tags. Each json object should contain a function name and arguments as follows:
+<tool_calls>[{"name": <function-name-1>, "arguments": <args-dict-1>}, {"name": <function-name-2>, "arguments": <args-dict-2>},...]</tool_calls>
+{%- endset -%}
+{%- elif tool_output_format == "yaml" -%}
+{%- set tool_output_instructions -%}
+Return all function calls as a list of yaml objects within <tool_call></tool_call> XML tags. Each yaml object should contain a function name and arguments as follows:
+<tool_calls>
+- name: <function-name-1>
+  arguments: <args-dict-1>
+- name: <function-name-2>
+  arguments: <args-dict-2>
+...
+</tool_calls>
+{%- endset -%}
+{%- endif -%}
+{%- if add_thoughts -%}
+{%- set thought_instructions -%}
+Prior to generating the function calls, you should generate the reasoning for why you're calling the function. Please generate these reasoning thoughts between <thinking> and </thinking> XML tags.
+{%- endset -%}
+{%- endif -%}
+{{- bos_token -}}
+{%- set reasoning_prompt='You are a thoughtful and systematic AI assistant built by ServiceNow Language Models (SLAM) lab. Before providing an answer, analyze the problem carefully and present your reasoning step by step. After explaining your thought process, provide the final solution in the following format: [BEGIN FINAL RESPONSE] ... [END FINAL RESPONSE].' -%}
+{%- if messages[0]['role'] != 'system' and tools is not none and tools|length > 0 -%}
+    {{- '<|system|>\n' + reasoning_prompt + available_tools_string + "\n" + tool_output_instructions + '\n<|end|>\n' -}}
+{%- endif -%}
+{%- if messages|selectattr('role', 'equalto', 'system')|list|length == 0 -%}
+{{- '<|system|>\n' + reasoning_prompt + '\n<|end|>\n' -}}
+{%- endif -%}
+{%- for message in messages -%}
+    {%- if message['role'] == 'user' -%}
+        {{- '<|user|>\n' }}
+        {%- if message['content'] is not string %}
+            {%- for chunk in message['content'] %}
+                {%- if chunk['type'] == 'text' %}
+                    {{- chunk['text'] }}
+                {%- elif chunk['type'] == 'image' or chunk['type'] == 'image_url'%}
+                    {{- '[IMG]' }}
+                {%- else %}
+                    {{- raise_exception('Unrecognized content type!') }}
+                {%- endif %}
+            {%- endfor %}
+        {%- else %}
+            {{- message['content'] }}
+        {%- endif %}
+        {{- '\n<|end|>\n' }}
+    {%- elif message['role'] == 'content' -%}
+        {%- if message['content'] is not string %}
+            {{- '<|content|>\n' + message['content'][0]['text'] + '\n<|end|>\n' -}}
+        {%- else %}
+            {{- '<|content|>\n' + message['content'] + '\n<|end|>\n' -}}
+        {%- endif -%}
+    {%- elif message['role'] == 'system' -%}
+        {%- if message['content'] is not none and message['content']|length > 0 %}
+            {%- if message['content'] is string %}
+                {%- set system_message = message['content'] %}
+            {%- else %}
+                {%- set system_message = message['content'][0]['text'] %}
+            {%- endif -%}
+        {%- else %}
+            {%- set system_message = '' %}\n        {%- endif -%}\n        {%- if tools is not none and tools|length > 0 -%}\n            {{- '<|system|>\n' + reasoning_prompt + system_message + '\n' + available_tools_string + '\n<|end|>\n' -}}\n        {%- else -%}\n            {{- '<|system|>\n' + reasoning_prompt + system_message + '\n<|end|>\n' -}}\n        {%- endif -%}\n    {%- elif message['role'] == 'assistant' -%}\n        {%- if loop.last -%}\n            {%- set add_tool_id = false -%}\n        {%- endif -%}\n        {{- '<|assistant|>\n' -}}\n        {%- if message['content'] is not none and message['content']|length > 0 -%}\n            {%- if message['content'] is not string and message['content'][0]['text'] is not none %}\n                {{- message['content'][0]['text'] }}\n            {%- else %}\n                {{- message['content'] -}}\n            {%- endif -%}\n        {%- elif message['chosen'] is not none and message['chosen']|length > 0 -%}\n            {{- message['chosen'][0] -}}\n        {%- endif -%}\n        {%- if add_thoughts and 'thought' in message and message['thought'] is not none -%}\n            {{- '<thinking>' + message['thought'] + '</thinking>' -}}\n        {%- endif -%}\n        {%- if message['tool_calls'] is not none and message['tool_calls']|length > 0 -%}\n            {{- '\n<tool_calls>[\' -}}\n            {%- for tool_call in message["tool_calls"] -%}\n                {{- '{"name": "' + tool_call['function']['name'] + '", "arguments": ' + tool_call['function']['arguments']|string -}}\n                {%- if add_tool_id == true -%}\n                    {{- ', "id": "' + tool_call['id'] + '"' -}}\n                {%- endif -%}\n                {{- '}' -}}\n                {%- if not loop.last -%}{{- ', ' -}}{%- endif -%}\n            {%- endfor -%}\n            {{- ']</tool_calls>' -}}\n        {%- endif -%}\n        {{- '\n<|end|>\n' + eos_token -}}\n    {%- elif message['role'] == 'tool' -%}\n        {%- if message['content'] is string %}\n            {%- set tool_message = message['content'] %}\n        {%- else %}\n            {%- set tool_message = message['content'][0]['text'] %}\n        {%- endif -%}\n        {{- '<|tool_result|>\n' + tool_message|string + '\n<|end|>\n' -}}\n    {%- endif -%}\n    {%- if loop.last and add_generation_prompt and message['role'] != 'assistant' -%}\n        {{- '<|assistant|>\n' -}}\n    {%- endif -%}\n{%- endfor -%}\n"""
+
+JAMBA_TEMPLATE = """
+{%- set thinking_prefix = thinking_prefix or 'Begin by thinking about the reasoning process in the mind within <think> </think> tags and then proceed to give your response.\n'
+
+-%}
+{%- if bos_token is defined and bos_token is not none %}{{- bos_token -}}{%- endif %}
+{%- if tools %}
+    {{- '<|im_start|>system\n' }}
+    {%- if messages|length > 0 and messages[0].role == 'system' %}
+        {{- messages[0].content + '\n\n' }}
+    {%- endif %}
+    {{- "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" }}
+    {%- for tool in tools %}
+        {{- "\n" }}
+        {{- tool | tojson }}
+    {%- endfor %}
+    {{- "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{"name": <function-name>, "arguments": <args-json-object>}\n</tool_call><|im_end|>\n" }}
+{%- else %}
+    {%- if messages|length > 0 and messages[0].role == 'system' %}
+        {{- '<|im_start|>system\n' + messages[0].content + '<|im_end|>\n' }}
+    {%- endif %}
+{%- endif %}
+{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
+{%- for message in messages[::-1] %}
+    {%- set index = (messages|length - 1) - loop.index0 %}
+    {%- if ns.multi_step_tool and message.role == "user" and not(message.content.startswith('<tool_response>') and message.content.endswith('</tool_response>')) %}
+        {%- set ns.multi_step_tool = false %}
+        {%- set ns.last_query_index = index %}
+    {%- endif %}
+{%- endfor %}
+{%- for message in messages %}
+    {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}
+        {%- set prefix = '' %}
+        {%- if message.role == 'user' and '<think>' not in message.content %}
+            {%- if loop.last %}
+                {%- set prefix = thinking_prefix %}
+            {%- endif %}
+            {%- if not loop.last %}
+                {%- if loop.nextitem.role == 'assistant' and loop.nextitem.content.startswith('<think>') or loop.nextitem.reasoning_content is defined and loop.nextitem.reasoning_content is not none %}
+                    {%- set prefix = thinking_prefix %}
+                {%- endif %}
+            {%- endif %}
+        {%- endif %}
+        {%- if message.role == 'user' and not loop.last and loop.nextitem.role == 'assistant' and loop.nextitem.content.startswith('<think>') and '<think>' not in message.content %}
+            {%- set prefix = thinking_prefix %}
+        {%- endif %}
+        {{- '<|im_start|>' + message.role + '\n' + prefix + message.content + '<|im_end|>' + '\n' }}
+    {%- elif message.role == "assistant" %}
+        {%- set content = message.content %}
+        {%- set reasoning_content = '' %}
+        {%- if message.reasoning_content is defined and message.reasoning_content is not none %}
+            {%- set reasoning_content = message.reasoning_content %}
+        {%- else %}
+            {%- if '</think>' in message.content %}
+                {%- set content = message.content.split('</think>')[-1].lstrip('\n') %}
+                {%- set reasoning_content = message.content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') %}
+            {%- endif %}
+        {%- endif %}
+        {%- if loop.index0 > ns.last_query_index %}
+            {%- if reasoning_content %}
+                {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}
+            {%- else %}
+                {{- '<|im_start|>' + message.role + '\n' + content }}
+            {%- endif %}
+        {%- else %}
+            {{- '<|im_start|>' + message.role + '\n' + content }}
+        {%- endif %}
+        {%- if message.tool_calls %}
+            {%- for tool_call in message.tool_calls %}
+                {%- if (loop.first and content) or (not loop.first) %}
+                    {{- '\n' }}
+                {%- endif %}
+                {%- if tool_call.function %}
+                    {%- set tool_call = tool_call.function %}
+                {%- endif %}
+                {{- '<tool_call>\n{\"name\": "' }}
+                {{- tool_call.name }}
+                {{- '", \"arguments\": ' }}
+                {%- if tool_call.arguments is string %}
+                    {{- tool_call.arguments }}
+                {%- else %}
+                    {{- tool_call.arguments | tojson }}
+                {%- endif %}
+                {{- '}\n</tool_call>' }}
+            {%- endfor %}
+        {%- endif %}
+        {{- '<|im_end|>\n' }}
+    {%- elif message.role == "tool" %}
+        {%- if loop.first or (messages[loop.index0 - 1].role != "tool") %}
+            {{- '<|im_start|>user' }}
+        {%- endif %}
+        {{- '\n<tool_response>\n' }}
+        {{- message.content }}
+        {{- '\n</tool_response>' }}
+        {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}
+            {{- '<|im_end|>\n' }}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+    {{- '<think>\n' }}
+{%- endif -%}"""
 
 models = {}
 model_states = {}
@@ -104,16 +292,27 @@ def load_model(
             if backend == "llama.cpp":
                 model_states[model_id]['uses_chat_handler'] = True
                 model_basename = os.path.basename(model_id).lower()
-                chat_format_name = "llama-2"  # Default
-                if "qwen" in model_basename:
-                    chat_format_name = "chatml"
-                elif "gemma" in model_basename:
-                    chat_format_name = "gemma"
-                elif "llama-3" in model_basename or "llama3" in model_basename:
-                    chat_format_name = "llama-3"
-
-                print(f"🗨️ Using chat format: {chat_format_name}")
-                chat_handler = get_chat_completion_handler(chat_format_name)
+                chat_handler = None
+                
+                if "lfm2" in model_basename:
+                    print("🗨️ Using custom chat format: LFM2")
+                    chat_handler = Jinja2ChatFormatter(template=LFM2_TEMPLATE, bos_token="<|startoftext|>", eos_token="<|im_end|>")
+                elif "apriel" in model_basename:
+                    print("🗨️ Using custom chat format: Apriel")
+                    chat_handler = Jinja2ChatFormatter(template=APRIEL_TEMPLATE, bos_token="<|im_start|>", eos_token="<|im_end|>")
+                elif "jamba" in model_basename:
+                    print("🗨️ Using custom chat format: Jamba")
+                    chat_handler = Jinja2ChatFormatter(template=JAMBA_TEMPLATE, bos_token="<|startoftext|>", eos_token="<|endoftext|>")
+                else:
+                    chat_format_name = "llama-2"  # Default
+                    if "qwen" in model_basename:
+                        chat_format_name = "chatml"
+                    elif "gemma" in model_basename:
+                        chat_format_name = "gemma"
+                    elif "llama-3" in model_basename or "llama3" in model_basename:
+                        chat_format_name = "llama-3"
+                    print(f"🗨️ Using built-in chat format: {chat_format_name}")
+                    chat_handler = get_chat_completion_handler(chat_format_name)
 
                 type_k = GGML_TYPE_F16 if kv_cache_quant == 'fp16' else GGML_TYPE_Q4_0 if kv_cache_quant == 'int4' else GGML_TYPE_Q8_0
                 type_v = GGML_TYPE_F16 if kv_cache_quant == 'fp16' else GGML_TYPE_Q4_0 if kv_cache_quant == 'int4' else GGML_TYPE_Q8_0
@@ -909,7 +1108,56 @@ def stream_llamacpp(model_instance, model_id_str, user_input, conversation_histo
             request_params["tool_choice"] = "auto"
 
         stream = model_instance.create_chat_completion(**request_params)
-        
+        # --- FINAL ROBUST GUARD FIX: Handle malformed response object ---
+        # If 'stream' is not a generator, we process it manually.
+        # Check if it lacks the generator's __iter__ method OR if it has the full object's 'choices' attribute.
+        if not hasattr(stream, '__iter__') or hasattr(stream, 'choices'):
+            
+            full_response = stream
+            
+            # CRITICAL: We must guard the access to 'choices' because the object 
+            # might be a malformed ChatFormatterResponse with no valid structure.
+            try:
+                # 1. Prepend <think> if required
+                if force_think_prepend:
+                    yield {'type': 'reply', 'token': '<think>'}
+
+                # 2. Extract and yield content
+                # This is the line that caused the crash, now safely inside try block.
+                content = full_response.choices[0].message.get("content", "") 
+                if content:
+                    if "apriel" in model_id_str.lower():
+                        content = re.sub(r'\s*\[/?(BEGIN|END) FINAL RESPONSE\]\s*', '', content, flags=re.IGNORECASE).strip()
+                    yield {'type': 'reply', 'token': content}
+                
+                # 3. Extract and yield tool calls
+                tool_calls = full_response.choices[0].message.get("tool_calls", [])
+                for tool_call in tool_calls:
+                    try:
+                        arguments = json.loads(tool_call['function']['arguments'])
+                    except json.JSONDecodeError:
+                        arguments = {"error": "Failed to decode arguments", "raw": tool_call['function']['arguments']}
+                    
+                    yield {
+                        'type': 'tool_call', 
+                        'tool_call': {
+                            'id': tool_call.get('id', 'tool_call_id'), 
+                            'name': tool_call['function']['name'],
+                            'arguments': arguments
+                        }
+                    }
+            
+            except (AttributeError, IndexError) as e:
+                # Catch the 'AttributeError: ... has no attribute choices' or IndexError
+                # if choices is empty. This means the model template process failed.
+                if debug_mode:
+                    print(f"DEBUG: Caught expected non-streaming object error: {e}")
+                # Yield a specific error token so the UI doesn't hang.
+                yield {'type': 'error', 'token': "[Chat Format Error: Apriel template failed to generate a valid response structure.]"}
+
+            # CRITICAL: Exit the function if it was not a generator!
+            return 
+        # --- END FINAL ROBUST GUARD FIX ---
         if force_think_prepend:
             yield {'type': 'reply', 'token': '<think>'}
 
@@ -923,7 +1171,10 @@ def stream_llamacpp(model_instance, model_id_str, user_input, conversation_histo
             if not delta: continue
 
             if delta.get("content"):
-                yield {'type': 'reply', 'token': str(delta["content"])}
+                token = str(delta["content"])
+                if "apriel" in model_id_str.lower():
+                    token = re.sub(r'\[/?(BEGIN|END) FINAL RESPONSE\]', '', token, flags=re.IGNORECASE)
+                yield {'type': 'reply', 'token': token}
 
             if delta.get("tool_calls"):
                 for tool_call_chunk in delta["tool_calls"]:
@@ -979,6 +1230,8 @@ def stream_ollama(model_instance, model_id_str, user_input, conversation_history
             }
             if thinking_level in thinking_instructions:
                 system_prompt += f"\n\n--- Reasoning Instructions ---\n{thinking_instructions[thinking_level]}"
+        # Encourage consistent think-tag usage across providers
+        system_prompt += "\n\nWhen you need to reason, wrap your internal reasoning between <think> and </think> tags, then provide the final answer after the closing tag."
         # Per user request, we don't force-prepend <think> for Ollama.
         # --- End Hybrid Logic ---
 
@@ -995,6 +1248,9 @@ def stream_ollama(model_instance, model_id_str, user_input, conversation_history
 
         messages = manage_context_window(messages, 8192 - 1024)
 
+        # Force a think block for GPT-OSS models via Ollama so reasoning is visible
+        force_think_prepend = ('gpt-oss' in str(model_id_str).lower()) or ('gpt_oss' in str(model_id_str).lower())
+
         if debug_mode:
             print("\n--- OLLAMA PROMPT DEBUG ---")
             print(json.dumps(messages, indent=2))
@@ -1006,6 +1262,11 @@ def stream_ollama(model_instance, model_id_str, user_input, conversation_history
             stream=True
         )
 
+        opened_think = False
+        if force_think_prepend:
+            opened_think = True
+            yield {'type': 'reply', 'token': '<think>'}
+
         for chunk in stream:
             if should_stop():
                 yield {'type': 'reply', 'token': "\n[Generation stopped by user]"}
@@ -1014,6 +1275,10 @@ def stream_ollama(model_instance, model_id_str, user_input, conversation_history
             token = str(chunk['message']['content'])
             if token:
                 yield {'type': 'reply', 'token': token}
+
+        if opened_think:
+            # Ensure the think block is closed if the model didn't
+            yield {'type': 'reply', 'token': '</think>'}
 
     except Exception as e:
         import traceback
@@ -1037,9 +1302,9 @@ def stream_safetensors(model_instance, model_id_str, user_input, conversation_hi
         import json
 
         if len(model_instance) == 4:
-            model, tokenizer, _, processor = model_instance
+            model, tokenizer, _, processor = model_instance  # streamer is recreated each time
         elif len(model_instance) == 3:
-            model, tokenizer, _ = model_instance
+            model, tokenizer, _ = model_instance  # streamer is recreated each time
             processor = None
         else:
             raise ValueError("Invalid model_instance tuple size")
@@ -1063,6 +1328,8 @@ def stream_safetensors(model_instance, model_id_str, user_input, conversation_hi
             }
             if thinking_level in thinking_instructions:
                 system_prompt += f"\n\n--- Reasoning Instructions ---\n{thinking_instructions[thinking_level]}"
+        # Encourage consistent think-tag usage
+        system_prompt += "\n\nWhen you need to reason, wrap your internal reasoning between <think> and </think> tags, then provide the final answer after the closing tag."
         # --- End Hybrid Logic ---
 
         now = datetime.now()
@@ -1105,23 +1372,94 @@ def stream_safetensors(model_instance, model_id_str, user_input, conversation_hi
             prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
-        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-        generation_kwargs = {**inputs, "streamer": streamer, "max_new_tokens": 4096, "temperature": 0.7, "do_sample": True, "pad_token_id": tokenizer.eos_token_id}
-        thread = Thread(target=model.generate, kwargs=generation_kwargs)
+        # Create fresh streamer for this generation (cannot be reused)
+        # Increased timeout to 60s for first token (4B models can be slow with long prompts)
+        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True, timeout=60)
+
+        print(f"🔧 DEBUG: Setting up SafeTensors generation for {model_id_str}")
+        print(f"🔧 DEBUG: Input shape: {inputs['input_ids'].shape}")
+
+        # Build generation kwargs properly without unpacking inputs directly
+        generation_kwargs = {
+            "input_ids": inputs['input_ids'],
+            "attention_mask": inputs.get('attention_mask'),
+            "streamer": streamer,
+            "max_new_tokens": 4096,
+            "temperature": 0.7,
+            "do_sample": True,
+            "pad_token_id": tokenizer.eos_token_id if tokenizer.eos_token_id else tokenizer.pad_token_id,
+            "eos_token_id": tokenizer.eos_token_id
+        }
+
+        # Remove None values
+        generation_kwargs = {k: v for k, v in generation_kwargs.items() if v is not None}
+        print(f"🔧 DEBUG: Generation kwargs keys: {list(generation_kwargs.keys())}")
+
+        # Start generation in background thread
+        print(f"🔧 DEBUG: Starting generation thread...")
+        thread = Thread(target=model.generate, kwargs=generation_kwargs, daemon=True)
         thread.start()
+        print(f"🔧 DEBUG: Generation thread started, waiting for tokens...")
 
         if force_think_prepend:
             yield {'type': 'reply', 'token': '<think>'}
 
-        for token in streamer:
-            if should_stop():
-                yield {'type': 'reply', 'token': "\n[Generation stopped by user]"}
-                break
-            
-            if token:
-                yield {'type': 'reply', 'token': str(token)}
-        
-        thread.join()
+        token_count = 0
+        try:
+            # Non-blocking polling of streamer queue (safetensors-specific)
+            from queue import Empty
+            while True:
+                if should_stop():
+                    print(f"🔧 DEBUG: Stop signal received after {token_count} tokens")
+                    yield {'type': 'reply', 'token': "\n[Generation stopped by user]"}
+                    break
+
+                try:
+                    token = streamer.text_queue.get(timeout=0.05)
+                except Empty:
+                    if not thread.is_alive():
+                        break
+                    continue
+
+                if token is None:
+                    break
+
+                token_count += 1
+                if token_count == 1:
+                    print(f"🔧 DEBUG: First token received!")
+                if token:
+                    yield {'type': 'reply', 'token': str(token)}
+
+            # Legacy blocking iteration (kept for reference)
+            return
+            # Stream tokens as they're generated
+            for token in streamer:
+                token_count += 1
+                if token_count == 1:
+                    print(f"🔧 DEBUG: First token received!")
+
+                if should_stop():
+                    print(f"🔧 DEBUG: Stop signal received after {token_count} tokens")
+                    yield {'type': 'reply', 'token': "\n[Generation stopped by user]"}
+                    break
+
+                if token:
+                    yield {'type': 'reply', 'token': str(token)}
+        except StopIteration:
+            print(f"🔧 DEBUG: Streamer stopped normally after {token_count} tokens")
+        except Exception as stream_error:
+            print(f"⚠️ Streaming error after {token_count} tokens: {stream_error}")
+            import traceback
+            traceback.print_exc()
+            yield {'type': 'error', 'token': f"[Streaming interrupted: {str(stream_error)}]"}
+
+        print(f"🔧 DEBUG: Streaming complete. Total tokens: {token_count}")
+
+        # Wait for generation to complete (with timeout)
+        thread.join(timeout=300)  # 5 minute max
+        if thread.is_alive():
+            print("⚠️ Generation thread did not complete in time")
+            yield {'type': 'error', 'token': "\n[Generation timeout - thread still running]"}
 
     except Exception as e:
         import traceback
@@ -1193,25 +1531,42 @@ def stream_openai(model_instance, model_id_str, user_input, conversation_history
         now = datetime.now()
         time_message = f"This is a system message. Do not refer to this message unless asked. This message is to give you a live update of the Current Date and Time. The User's Timezone is {timezone}. The Current time is {now.strftime('%H:%M')} and The Current Date is {now.strftime('%m/%d/%Y')}."
 
-        # The conversation_history already includes the latest user message.
-        # If there's image data, we need to find the last user message and append the image to it.
-        if image_data:
-            for msg in reversed(conversation_history):
-                if msg['role'] == 'user':
-                    if isinstance(msg['content'], str):
+        # Normalize history from frontend shape to OpenAI format
+        normalized_history = []
+        try:
+            for entry in (conversation_history or []):
+                if isinstance(entry, dict) and 'role' in entry and 'content' in entry:
+                    role = entry.get('role')
+                    content = entry.get('content', '')
+                else:
+                    role = 'user' if (str(entry.get('type', '')).lower() == 'user') else 'assistant'
+                    content = entry.get('message', '')
+                if role and (content or entry.get('imageB64')):
+                    normalized_history.append({'role': role, 'content': content})
+        except Exception:
+            normalized_history = []
+
+        # If there's image data, append to the last user message
+        if image_data and normalized_history:
+            for msg in reversed(normalized_history):
+                if msg.get('role') == 'user':
+                    if isinstance(msg.get('content'), str):
                         msg['content'] = [
                             {"type": "text", "text": msg['content']},
                             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}}
                         ]
                     break
-        
+        # Ensure the latest user input is present at the end
+        if user_input:
+            if not normalized_history or normalized_history[-1].get('content') != user_input or normalized_history[-1].get('role') != 'user':
+                normalized_history.append({"role": "user", "content": user_input})
+
         messages = [
             {"role": "system", "content": time_message},
             {"role": "system", "content": system_prompt},
             {"role": "system", "content": f"Relevant Memories:\n{memory_context}"},
-            *manage_context_window(conversation_history, 128000 - 4096), # GPT-4o has 128k context
+            *manage_context_window(normalized_history, 128000 - 4096), # GPT-4o has 128k context
         ]
-
 
         client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         stream = client.chat.completions.create(
@@ -1224,6 +1579,7 @@ def stream_openai(model_instance, model_id_str, user_input, conversation_history
             if should_stop():
                 yield {'type': 'reply', 'token': "\n[Generation stopped by user]"}
                 break
+        
             delta = chunk.choices[0].delta.content
             if delta:
                 yield {'type': 'reply', 'token': str(delta)}
@@ -1287,41 +1643,14 @@ def stream_qwen(model_instance, model_id_str, user_input, conversation_history, 
         image_data=image_data
     )
 
-def stream_deepseek(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None):
-    try:
-        memory_context = get_context_for_model(user_input, model_id=model_id_str)
-        system_prompt = model_states.get(model_id_str, {}).get("system_prompt", "You are a helpful AI assistant.")
-
-        messages = [
-            {"role": "system", "content": f"{system_prompt}\nRelevant Memories:\n{memory_context}"},
-            *conversation_history,
-        ]
-
-        api_key = os.getenv("DEEPSEEK_API_KEY")
-        if not api_key:
-            yield f"[ERROR: DEEPSEEK_API_KEY not set]"
-            return
-
-        client = OpenAIClient(
-            api_key=api_key, 
-            base_url="https://api.deepseek.com/v1"
-        )
-
-        stream = client.chat.completions.create(
-            model=model_instance,
-            messages=messages,
-            stream=True
-        )
-
-        for chunk in stream:
-            if should_stop():
-                yield "\n[Generation stopped by user]"
-                break
-            if chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
-
-    except Exception as e:
-        yield f"[STREAM ERROR (DeepSeek): {str(e)} ]"
+def stream_deepseek(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None, timezone='UTC'):
+    return stream_openai_compatible(
+        model_instance, model_id_str, user_input, conversation_history, should_stop,
+        base_url="https://api.deepseek.com/v1",
+        api_key_env="DEEPSEEK_API_KEY",
+        image_data=image_data,
+        timezone=timezone
+    )
 
 def stream_perplexity(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None):
     return stream_openai_compatible(
@@ -1350,22 +1679,42 @@ def stream_openai_compatible(model_instance, model_id_str, user_input, conversat
         now = datetime.now()
         time_message = f"This is a system message. Do not refer to this message unless asked. This message is to give you a live update of the Current Date and Time. The User's Timezone is {timezone}. The Current time is {now.strftime('%H:%M')} and The Current Date is {now.strftime('%m/%d/%Y')}."
 
-        # The conversation_history already includes the latest user message.
-        # If there's image data, we need to find the last user message and append the image to it.
-        if image_data:
-            for msg in reversed(conversation_history):
-                if msg['role'] == 'user':
-                    if isinstance(msg['content'], str):
+        # Normalize history from frontend shape (sender/message/type) to OpenAI format (role/content)
+        normalized_history = []
+        try:
+            for entry in (conversation_history or []):
+                if isinstance(entry, dict) and 'role' in entry and 'content' in entry:
+                    role = entry.get('role')
+                    content = entry.get('content', '')
+                else:
+                    role = 'user' if (str(entry.get('type', '')).lower() == 'user') else 'assistant'
+                    content = entry.get('message', '')
+                if role and (content or entry.get('imageB64')):
+                    normalized_history.append({'role': role, 'content': content})
+        except Exception:
+            normalized_history = []
+
+        # If there's an image attached to this turn, append it to the last user message
+        if image_data and normalized_history:
+            for msg in reversed(normalized_history):
+                if msg.get('role') == 'user':
+                    if isinstance(msg.get('content'), str):
                         msg['content'] = [
                             {"type": "text", "text": msg['content']},
                             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}}
                         ]
                     break
 
+        # Ensure the latest user input is present at the end
+        if user_input:
+            if not normalized_history or normalized_history[-1].get('content') != user_input or normalized_history[-1].get('role') != 'user':
+                normalized_history.append({"role": "user", "content": user_input})
+
+        truncated_history = manage_context_window(normalized_history, 8192 - 2048)
         messages = [
             {"role": "system", "content": time_message},
             {"role": "system", "content": f"{system_prompt}\nRelevant Memories:\n{memory_context}"},
-            *manage_context_window(conversation_history, 8192 - 2048), # Assume 8k context for generic compatible APIs
+            *truncated_history,
         ]
 
 
@@ -1477,7 +1826,40 @@ def _get_openai_models_from_api():
         print(f"🔴 Could not fetch OpenAI models: {e}")
         # Fallback safe list
         return ["gpt-4o-mini", "gpt-4o", "gpt-4.1", "gpt-4.1-mini"]
-   
+
+def _get_deepseek_models_from_api():
+    """
+    Fetch available DeepSeek models using the OpenAI-compatible API format.
+    Returns a sorted list of model IDs, or a fallback list if the API fails.
+    """
+    try:
+        api_key = os.getenv("DEEPSEEK_API_KEY")
+        if not api_key:
+            print("⚠️ DEEPSEEK_API_KEY not set.")
+            return ["deepseek-chat", "deepseek-coder", "deepseek-reasoner"]
+
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com/v1")
+            resp = client.models.list()
+            models = [m.id for m in resp.data] if hasattr(resp, 'data') else []
+        except Exception:
+            import requests
+            headers = {"Authorization": f"Bearer {api_key}"}
+            r = requests.get("https://api.deepseek.com/v1/models", headers=headers, timeout=10)
+            if r.status_code == 200 and "data" in r.json():
+                models = [m["id"] for m in r.json()["data"]]
+            else:
+                raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+
+        models = sorted(list(set(models)))
+        return models or ["deepseek-chat", "deepseek-coder", "deepseek-reasoner"]
+
+    except Exception as e:
+        print(f"🔴 Could not fetch DeepSeek models: {e}")
+        # Fallback safe list (based on known public models)
+        return ["deepseek-chat", "deepseek-coder", "deepseek-reasoner"]
+
 def get_available_models(backend="llama.cpp", provider=None):
     print(f"🔍 Getting available models for backend: {backend}, provider: {provider}")
     
@@ -1525,6 +1907,14 @@ def get_available_models(backend="llama.cpp", provider=None):
                 print(f"🔴 Could not fetch OpenAI models, returning defaults: {e}")
                 return ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo"]
 
+        elif provider == "deepseek":
+            try:
+                # Use the OpenAI-compatible DeepSeek models endpoint
+                return _get_deepseek_models_from_api()
+            except Exception:
+                # Fallback to known model IDs
+                return ["deepseek-chat", "deepseek-coder", "deepseek-reasoner"]
+        
         elif provider == "anthropic":
             # Anthropic doesn't have a model list endpoint, so we always return known models
             return ["claude-3-5-sonnet-20240620", "claude-3-opus-20240229", 
@@ -1543,6 +1933,156 @@ def get_available_models(backend="llama.cpp", provider=None):
                 return ["llama3-70b-8192", "llama3-8b-8192", "llama3.1-70b-versatile", "llama3.1-8b-instant"]
 
         # ... [Add similar try/except blocks with default fallbacks for other providers] ...
+        
+        elif provider == "xai":
+            # xAI (Grok) - Use OpenAI-compatible endpoint
+            try:
+                api_key = os.getenv("XAI_API_KEY")
+                if not api_key:
+                    raise Exception("XAI_API_KEY not set")
+                
+                # xAI uses OpenAI-compatible API
+                headers = {"Authorization": f"Bearer {api_key}"}
+                response = requests.get("https://api.x.ai/v1/models", headers=headers, timeout=10)
+                response.raise_for_status()
+                
+                models_data = response.json()
+                if "error" in models_data:
+                    raise Exception(models_data["error"].get("message", "Unknown xAI error"))
+                model_ids = [m["id"] for m in models_data.get("data", [])]
+                print(f"📁 Found {len(model_ids)} xAI models")
+                return sorted(model_ids)
+            except Exception as e:
+                print(f"🔴 Could not fetch xAI models, returning defaults: {e}")
+                return ["grok-beta", "grok-vision-beta"]
+
+        elif provider == "qwen":
+            # Qwen/Alibaba Cloud DashScope - International-Friendly Loading
+            try:
+                api_key = os.getenv("QWEN_API_KEY") or os.getenv("DASHSCOPE_API_KEY")
+                if not api_key:
+                    raise Exception("QWEN_API_KEY or DASHSCOPE_API_KEY not set")
+                
+                # Try the OpenAI-compatible model list endpoint first
+                headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json"
+                }
+                
+                response = requests.get(
+                    "https://dashscope.aliyuncs.com/compatible-mode/v1/models",
+                    headers=headers,
+                    timeout=10
+                )
+                
+                # If it works, return the models from the response
+                response.raise_for_status()
+                models_data = response.json()
+                
+                # Handle both possible response formats
+                if "data" in models_data and "models" in models_data["data"]:
+                    # Format 1: {"data": {"models": [...]}}
+                    model_ids = [m["id"] for m in models_data["data"]["models"]]
+                elif "data" in models_data and isinstance(models_data["data"], list):
+                    # Format 2: {"data": [...]}
+                    model_ids = [m["id"] for m in models_data["data"]]
+                elif "models" in models_data:
+                    # Format 3: {"models": [...]}
+                    model_ids = [m["id"] for m in models_data["models"]]
+                else:
+                    # If no models found in response, fall back to known models
+                    print("📁 Qwen API returned unexpected format, using known models")
+                    model_ids = [
+                        "qwen-max",
+                        "qwen-plus", 
+                        "qwen-turbo",
+                        "qwen-long",
+                        "qwq-32b-preview"
+                    ]
+                
+                print(f"📁 Found {len(model_ids)} Qwen models via API")
+                return sorted(model_ids)
+                
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 401:
+                    print("🔴 Qwen API: 401 Unauthorized - International endpoint not enabled yet")
+                    print("📁 Using known Qwen models as fallback")
+                elif e.response.status_code == 404:
+                    print("🔴 Qwen API: 404 - OpenAI-compatible endpoint not available")
+                    print("📁 Using known Qwen models as fallback")
+                else:
+                    print(f"🔴 Qwen API HTTP Error: {e}")
+                
+                # Return known models with a note that API access is limited
+                return [
+                    "qwen-max",
+                    "qwen-plus",
+                    "qwen-turbo", 
+                    "qwen-long",
+                    "qwq-32b-preview"
+                ]
+                
+            except requests.exceptions.RequestException as e:
+                print(f"🔴 Qwen API Network Error (likely 401 Unauthorized): {e}")
+                print("📁 Using known Qwen models as fallback - International access may be limited")
+                return [
+                    "qwen-max",
+                    "qwen-plus",
+                    "qwen-turbo",
+                    "qwen-long", 
+                    "qwq-32b-preview"
+                ]
+                
+            except Exception as e:
+                print(f"🔴 Unexpected error fetching Qwen models: {e}")
+                print("📁 Using known Qwen models as fallback")
+                return [
+                    "qwen-max",
+                    "qwen-plus", 
+                    "qwen-turbo",
+                    "qwen-long",
+                    "qwq-32b-preview"
+                ]
+
+        elif provider == "perplexity":
+            # Perplexity - Static list (they don't have a models endpoint)
+            return [
+                "llama-3.1-sonar-small-128k-online",
+                "llama-3.1-sonar-large-128k-online",
+                "llama-3.1-sonar-huge-128k-online",
+                "llama-3.1-sonar-small-128k-chat",
+                "llama-3.1-sonar-large-128k-chat",
+                "llama-3.1-8b-instruct",
+                "llama-3.1-70b-instruct"
+            ]
+
+        elif provider == "openrouter":
+            # OpenRouter - They have a models endpoint
+            try:
+                api_key = os.getenv("OPENROUTER_API_KEY")
+                if not api_key:
+                    raise Exception("OPENROUTER_API_KEY not set")
+                
+                headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "HTTP-Referer": "https://localhost",
+                    "X-Title": "SolaceHomeUI"
+                }
+                response = requests.get("https://openrouter.ai/api/v1/models", headers=headers, timeout=10)
+                response.raise_for_status()
+                
+                models_data = response.json()
+                model_ids = [m["id"] for m in models_data.get("data", [])]
+                print(f"📁 Found {len(model_ids)} OpenRouter models")
+                return sorted(model_ids)
+            except Exception as e:
+                print(f"🔴 Could not fetch OpenRouter models, returning defaults: {e}")
+                return [
+                    "anthropic/claude-3.5-sonnet",
+                    "openai/gpt-4o",
+                    "google/gemini-pro-1.5",
+                    "meta-llama/llama-3.1-70b-instruct"
+                ]
         
         else:
             return [] # No provider selected or unknown

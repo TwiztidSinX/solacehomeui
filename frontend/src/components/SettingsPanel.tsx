@@ -4,7 +4,11 @@ import ToolSettings from './ToolSettings';
 import TtsPanel from './TtsPanel';
 import SttPanel from './SttPanel';
 import NovaCustomizations from './NovaCustomizations'; // Import the new component
-
+declare global {
+  interface Window {
+    socket: any;
+  }
+}
 // A generic interface for any model configuration
 interface ModelConfig {
   [key: string]: any;
@@ -56,6 +60,7 @@ interface SettingsPanelProps {
   onSaveVoiceSettings: () => void;
   onNovaSettingsChange: (settings: any) => void;
   onSaveNovaSettings: () => void;
+  onReloadOrchestrator: () => void;
   debugMode: boolean;
   onDebugModeChange: (enabled: boolean) => void;
 }
@@ -103,6 +108,7 @@ const SettingsPanel: React.FC<SettingsPanelProps> = (props) => {
     novaSettings,
     onNovaSettingsChange,
     onSaveNovaSettings,
+    onReloadOrchestrator,
     debugMode,
     onDebugModeChange,
   } = props;
@@ -559,10 +565,143 @@ const SettingsPanel: React.FC<SettingsPanelProps> = (props) => {
             </button>
           </div>
         </div>
+        <div className="bg-gray-800/50 p-4 rounded-lg mt-4" style={{ backgroundColor: 'var(--primary-color)' }}>
+          <h3 className="text-xl mb-2 text-center">Orchestrator Settings</h3>
+          <p className="text-sm text-gray-400 text-center mb-4">
+            The orchestrator (Nova) handles tool selection and multi-step reasoning
+          </p>
+          
+          <div className="space-y-4">
+            <div>
+              <label className="block mb-1">Orchestrator Type</label>
+              <select
+                value={novaSettings?.orchestratorType || 'local'}
+                onChange={(e) => onNovaSettingsChange({ 
+                  ...novaSettings, 
+                  orchestratorType: e.target.value 
+                })}
+                className="w-full p-2 rounded inputfield-background"
+              >
+                <option value="local">Local Model (Qwen3 1.7B - Free)</option>
+                <option value="api">API Model (Paid)</option>
+              </select>
+            </div>
 
+            {novaSettings?.orchestratorType === 'api' && (
+              <>
+                <div>
+                  <label className="block mb-1">API Provider</label>
+                  <select
+                    value={novaSettings?.orchestratorApiProvider || 'openai'}
+                    onChange={(e) => onNovaSettingsChange({ 
+                      ...novaSettings, 
+                      orchestratorApiProvider: e.target.value 
+                    })}
+                    className="w-full p-2 rounded inputfield-background"
+                  >
+                    <option value="openai">OpenAI (GPT-4o-mini recommended)</option>
+                    <option value="deepseek">DeepSeek (Cheaper alternative)</option>
+                    <option value="qwen">Qwen (API)</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block mb-1">Model Name</label>
+                  <input
+                    type="text"
+                    value={novaSettings?.orchestratorApiModel || 'gpt-4o-mini'}
+                    onChange={(e) => onNovaSettingsChange({ 
+                      ...novaSettings, 
+                      orchestratorApiModel: e.target.value 
+                    })}
+                    className="w-full p-2 rounded inputfield-background"
+                    placeholder="e.g., gpt-4o-mini, deepseek-chat, qwen-max"
+                  />
+                  <p className="text-xs text-gray-400 mt-1">
+                    Model name from the API provider
+                  </p>
+                </div>
+
+                <div className="bg-blue-900/30 p-3 rounded border border-blue-500/50">
+                  <p className="text-sm text-blue-200">
+                    💡 <strong>API Key Required:</strong> Make sure your API key is set in the main Settings → API Provider section above.
+                  </p>
+                </div>
+
+                <div className="bg-yellow-900/30 p-3 rounded border border-yellow-500/50">
+                  <p className="text-sm text-yellow-200">
+                    ⚠️ <strong>Cost Warning:</strong> API orchestrators use paid API calls for every tool decision.
+                  </p>
+                  <ul className="text-xs text-yellow-100 mt-2 ml-4 list-disc">
+                    <li>OpenAI GPT-4o-mini: ~$0.15 per 1M input tokens</li>
+                    <li>DeepSeek: ~$0.14 per 1M input tokens (cheaper!)</li>
+                    <li>Qwen API: Check dashscope.aliyun.com for pricing</li>
+                  </ul>
+                </div>
+              </>
+            )}
+
+            {novaSettings?.orchestratorType === 'local' && (
+              <div className="bg-green-900/30 p-3 rounded border border-green-500/50">
+                <p className="text-sm text-green-200">
+                  ✅ <strong>Local Mode:</strong> Using Qwen3 1.7B running on your RAM
+                </p>
+                <ul className="text-xs text-green-100 mt-2 ml-4 list-disc">
+                  <li>Free - no API costs</li>
+                  <li>Fast - runs on your computer</li>
+                  <li>Basic reasoning - good for simple tool selection</li>
+                  <li>8GB RAM usage</li>
+                </ul>
+              </div>
+            )}
+
+            <div className="flex gap-2 justify-center mt-4">
+              <button
+                onClick={() => {
+                  // Save settings first
+                  onSaveNovaSettings();
+                  onReloadOrchestrator();
+                  // Then trigger orchestrator reload via socket
+                  // @ts-ignore - socket is available in parent component
+                  if (window.socket) {
+                    window.socket.emit('reload_orchestrator', {});
+                    
+                    // Listen for response
+                    window.socket.once('orchestrator_reloaded', (data: any) => {
+                      if (data.success) {
+                        alert(`✅ Orchestrator reloaded: ${data.config.type} mode`);
+                      } else {
+                        alert(`❌ Failed to reload orchestrator: ${data.error}`);
+                      }
+                    });
+                  }
+                }}
+                className="bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded custom-button"
+              >
+                💾 Save & Reload Orchestrator
+              </button>
+            </div>
+
+            <div className="bg-gray-700/50 p-3 rounded text-sm">
+              <p className="font-semibold mb-2">🤖 What is the Orchestrator?</p>
+              <p className="text-gray-300">
+                Nova (the orchestrator) is a lightweight AI that runs in the background 
+                deciding when and which tools to use. It's separate from your main model.
+              </p>
+              <ul className="text-gray-300 mt-2 ml-4 list-disc text-xs">
+                <li>Main Model = Solace/Claude/GPT (answers your questions)</li>
+                <li>Orchestrator = Nova (decides which tools to call)</li>
+              </ul>
+            </div>
+          </div>
+        </div>
         <div className="bg-gray-800/50 p-4 rounded-lg mt-4 text-center" style={{ backgroundColor: 'var(--primary-color)' }}>
             <h3 className="text-xl mb-2">Credits</h3>
-            <p className="text-gray-300">A special thank you to Gemini-2.5-Pro and GeminiCLI. Without the coding help from this model, I would not have made it even half as far as I did.</p>
+            <div className="text-gray-300 space-y-2">
+              <p>A special thank you to <strong>Gemini 2.5 Pro</strong> and <strong>GeminiCLI</strong> for the initial foundation of SolaceHomeUI. Without the coding help from this model, I would not have made it even half as far as I did.</p>
+              <p>Additional thanks to <strong>Claude Sonnet 4.5</strong> (Anthropic) for the advanced agentic orchestration system, multi-step reasoning capabilities, and ongoing development assistance for SolaceHomeUI v4.</p>
+              <p className="text-sm text-gray-400 mt-3">Built with passion by Tim, powered by AI collaboration.</p>
+            </div>
         </div>
 
       </div>

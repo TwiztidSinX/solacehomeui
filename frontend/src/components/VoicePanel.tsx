@@ -3,13 +3,20 @@ import { VoiceVisualizer } from '../VoiceVisualizer';
 import { Socket } from 'socket.io-client'; // Assuming you pass the socket instance as a prop
 
 interface VoicePanelProps {
+  onVisualizerReady?: (visualizer: VoiceVisualizer) => void;  // add this
   onClose: () => void;
   socket: Socket | null;
   isHandsFreeMode: boolean;
   onHandsFreeModeChange: (isHandsFree: boolean) => void;
 }
 
-const VoicePanel: React.FC<VoicePanelProps> = ({ onClose, socket, isHandsFreeMode, onHandsFreeModeChange }) => {
+const VoicePanel: React.FC<VoicePanelProps> = ({
+  onClose,
+  socket,
+  isHandsFreeMode,
+  onHandsFreeModeChange,
+  onVisualizerReady   // <-- ADD THIS
+}) => {
   const visualizerRef = useRef<VoiceVisualizer | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
@@ -24,23 +31,37 @@ const VoicePanel: React.FC<VoicePanelProps> = ({ onClose, socket, isHandsFreeMod
   const [status, setStatus] = useState('Ready');
 
   useEffect(() => {
-    // Ensure all refs are attached to DOM elements before creating the visualizer
-    if (logoRef.current && dotsRef.current && canvasRef.current && statusLabelRef.current) {
-      visualizerRef.current = new VoiceVisualizer(
+    if (
+      logoRef.current &&
+      dotsRef.current &&
+      canvasRef.current &&
+      statusLabelRef.current
+    ) {
+      const visualizer = new VoiceVisualizer(
         logoRef.current,
         dotsRef.current,
         canvasRef.current,
         statusLabelRef.current
       );
+
+      visualizerRef.current = visualizer;
+
+      // Pass visualizer up to App.tsx
+      if (onVisualizerReady) {
+        onVisualizerReady(visualizer);
+      }
     }
 
     return () => {
       visualizerRef.current?.stop();
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+      if (
+        mediaRecorderRef.current &&
+        mediaRecorderRef.current.state === "recording"
+      ) {
         mediaRecorderRef.current.stop();
       }
     };
-  }, []); // Empty dependency array ensures this runs only once on mount
+  }, []);
 
   const startRecording = async () => {
     if (isRecording) return;

@@ -11,7 +11,10 @@ echo --- Frontend Build Complete ---
 REM Activate virtual environment
 call llama-gpu\Scripts\activate.bat
 
-REM Run Nova
-echo --- Starting Solace Home UI ---
+REM Start MCP Tool Server in background (same window)
+start /b python tool_server.py
+
+REM Start main server in foreground
 python main_server.py
+
 pause

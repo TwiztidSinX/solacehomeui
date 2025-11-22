@@ -111,30 +111,132 @@ class Memory:
             logger.error(f"FAISS index build failed: {str(e)}")
             return None
 
+    def find_similar_memory(self, content, model_id=None, similarity_threshold=0.85):
+        """Finds semantically similar memories using cosine similarity on embeddings."""
+        try:
+            embedding = self.model.encode([content])[0]
+
+            # Get all memories for this model
+            filter_query = {}
+            if model_id:
+                filter_query["metadata.model_id"] = model_id
+
+            memories = list(self.collection.find(filter_query))
+            if not memories:
+                return None
+
+            # Calculate cosine similarity with each memory
+            for mem in memories:
+                if 'embedding' not in mem or not mem['embedding']:
+                    continue
+
+                mem_embedding = np.array(mem['embedding'])
+                similarity = 1 - cosine(embedding, mem_embedding)
+
+                if similarity >= similarity_threshold:
+                    logger.debug(f"Found similar memory (similarity: {similarity:.3f}): {mem['content'][:50]}...")
+                    return mem
+
+            return None
+        except Exception as e:
+            logger.error(f"Similar memory search failed: {str(e)}")
+            return None
+
+    def reinforce_memory(self, memory_id, new_content=None):
+        """Reinforces an existing memory by updating access count and optionally merging content."""
+        try:
+            update_fields = {
+                # Each reinforcement counts as a recall: +1 access, +1 score
+                "$inc": {"access_count": 1, "score": 1.0},
+                "$set": {"last_accessed": datetime.now()}
+            }
+
+            if new_content:
+                # Merge the new phrasing into metadata, keeping only last 20 variations
+                self.collection.update_one(
+                    {"_id": memory_id},
+                    {
+                        "$push": {
+                            "metadata.variations": {
+                                "$each": [new_content],
+                                "$slice": -20  # Keep only the most recent 20 variations
+                            }
+                        }
+                    }
+                )
+
+            result = self.collection.update_one({"_id": memory_id}, update_fields)
+
+            if result.modified_count > 0:
+                mem = self.collection.find_one({"_id": memory_id})
+                logger.info(f"🔁 Reinforced memory (access_count: {mem['access_count']}): {mem['content'][:50]}...")
+
+                # If memory score reaches 100, promote to belief and reset score
+                try:
+                    score = float(mem.get("score", 0))
+                    if score >= 100.0:
+                        self._promote_to_belief(mem)
+                        self.collection.update_one(
+                            {"_id": memory_id},
+                            {"$set": {"score": 1.0}}
+                        )
+                except Exception as promote_err:
+                    logger.error(f"Memory promotion check failed: {promote_err}")
+
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Memory reinforcement failed: {str(e)}")
+            return False
+
+    def _promote_to_belief(self, memory):
+        """Promotes a frequently-accessed memory to a belief."""
+        try:
+            # Check if belief already exists
+            if beliefs_manager and not beliefs_manager.belief_exists(memory['content']):
+                confidence = min(0.9, 0.5 + (memory['access_count'] * 0.05))  # Max 0.9
+                beliefs_manager.add_belief(
+                    memory['content'],
+                    source=f"memory_promotion_{memory['source']}",
+                    confidence=confidence
+                )
+                logger.info(f"⭐ Promoted memory to belief: {memory['content'][:50]}...")
+        except Exception as e:
+            logger.error(f"Belief promotion failed: {str(e)}")
+
     def add_memory(self, content, source, model_id=None, category="conversation", importance=0.5, metadata=None):
-        """Adds a memory to the database and FAISS index."""
+        """Adds a memory to the database and FAISS index, or reinforces existing similar memory."""
         try:
             content = content.strip()
             if not content or len(content) < 3:
                 logger.warning(f"Memory content too short: '{content}'")
                 return None
-                
-            # Check for duplicate memory before inserting
-            existing_memory = self.collection.find_one({"content": content, "metadata.model_id": model_id})
-            if existing_memory:
-                logger.warning(f"Duplicate memory skipped: {content[:50]}... (model: {model_id})")
+
+            # Check for semantically similar memory
+            similar_memory = self.find_similar_memory(content, model_id, similarity_threshold=0.85)
+            if similar_memory:
+                logger.info(f"📝 Found similar memory, reinforcing instead of creating duplicate")
+                self.reinforce_memory(similar_memory['_id'], new_content=content)
+                return str(similar_memory['_id'])
+
+            # Compute importance score (0-100) and only store if high enough
+            importance_score = self._calculate_memory_score(content)
+            if importance_score < 50.0:
+                logger.info(f"Memory importance below threshold (score={importance_score}), not storing.")
                 return None
-                
+
             embedding = self.model.encode([content])[0]
             emotion = analyze_emotion(content)
-            score = self._calculate_memory_score(content)
+            # Stored memory score always starts at 1.0 and grows with recalls
+            stored_score = 1.0
+            score = stored_score
             
             memory_doc = {
                 "content": content,
                 "embedding": embedding.tolist(),
                 "source": source,
                 "category": category,
-                "importance": importance,
+                "importance": importance_score,
                 "created_at": datetime.now(),
                 "last_accessed": datetime.now(),
                 "access_count": 1,
@@ -142,7 +244,7 @@ class Memory:
                     "emotion": emotion,
                     "model_id": model_id
                 },
-                "score": score
+                "score": stored_score
             }
             
             if metadata:
@@ -219,13 +321,27 @@ class Memory:
                     if 'emotional_context' not in mem:
                         mem['emotional_context'] = self._generate_emotional_context(mem)
             
-            # Update access stats for recalled memories
+            # Update access stats for recalled memories (+1 access, +1 score)
             if recalled_memories:
                 ids = [m["_id"] for m in recalled_memories]
                 self.collection.update_many(
                     {"_id": {"$in": ids}},
-                    {"$inc": {"access_count": 1}, "$set": {"last_accessed": datetime.now()}}
+                    {"$inc": {"access_count": 1, "score": 1.0}, "$set": {"last_accessed": datetime.now()}}
                 )
+
+                # Check for memories that should be promoted to beliefs
+                try:
+                    for mem in recalled_memories:
+                        current_score = float(mem.get("score", 0))
+                        new_score = current_score + 1.0
+                        if new_score >= 100.0:
+                            self._promote_to_belief(mem)
+                            self.collection.update_one(
+                                {"_id": mem["_id"]},
+                                {"$set": {"score": 1.0}}
+                            )
+                except Exception as promote_err:
+                    logger.error(f"Memory promotion during recall failed: {promote_err}")
             
             logger.debug(f"Recalled {len(recalled_memories)} memories for query: {query}")
             return recalled_memories
@@ -338,23 +454,83 @@ class Memory:
             logger.error(f"Memory maintenance failed: {str(e)}")
             return False
 
+    def degrade_memories(self) -> bool:
+        """
+        Gradually degrade memory scores over time.
+        - If a memory has not been recalled for 24 hours, its score decreases by 1.0.
+        - When score reaches 0, the memory is forgotten (deleted).
+        """
+        try:
+            now = datetime.now()
+            degraded = 0
+            removed = 0
+
+            cursor = self.collection.find({})
+            for mem in cursor:
+                score = float(mem.get("score", 0))
+                if score <= 0:
+                    continue
+
+                last_accessed = mem.get("last_accessed") or mem.get("created_at")
+                if not isinstance(last_accessed, datetime):
+                    continue
+
+                # Determine when we last applied decay; fall back to last_accessed
+                last_decay = mem.get("last_decay_at", last_accessed)
+                if not isinstance(last_decay, datetime):
+                    last_decay = last_accessed
+
+                elapsed_days = int((now - last_decay).total_seconds() // 86400)
+                if elapsed_days <= 0:
+                    continue
+
+                new_score = max(0.0, score - float(elapsed_days))
+
+                if new_score <= 0.0:
+                    self.collection.delete_one({"_id": mem["_id"]})
+                    removed += 1
+                else:
+                    self.collection.update_one(
+                        {"_id": mem["_id"]},
+                        {"$set": {"score": new_score, "last_decay_at": now}}
+                    )
+                    degraded += 1
+
+            if degraded or removed:
+                logger.info(f"🧠 Memory decay applied: {degraded} degraded, {removed} forgotten")
+            return True
+        except Exception as e:
+            logger.error(f"Memory decay failed: {str(e)}")
+            return False
+
     def extract_facts(self, text: str):
         """Extracts facts from a given text."""
         text = re.sub(r"[\n]+", " ", text)
         return [s.strip() for s in re.split(r'[.?!;]\s+', text) if len(s.strip().split()) >= 5]
 
-    def learn_from_text(self, text: str, source: str, model_id=None, force: bool = False):
-        """Learns from a given text by extracting facts and remembering them."""
+    def learn_from_text(self, text: str, source: str, model_id=None, force: bool = False, user_id: str = "default_user"):
+        """Learns from a given text by extracting facts and remembering them. Also updates ToM profile if source is user."""
         facts = self.extract_facts(text)
         remembered_count = 0
-        
+
+        # Analyze emotion for the full text
+        emotion_data = analyze_emotion(text)
+
+        # Update user's Theory of Mind profile with emotional data (if user message)
+        if source == "user":
+            try:
+                from upgraded_memory_manager import update_user_model
+                update_user_model(text, user_id=user_id, emotion_data=emotion_data)
+            except Exception as e:
+                logger.error(f"Failed to update ToM profile: {str(e)}")
+
         for fact in facts:
             score = self._calculate_memory_score(fact)
             if force or score >= 60:
                 if self.add_memory(fact, source=source, model_id=model_id):
                     remembered_count += 1
-                    
-        logger.info(f"📚 Learned {remembered_count} facts from text of length {len(text)}")
+
+        logger.info(f"📚 Learned {remembered_count} facts from text of length {len(text)} | Emotion: {emotion_data.get('vader_mood', 'unknown')}")
         return remembered_count
 
     def summarize_memories(self, topic: str, model_instance, model_id="summary") -> str:
@@ -373,8 +549,18 @@ class Memory:
             from model_loader import stream_gpt
             full_summary = "".join(list(stream_gpt(model_instance, "summary_model", summary_prompt)))
 
-            self.add_memory(f"Summary about {topic}: {full_summary}", source="system", model_id=model_id)
+            summary_text = f"Summary about {topic}: {full_summary}"
+
+            # Re-score the summary itself
+            summary_score = self._calculate_memory_score(summary_text)
+
+            if summary_score >= 50:  # or 75, depending on what you want
+                self.add_memory(summary_text, source="system", model_id=model_id)
+            else:
+                logger.info(f"Summary importance below threshold (score={summary_score}), not storing.")
+
             return full_summary
+
         except Exception as e:
             logger.error(f"Memory summarization failed: {str(e)}")
             return f"Failed to generate summary about {topic}"
@@ -427,9 +613,14 @@ class Beliefs:
             "content": content,
             "source": source,
             "confidence": confidence,
+            # Belief reinforcement score (0-100) before becoming a core belief
+            "score": 1.0,
             "timestamp": datetime.now(),
             "reinforced": 1,
-            "last_updated": datetime.now()
+            "last_updated": datetime.now(),
+            "last_accessed": datetime.now(),
+            # Core beliefs are never decayed or demoted back to memories
+            "is_core": False
         }
         
         self.collection.insert_one(belief_doc)
@@ -446,11 +637,23 @@ class Beliefs:
                 {
                     "$set": {
                         "confidence": new_confidence,
-                        "last_updated": datetime.now()
+                        "last_updated": datetime.now(),
+                        "last_accessed": datetime.now()
                     },
-                    "$inc": {"reinforced": 1}
+                    "$inc": {"reinforced": 1, "score": 1.0}
                 }
             )
+            try:
+                # Promote to core belief if score reaches 100
+                new_score = float(belief.get("score", 0)) + 1.0
+                if new_score >= 100.0 and not belief.get("is_core", False):
+                    self.collection.update_one(
+                        {"_id": belief["_id"]},
+                        {"$set": {"is_core": True, "score": 1.0}}
+                    )
+                    logger.info(f"🧠 Belief promoted to core belief: {content[:50]}...")
+            except Exception as promote_err:
+                logger.error(f"Belief promotion failed: {promote_err}")
             logger.debug(f"🔁 Reinforced belief: {content[:30]}... (new confidence: {new_confidence})")
             return True
         return False
@@ -500,12 +703,87 @@ class Beliefs:
             return "No strong beliefs yet."
             
         formatted_beliefs = []
+        ids = []
         for i, belief in enumerate(beliefs):
             confidence = belief.get('confidence', 0)
             strength = "strongly" if confidence > 0.7 else "moderately" if confidence > 0.4 else "somewhat"
             formatted_beliefs.append(f"{i+1}. {belief['content']} ({strength} held)")
+            ids.append(belief["_id"])
+
+        # Mark retrieved beliefs as recalled (+1 score) and update last_accessed
+        try:
+            if ids:
+                self.collection.update_many(
+                    {"_id": {"$in": ids}},
+                    {"$inc": {"score": 1.0}, "$set": {"last_accessed": datetime.now()}}
+                )
+
+                # Promote any beliefs that reached core threshold
+                for belief in beliefs:
+                    if belief.get("is_core"):
+                        continue
+                    current_score = float(belief.get("score", 0))
+                    new_score = current_score + 1.0
+                    if new_score >= 100.0:
+                        self.collection.update_one(
+                            {"_id": belief["_id"]},
+                            {"$set": {"is_core": True, "score": 1.0}}
+                        )
+                        logger.info(f"🧠 Belief promoted to core belief via recall: {belief['content'][:50]}...")
+        except Exception as e:
+            logger.error(f"Belief recall update failed: {str(e)}")
             
         return "\n".join(formatted_beliefs)
+
+    def degrade_beliefs(self) -> bool:
+        """
+        Gradually degrade belief scores over time.
+        - Non-core beliefs (is_core != True) lose 0.5 score per 24h without recall.
+        - When score reaches 0, the belief can be demoted or forgotten.
+        """
+        try:
+            now = datetime.now()
+            degraded = 0
+            removed = 0
+
+            cursor = self.collection.find({"is_core": {"$ne": True}})
+            for belief in cursor:
+                score = float(belief.get("score", 0))
+                if score <= 0:
+                    continue
+
+                last_accessed = belief.get("last_accessed") or belief.get("timestamp")
+                if not isinstance(last_accessed, datetime):
+                    continue
+
+                last_decay = belief.get("last_decay_at", last_accessed)
+                if not isinstance(last_decay, datetime):
+                    last_decay = last_accessed
+
+                elapsed_days = int((now - last_decay).total_seconds() // 86400)
+                if elapsed_days <= 0:
+                    continue
+
+                new_score = max(0.0, score - 0.5 * float(elapsed_days))
+
+                if new_score <= 0.0:
+                    # For now, simply remove stale beliefs; demotion back to memory
+                    # can be added here if desired.
+                    self.collection.delete_one({"_id": belief["_id"]})
+                    removed += 1
+                else:
+                    self.collection.update_one(
+                        {"_id": belief["_id"]},
+                        {"$set": {"score": new_score, "last_decay_at": now}}
+                    )
+                    degraded += 1
+
+            if degraded or removed:
+                logger.info(f"🧠 Belief decay applied: {degraded} degraded, {removed} removed")
+            return True
+        except Exception as e:
+            logger.error(f"Belief decay failed: {str(e)}")
+            return False
 
 # --- Theory of Mind Class ---
 class ToMProfile:
@@ -778,36 +1056,75 @@ def update_user_model(interaction_text: str, user_id: str = "default_user", emot
     profile = ToMProfile(db, user_id)
     profile.update_from_interaction(interaction_text, emotion_data)
 
-def get_context_for_model(query: str, model_id: str, user_id: str = "default_user") -> str:
+def get_current_emotion_context(user_input: str) -> str:
     """
-    Gets comprehensive context for a model including memories, beliefs, and user profile.
+    Analyzes the current user input and returns formatted emotional context.
+    This should be injected into the prompt so the model sees the user's current emotional state.
+    """
+    try:
+        emotion_data = analyze_emotion(user_input)
+
+        mood = emotion_data.get("vader_mood", "neutral")
+        score = emotion_data.get("vader_score", 0)
+
+        # Create intensity descriptor
+        intensity = abs(score)
+        if intensity > 0.7:
+            intensity_desc = "very"
+        elif intensity > 0.4:
+            intensity_desc = "quite"
+        elif intensity > 0.1:
+            intensity_desc = "slightly"
+        else:
+            intensity_desc = ""
+
+        # Format as context message
+        emotional_state = f"{intensity_desc} {mood}".strip()
+        context = f"[Current User Emotional State: {emotional_state} (score: {score:.2f})]"
+
+        logger.debug(f"🎭 Current emotion context: {context}")
+        return context
+
+    except Exception as e:
+        logger.error(f"Failed to analyze current emotion: {str(e)}")
+        return "[Current User Emotional State: unknown]"
+
+def get_context_for_model(query: str, model_id: str, user_id: str = "default_user", include_current_emotion: bool = True) -> str:
+    """
+    Gets comprehensive context for a model including memories, beliefs, user profile, and CURRENT emotion.
     """
     db = setup_mongodb()
     if db is None:
         return ""
-        
+
     memory_manager = Memory(db)
     beliefs_manager = Beliefs(db)
     user_profile = ToMProfile(db, user_id)
-    
+
     context_parts = []
-    
+
+    # Add CURRENT emotional state of user (NEW!)
+    if include_current_emotion:
+        current_emotion = get_current_emotion_context(query)
+        context_parts.append(current_emotion)
+
     # Add memories
     memories = memory_manager.get_memories_for_prompt(query, model_id=model_id)
     if memories != "No relevant memories found.":
-        context_parts.append("RELEVANT MEMORIES:")
+        context_parts.append("\nRELEVANT MEMORIES:")
         context_parts.append(memories)
-    
+
     # Add beliefs
     beliefs_text = beliefs_manager.get_beliefs_for_prompt()
-    context_parts.append("CORE BELIEFS:")
-    context_parts.append(beliefs_text)
-    
+    if beliefs_text != "No strong beliefs yet.":
+        context_parts.append("\nCORE BELIEFS:")
+        context_parts.append(beliefs_text)
+
     # Add user profile
     profile_text = user_profile.get_profile_for_prompt()
-    context_parts.append(profile_text)
-    
-    return "\n\n".join(context_parts)
+    context_parts.append(f"\n{profile_text}")
+
+    return "\n".join(context_parts)
 
 # --- Initialization ---
 db = setup_mongodb()

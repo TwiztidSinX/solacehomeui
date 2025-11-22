@@ -91,7 +91,7 @@ export class VoiceVisualizer {
           const reader = new FileReader();
           reader.onloadend = () => {
             const base64data = reader.result;
-            socket.emit('transcribe_audio', { audio: base64data });
+            socket.emit('transcribe', { audio: base64data });
           };
           reader.readAsDataURL(audioBlob);
         };
@@ -115,7 +115,11 @@ export class VoiceVisualizer {
     this.state = 'processing';
     this.logo.classList.remove('listening');
     this._transition(this.dots, this.logo, 'Processing...').then(() => {
-      socket.emit('voice_chat', { text: transcribedText, history: [] }); // Note: history is not available here
+      socket.emit('chat', { 
+        text: transcribedText, 
+        session_id: null, // Add proper session handling if needed
+        user_id: 'default_user' 
+      });
     });
   }
 
