@@ -1,6 +1,9 @@
 {
+    "orchestratorType": "api",
+    "orchestratorApiProvider": "deepseek",
+    "orchestratorApiModel": "deepseek-chat",
     "searxngUrl": "http://localhost:8088",
     "mediaServerUrl": "http://localhost:8096",
-    "mediaServerApiKey": "84b04029129e4ee3955d133025d9ef25", 
+    "mediaServerApiKey": "84b04029129e4ee3955d133025d9ef25",
     "imageGenUrl": "http://localhost:8000"
 }

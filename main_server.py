@@ -11,7 +11,7 @@ import time
 import webbrowser
 import random
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import eventlet
 import networkx as nx
 import numpy as np
@@ -22,7 +22,7 @@ import torch
 import urllib.parse
 import sounddevice as sd
 from faster_whisper import WhisperModel
-from flask import Flask, render_template, request, send_from_directory
+from flask import Flask, render_template, request, send_from_directory, jsonify
 from flask_socketio import SocketIO, emit
 from scipy.spatial import distance as ssd
 from bson.objectid import ObjectId
@@ -30,16 +30,29 @@ from pymongo.errors import PyMongoError
 from sentence_transformers import SentenceTransformer
 from llama_agent_integration import LlamaCppAgenticOrchestrator
 from model_loader import (
-    get_available_models, load_model, unload_model, 
-    stream_gpt, stream_llamacpp, stream_ollama, stream_safetensors, 
-    stream_google, stream_openai, stream_anthropic, stream_meta, 
+    get_available_models, load_model, unload_model,
+    stream_gpt, stream_llamacpp, stream_ollama, stream_safetensors,
+    stream_google, stream_openai, stream_anthropic, stream_meta,
     stream_xai, stream_qwen, stream_deepseek, stream_perplexity, stream_openrouter
 )
 from upgraded_memory_manager import memory_manager as memory, beliefs_manager as beliefs, db
+from token_utils import (
+    TokenTracker,
+    estimate_input_tokens,
+    normalize_model_name,
+    calculate_cost,
+    MODEL_PRICING,
+)
 from orchestrator import load_orchestrator_model, get_summary_for_title, parse_command, get_tool_call, summarize_text, get_orchestrator_response, score_response_confidence, summarize_for_memory, should_perform_web_search_intelligent
 from tools import dispatch_tool, TOOLS_SCHEMA
 import orchestrator as orchestrator_module
 from orchestrator import build_parliament_prompt  # helper we will add for merging
+from parliament_voting import ParliamentVoter  # Parliament voting system
+from agent_coding_socket import register_agent_coding_handlers
+
+# Initialize Parliament voter
+parliament_voter = ParliamentVoter()
+
 is_speaking = False
 # --- Database Setup for Chat History ---
 try:
@@ -52,6 +65,19 @@ except Exception as e:
     print(f"🔴 FAILED to configure chat sessions collection: {e}")
     chat_sessions_collection = None
 # --- End Database Setup ---
+
+# --- Database Setup for Usage Events ---
+try:
+    usage_events_collection = db['llm_usage_events'] if db is not None else None
+    if usage_events_collection is not None:
+        usage_events_collection.create_index('timestamp')
+        usage_events_collection.create_index([('model', 1), ('provider', 1)])
+        usage_events_collection.create_index('sessionId')
+        print("バ. Usage events collection configured.")
+except Exception as e:
+    print(f"dY\"' FAILED to configure usage events collection: {e}")
+    usage_events_collection = None
+# --- End Usage Events Setup ---
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKSPACE_ROOT = Path(BASE_DIR).resolve()
@@ -100,6 +126,109 @@ def set_voice_state(listen, speak):
     speak_enabled = speak
     print(f"🎚️ Voice State Updated — Listening: {listen} | Speaking: {speak}")
 
+
+def extract_text_from_content(content):
+    """
+    Safely extract plain text from message content that might be a string or
+    a multimodal list of parts (e.g., [{'type': 'text', ...}, {'type': 'image_url', ...}]).
+    """
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                parts.append(part.get("text", ""))
+            elif isinstance(part, str):
+                parts.append(part)
+        return " ".join(p for p in parts if p).strip()
+    if isinstance(content, str):
+        return content
+    return ""
+
+
+def merge_text_into_content(content, extra_text):
+    """
+    Inject extra_text into an existing content structure without losing multimodal parts.
+    For list content, prepend the text block; for string content, prepend as plain text.
+    """
+    if not extra_text:
+        return content
+
+    if isinstance(content, list):
+        updated = []
+        text_merged = False
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text" and not text_merged:
+                merged = dict(part)
+                merged["text"] = f"{extra_text}\n\n{part.get('text', '')}".strip()
+                updated.append(merged)
+                text_merged = True
+            else:
+                updated.append(part)
+        if not text_merged:
+            updated.insert(0, {"type": "text", "text": extra_text})
+        return updated
+
+    base_text = extract_text_from_content(content)
+    return f"{extra_text}\n\n{base_text}".strip()
+
+
+def is_question_like(text: str) -> bool:
+    """
+    Rough heuristic to decide if a user input is an info-seeking query.
+    Helps prevent unnecessary auto-search on casual statements.
+    """
+    if not text:
+        return False
+    lowered = text.lower().strip()
+    if '?' in lowered:
+        return True
+    starters = ("who ", "what ", "where ", "when ", "why ", "how ", "which ", "can you", "could you", "would you", "should you", "tell me", "explain", "give me")
+    return lowered.startswith(starters)
+
+
+def build_search_query(user_text: str, max_words: int = 32) -> str:
+    """
+    Reduce verbose user inputs to a compact search query.
+    - Prefer the first sentence; otherwise the first N words.
+    """
+    if not user_text:
+        return ""
+    first_sentence_end = user_text.find(".")
+    if first_sentence_end != -1 and first_sentence_end < 240:
+        candidate = user_text[: first_sentence_end + 1]
+    else:
+        words = user_text.split()
+        candidate = " ".join(words[:max_words])
+    return candidate.strip()
+
+
+def extract_uncertain_span(response_text: str, max_words: int = 24) -> str:
+    """
+    Try to pull the most uncertain sentence/phrase from the model response
+    to use as a targeted search query.
+    """
+    if not response_text:
+        return ""
+    markers = [
+        "not sure", "don't know", "uncertain", "unclear",
+        "might be", "could be", "probably", "maybe",
+        "as far as i know", "my knowledge", "not certain"
+    ]
+    # Naive sentence split
+    import re
+    sentences = re.split(r"[\\.\\?!]", response_text)
+    sentences = [s.strip() for s in sentences if s.strip()]
+    for sent in sentences:
+        lower = sent.lower()
+        if any(m in lower for m in markers):
+            words = sent.split()
+            return " ".join(words[:max_words]).strip()
+    # fallback: first sentence snippet
+    if sentences:
+        words = sentences[0].split()
+        return " ".join(words[:max_words]).strip()
+    return ""
+
 app = Flask(__name__, static_folder='static/react', static_url_path='')
 # Add cache-busting configuration for development
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
@@ -110,6 +239,27 @@ socketio = SocketIO(app,
                    ping_timeout=60000, # 60 seconds
                    ping_interval=25000, # 25 seconds
                    max_http_buffer_size=100 * 1024 * 1024) # 100MB limit
+
+# Resolve the model to use for agentic coding (Nova-style coding agent).
+def get_agent_coding_model_client():
+    """
+    Return a model client suitable for agentic coding tool calls.
+    Prefer the lightweight orchestrator model when available, otherwise
+    fall back to the currently loaded main model.
+    """
+    try:
+        if orchestrator_module.orchestrator_model is not None:
+            return orchestrator_module.orchestrator_model
+        return current_model
+    except Exception as e:
+        print(f"[AgentCoding] Failed to resolve model client: {e}")
+        return None
+
+# Register agentic coding socket handlers (Nova-style coding agent)
+agent_coding_handler = register_agent_coding_handlers(
+    socketio,
+    model_client_factory=get_agent_coding_model_client
+)
 
 memory_graph = nx.DiGraph()
 _model = None
@@ -352,7 +502,7 @@ def run_agentic_chat_task(data, sid, forced: bool = False):
     global agentic_orchestrator
 
     session_id = data.get("session_id")
-    user_input = data.get("text", "")
+    user_input = extract_text_from_content(data.get("text", ""))
     current_sender = data.get("aiName", "Nova")
 
     full_thought = ""
@@ -774,23 +924,41 @@ def handle_chat(data):
     backend = data.get('backend', current_backend)
     provider = data.get('provider')
     timezone = data.get('timezone', 'UTC')
-    user_input = data.get('text', '')
+    raw_user_input = data.get('text', '')
+    user_input_text = extract_text_from_content(raw_user_input)
+    attachments = data.get('attachments') or []
+    attachment_context = ""
+    if attachments:
+        blocks = []
+        for attachment in attachments:
+            name = attachment.get('name', 'attachment')
+            content = attachment.get('content', '')
+            blocks.append(f"### {name} ###\n{content}")
+        attachment_context = "\n\n--- ATTACHED FILES ---\n" + "\n\n".join(blocks)
+        context_block = attachment_context.strip()
+        user_input_text = f"{attachment_context}\n\n{user_input_text}".strip()
+        raw_user_input = merge_text_into_content(raw_user_input, context_block)
+        # Keep the augmented input in the payload for downstream steps (preserve multimodal parts)
+        data['text'] = raw_user_input
+    else:
+        data['text'] = raw_user_input
     
     # --- Save User Message to DB ---
     session_id = data.get('session_id')
     if session_id:
         user_message = {
             "sender": data.get('userName', 'User'),
-            "message": user_input,
+            "message": user_input_text,
             "type": "user",
-            "imageB64": data.get('image_base_64')
+            "imageB64": data.get('image_base_64'),
+            "attachments": attachments
         }
         _save_message_to_db(session_id, user_message)
 
     # --- Hybrid Orchestration Logic ---
     # 0. Allow forcing agentic mode with /agent prefix
     if auto_agent_enabled:
-        stripped_input = user_input.strip()
+        stripped_input = user_input_text.strip()
         if stripped_input.startswith('/agent '):
             forced_query = stripped_input[7:].strip()
             if forced_query:
@@ -801,26 +969,100 @@ def handle_chat(data):
                 return
 
     # 1. Always check for slash commands first (instant)
-    command = parse_command(user_input)
+    command = parse_command(user_input_text)
     if command:
         query = command.get('query')
         command_name = command.get('command')
 
         # List of commands handled by the special iframe/frontend logic
-        frontend_commands = ['search']
+        frontend_commands = ['browser']
 
         if command_name in frontend_commands:
             response_payload = {'type': 'error', 'message': f"Unknown command: {command_name}", 'sender': 'Nova'}
             try:
-                if command_name == 'search':
-                    encoded_query = urllib.parse.quote(query)
-                    search_url = f"http://localhost:8088/?q={encoded_query}"
-                    response_payload = {'type': 'iframe', 'url': search_url, 'message': f"Searching for: `{query}`", 'sender': 'Nova'}
-                
+                if command_name == 'browser':
+                    # Treat the query as a URL (or domain/keyword) and open via the proxy-enabled browser panel.
+                    target = (query or "").strip()
+                    if target and not target.startswith(("http://", "https://")):
+                        target = f"https://{target}"
+                    response_payload = {
+                        'type': 'iframe',
+                        'url': target,
+                        'message': f"Opening browser for: `{query}`",
+                        'sender': 'Nova'
+                    }
+
                 emit('command_response', response_payload)
                 if session_id:
                     _save_message_to_db(session_id, {"sender": "Nova", **response_payload, "type": "ai"})
                 return # Stop further processing
+
+            except Exception as e:
+                response_payload = {'type': 'error', 'message': f"An unexpected error occurred: {e}", 'sender': 'Nova'}
+                emit('command_response', response_payload)
+                if session_id:
+                    _save_message_to_db(session_id, {"sender": "Nova", **response_payload, "type": "ai"})
+                return # Stop further processing
+
+        elif command_name == 'search':
+            # NEW: Enhanced multi-panel intelligent search
+            try:
+                encoded_query = urllib.parse.quote(query)
+                aggregated_context = f"User searched for: {query}\n\n"
+
+                # 1. YouTube Search first (so embed shows quickly even with single SearXNG instance)
+                try:
+                    youtube_url = f"http://localhost:8088/search?q={encoded_query}&engines=youtube&format=json"
+                    youtube_response = requests.get(youtube_url, timeout=10).json()
+                    first_video = next((r for r in youtube_response.get('results', []) if 'youtube.com/watch' in r.get('url', '') or 'youtu.be/' in r.get('url', '')), None)
+
+                    if first_video:
+                        url = first_video.get('url', '')
+                        vid_match = re.search(r'(?:v=|youtu\.be/)([^&\\s]{6,})', url)
+                        video_id = vid_match.group(1) if vid_match else None
+                        if video_id:
+                            emit('command_response', {
+                                'type': 'youtube_embed',
+                                'video_id': video_id,
+                                'message': f"Related video for '{query}':",
+                                'sender': 'Nova'
+                            })
+                            aggregated_context += "YouTube Result:\n"
+                            aggregated_context += f"Video: {first_video.get('title', 'No title')}\n\n"
+                    else:
+                        print("No YouTube result found via SearXNG")
+                except Exception as e:
+                    print(f"YouTube search failed: {e}")
+
+                # Slight delay to avoid hammering single SearXNG instance
+                time.sleep(1.5)
+
+                # 2. SearXNG Web Search
+                try:
+                    search_url = f"http://localhost:8088/search?q={encoded_query}&format=json"
+                    search_response = requests.get(search_url, timeout=10).json()
+                    results = search_response.get('results', [])[:5]  # Top 5 results
+
+                    # Emit to open search panel
+                    emit('search_results', {
+                        'query': query,
+                        'results': [{'title': r.get('title', ''), 'url': r.get('url', ''), 'snippet': r.get('content', '')} for r in results]
+                    })
+
+                    # Add to context
+                    if results:
+                        aggregated_context += "Web Search Results:\n"
+                        for i, result in enumerate(results, 1):
+                            aggregated_context += f"{i}. {result.get('title', 'No title')}\n"
+                            aggregated_context += f"   {result.get('content', 'No description')[:200]}...\n\n"
+                except Exception as e:
+                    print(f"Web search failed: {e}")
+
+                # 3. Send aggregated context to Solace for synthesis
+                # Continue to normal chat flow with enhanced context
+                data['text'] = f"{aggregated_context}\n\nBased on the search results above, please provide a helpful summary about: {query}"
+
+                # Don't return - let it continue to normal chat processing
 
             except Exception as e:
                 response_payload = {'type': 'error', 'message': f"An unexpected error occurred: {e}", 'sender': 'Nova'}
@@ -1083,14 +1325,14 @@ def handle_chat(data):
 
     # 1b. If no handled slash command, decide whether to use agentic orchestrator
     use_agentic = auto_agent_enabled
-    if use_agentic and detect_needs_agentic_approach(user_input):
+    if use_agentic and detect_needs_agentic_approach(user_input_text):
         sid = request.sid
         socketio.start_background_task(run_agentic_chat_task, data, sid, False)
         return
 
     # 2. If no slash command, intelligently detect if web search is needed
     # Use intelligent detection (heuristics + Nova) as primary method
-    search_decision = should_perform_web_search_intelligent(user_input)
+    search_decision = should_perform_web_search_intelligent(user_input_text)
     should_orchestrate = search_decision['should_search']
 
     # Fallback: Also check hardcoded keywords for robustness
@@ -1103,7 +1345,7 @@ def handle_chat(data):
             "flight status", "train schedule", "bus times",
             "traffic", "road conditions"
         ]
-        should_orchestrate = any(keyword in user_input.lower() for keyword in ORCHESTRATOR_KEYWORDS)
+        should_orchestrate = any(keyword in user_input_text.lower() for keyword in ORCHESTRATOR_KEYWORDS)
         if should_orchestrate:
             print(f"🔍 Web search triggered by keyword fallback")
     else:
@@ -1111,7 +1353,7 @@ def handle_chat(data):
 
     if should_orchestrate:
         print("Orchestration keywords detected. Checking for tool call...")
-        tool_calls = get_tool_call(user_input)
+        tool_calls = get_tool_call(user_input_text)
         if tool_calls:
             tool_call = tool_calls[0] # Assuming one tool call for now
             tool_name = tool_call.get("name")
@@ -1130,9 +1372,9 @@ def handle_chat(data):
                     "You have been provided with the following real-time information to answer the user's query. "
                     "You MUST use this information to form your answer and ignore any conflicting internal knowledge."
                 )
-                user_input = f"{forceful_instruction}\n\n--- Information ---\n{tool_result}\n--- End Information ---\n\nUser Query: {user_input}"
+                user_input_text = f"{forceful_instruction}\n\n--- Information ---\n{tool_result}\n--- End Information ---\n\nUser Query: {user_input_text}"
                 # IMPORTANT: Update the 'text' in the data payload that gets passed to the streaming task.
-                data['text'] = user_input
+                data['text'] = user_input_text
                 # Fall through to the main model logic below
 
     # 3. If neither, bypass orchestrator and go directly to the main model
@@ -1157,6 +1399,37 @@ def handle_chat(data):
     sid = request.sid
     socketio.start_background_task(stream_response, data, sid)
 
+
+def _detect_provider_from_model(model_name, provider_hint=None, backend_hint=None):
+    """
+    Resolve provider name using explicit hint, backend, or model pattern.
+    """
+    if provider_hint:
+        return provider_hint
+    name = (model_name or "").lower()
+    if "deepseek" in name:
+        return "deepseek"
+    if "qwen" in name:
+        return "qwen"
+    if "gpt" in name or "openai" in name or name.startswith("o1") or name.startswith("o3") or name.startswith("o4"):
+        return "openai"
+    if "claude" in name or "anthropic" in name:
+        return "anthropic"
+    if "gemini" in name:
+        return "google"
+    if "grok" in name or "xai" in name:
+        return "xai"
+    if "llama" in name or "meta" in name:
+        return "meta"
+    if "mistral" in name:
+        return "mistral"
+    if "sonar" in name or "perplexity" in name:
+        return "perplexity"
+    if backend_hint:
+        return backend_hint
+    return "unknown"
+
+
 def stream_response(data, sid):
     global stop_streaming
     full_response = ""
@@ -1165,7 +1438,21 @@ def stream_response(data, sid):
     in_thought_block = False
     current_sender = data.get('aiName', 'Nova')  # Get the actual AI name
 
+    # Initialize token tracking
+    model_name = data.get('model_name', current_model_path_string)
+    token_tracker = TokenTracker(model_name=model_name)
+    raw_user_input = data.get('text', '')
+    user_input_text = extract_text_from_content(raw_user_input)
+
     try:
+        # Start timing for TTFT calculation
+        token_tracker.start()
+
+        # Estimate input tokens from conversation history
+        conversation_history = data.get('history', [])
+        input_token_count = estimate_input_tokens(conversation_history, raw_user_input, model_name)
+        token_tracker.add_input_tokens(input_token_count)
+
         socketio.emit('stream_start', {'sender': current_sender}, room=sid)
         socketio.sleep(0)
 
@@ -1200,13 +1487,20 @@ def stream_response(data, sid):
             raise ValueError(f"No valid streamer found for backend '{backend}' and provider '{provider}'")
 
         # --- Prepare Arguments for All Streamers ---
+        image_payload = None
+        if data.get('image_base_64'):
+            image_payload = {
+                "data": data.get('image_base_64'),
+                "media_type": data.get('image_mime_type') or "image/png"
+            }
+
         args = {
             "model_instance": current_model if backend != 'ollama' else current_model_path_string,
             "model_id_str": current_model_path_string,
             "user_input": data['text'],
             "conversation_history": data.get('history', []),
             "should_stop": lambda: stop_streaming,
-            "image_data": data.get('image_base_64'),
+            "image_data": image_payload,
             "timezone": data.get('timezone', 'UTC'),
             "debug_mode": data.get('debug_mode', False),
             "thinking_level": data.get('thinking_level', 'medium') # Pass thinking level
@@ -1262,6 +1556,8 @@ def stream_response(data, sid):
                     nonlocal full_response
                     if text:
                         full_response += text
+                        # Track output tokens (approximate 1 token per chunk on average)
+                        token_tracker.add_output_token(text)
                         socketio.emit('stream', {'text': text, 'aiName': current_sender, 'type': 'reply'}, room=sid)
 
                 if chunk_type == 'thought':
@@ -1308,8 +1604,46 @@ def stream_response(data, sid):
     finally:
         with stop_lock:
             stop_streaming = False
-        
-        socketio.emit('stream_end', {'aiName': current_sender}, room=sid)
+
+        # Get token metrics
+        token_metrics = token_tracker.get_metrics()
+
+        # Persist usage metrics for analytics (one event per streamed response)
+        if usage_events_collection is not None:
+            try:
+                normalized_model = normalize_model_name(model_name)
+                provider_value = _detect_provider_from_model(
+                    model_name, data.get('provider'), data.get('backend', current_backend)
+                )
+                input_tokens = token_metrics.get('inputTokens', 0)
+                output_tokens = token_metrics.get('outputTokens', 0)
+                total_tokens = input_tokens + output_tokens
+                estimated_cost = calculate_cost(input_tokens, output_tokens, normalized_model)
+                usage_events_collection.insert_one({
+                    "timestamp": int(time.time() * 1000),
+                    "sessionId": session_id,
+                    "model": normalized_model,
+                    "provider": provider_value,
+                    "inputTokens": input_tokens,
+                    "outputTokens": output_tokens,
+                    "totalTokens": total_tokens,
+                    "timeToFirstTokenMs": token_metrics.get('timeToFirstToken'),
+                    "tokensPerSecond": token_metrics.get('tokensPerSecond'),
+                    "estimatedCost": estimated_cost,
+                    "meta": {
+                        "aiName": current_sender,
+                        "backend": data.get('backend', current_backend),
+                        "timezone": data.get('timezone'),
+                        "rawModelName": model_name,
+                    }
+                })
+            except Exception as e:
+                logger.error(f"Failed to persist usage event: {e}")
+
+        socketio.emit('stream_end', {
+            'aiName': current_sender,
+            'tokenMetrics': token_metrics
+        }, room=sid)
         
         # Fix: Use the actual sender name instead of hardcoding "Nova"
         if full_response and session_id:
@@ -1317,19 +1651,20 @@ def stream_response(data, sid):
                 "sender": current_sender,  # Use the dynamic AI name
                 "message": full_response,
                 "type": "ai",
-                "thought": full_thought
+                "thought": full_thought,
+                "tokenMetrics": token_metrics
             }
             _save_message_to_db(session_id, ai_message)
 
         # MEMORY SUMMARIZATION: Extract key facts via Nova instead of storing raw text
         user_id = data.get('user_id', 'default_user')
-        user_input = data.get('text', '')
 
-        if full_response and user_input:
+        if full_response and user_input_text:
             # Let Nova extract concise facts from the conversation exchange
-            facts = summarize_for_memory(user_input, full_response)
+            facts = summarize_for_memory(user_input_text, full_response)
 
             if facts:
+                print(f" Processing {len(facts)} facts extracted by Nova...")
                 # Store the summarized facts (much cleaner than raw text)
                 stored_count = 0
                 for fact in facts:
@@ -1342,7 +1677,10 @@ def stream_response(data, sid):
                     if result:
                         stored_count += 1
 
-                print(f"💾 Stored {stored_count} summarized facts to memory")
+                if stored_count > 0:
+                    print(f"✅ Successfully stored {stored_count}/{len(facts)} facts to memory")
+                else:
+                    print(f"⚠️ No facts stored ({len(facts)} extracted, all below threshold or duplicates)")
             else:
                 # Fallback: If summarization fails, store raw (old behavior)
                 print("⚠️ Summarization returned no facts, using fallback storage")
@@ -1354,31 +1692,50 @@ def stream_response(data, sid):
                 )
 
         # CONFIDENCE SCORING: Score the main model's response
-        # Skip scoring for: Nova's own responses, empty responses, or command responses
-        # (user_input already extracted above at line 866)
+        # Skip scoring for: Nova's own responses, empty responses, command responses, or already-enhanced retries
         is_nova_response = current_sender.lower() == 'nova'
-        is_command = user_input.strip().startswith('/')
+        is_command = user_input_text.strip().startswith('/')
+        is_enhanced = data.get('confidence_enhanced', False)
 
-        if full_response and not is_nova_response and not is_command and len(full_response.strip()) > 10:
+        if full_response and not is_nova_response and not is_command and not is_enhanced and len(full_response.strip()) > 10:
             try:
-                confidence_result = score_response_confidence(full_response, user_input)
-                score = confidence_result['score']
-                reasoning = confidence_result['reasoning']
-                should_search = confidence_result['should_search']
+                confidence_result = score_response_confidence(full_response, user_input_text)
+                confidence_score = confidence_result.get('score', 100)
+                reasoning = confidence_result.get('reasoning', 'n/a')
+                should_search = confidence_result.get('should_search', False)
 
                 # Log the confidence score
-                if score < 50:
-                    print(f"🔴 LOW CONFIDENCE ({score:.1f}%): {reasoning}")
-                elif score < 80:
-                    print(f"🟡 MODERATE CONFIDENCE ({score:.1f}%): {reasoning}")
+                if confidence_score < 50:
+                    print(f"🔴 LOW CONFIDENCE ({confidence_score:.1f}%): {reasoning}")
+                elif confidence_score < 80:
+                    print(f"🟡 MODERATE CONFIDENCE ({confidence_score:.1f}%): {reasoning}")
                 else:
-                    print(f"🟢 HIGH CONFIDENCE ({score:.1f}%): {reasoning}")
+                    print(f"🟢 HIGH CONFIDENCE ({confidence_score:.1f}%): {reasoning}")
 
-                # If confidence is low, log recommendation for web search
-                if should_search:
-                    print(f"💡 RECOMMENDATION: Consider web search for query: '{user_input[:100]}'")
-                    # TODO: In future, auto-trigger reactive web search here
-                    # For now, just log it so we don't break anything
+                # Only act on low confidence + search recommendation + question-like input
+                # (threshold relaxed to 60 to allow legit lookups without being over-aggressive)
+                if confidence_score < 60 and should_search and is_question_like(user_input_text):
+                    print(f"⚠️ Low confidence ({confidence_score:.1f}%) detected for query: {user_input_text[:100]}")
+                    try:
+                        # Auto-trigger a single web search and enhanced response (no UI spam, no loops)
+                        search_query = extract_uncertain_span(full_response) or build_search_query(user_input_text)
+                        search_results = dispatch_tool("search_web", {"query": search_query})
+                        if search_results and not str(search_results).lower().startswith("error"):
+                            enhanced_prompt = (
+                                "The previous response had low confidence. Here is additional context from web search:\n\n"
+                                f"{search_results}\n\n"
+                                f"Original query: {user_input_text}\n\n"
+                                "Please provide a more informed answer using the search results above."
+                            )
+                            enhanced_data = dict(data)
+                            enhanced_data['text'] = enhanced_prompt
+                            enhanced_data['confidence_enhanced'] = True
+                            print("✅ Triggering enhanced response with web search context")
+                            socketio.start_background_task(stream_response, enhanced_data, sid)
+                        else:
+                            print("⚠️ Web search returned no results; skipping enhancement")
+                    except Exception as enhance_err:
+                        print(f"❌ Auto-search/reenhance failed: {enhance_err}")
 
             except Exception as e:
                 print(f"⚠️ Confidence scoring error: {e}")
@@ -1827,37 +2184,74 @@ def _is_safe_path(target: Path) -> bool:
     except Exception:
         return False
 
-def _build_file_tree(path: Path, depth: int = 6, max_entries: int = 800):
+def _build_file_tree(path: Path, depth: int = 10, max_entries: int = 9999):
     """
     Build a file tree up to a given depth and entry count.
-    Simpler traversal to ensure files are not skipped.
     """
     root = path.resolve()
     entries_left = max_entries
+    
+    SKIP_DIRS = {
+        '__pycache__', 'node_modules', '.git', '.venv', 'venv', 
+        'env', 'dist', 'build', '.next', '.cache',
+        'llama-gpu', '.pytest_cache', '.mypy_cache', '.tox',
+        'htmlcov', '.coverage', 'site-packages', 'Lib', 'searxng-docker'
+    }
 
     def walk(node: Path, current_depth: int):
         nonlocal entries_left
         if entries_left <= 0:
             return None
         try:
-          is_dir = node.is_dir()
-        except Exception:
-          return None
+            is_dir = node.is_dir()
+        except Exception as e:
+            return None
+            
         if is_dir:
+            is_root_node = (node == root)
+            should_skip = (not is_root_node) and (node.name in SKIP_DIRS or node.name.startswith('.'))
+            
+            if should_skip:
+                return None
+                
             children = []
-            if current_depth < depth:
-                for child in sorted(node.iterdir(), key=lambda p: (p.is_file(), p.name.lower())):
-                    if entries_left <= 0:
-                        break
-                    if child.name.startswith('.'):
-                        continue  # hide dotfiles
-                    child_info = walk(child, current_depth + 1)
-                    if child_info:
-                        children.append(child_info)
+            if is_root_node or current_depth < depth:
+                try:
+                    all_items = list(node.iterdir())
+                    
+                    # IMPORTANT: Process FILES first, then DIRECTORIES
+                    # This ensures root-level files are added before we recurse deep into folders
+                    files = [item for item in all_items if item.is_file() and not item.name.startswith('.')]
+                    dirs = [item for item in all_items if item.is_dir() and not item.name.startswith('.') and item.name not in SKIP_DIRS]
+                    
+                    # Sort files alphabetically
+                    files.sort(key=lambda p: p.name.lower())
+                    # Sort dirs alphabetically  
+                    dirs.sort(key=lambda p: p.name.lower())
+                    
+                    # Process files FIRST
+                    for child in files:
+                        if entries_left <= 0:
+                            break
+                        child_info = walk(child, current_depth + 1)
+                        if child_info:
+                            children.append(child_info)
+                    
+                    # Then process directories
+                    for child in dirs:
+                        if entries_left <= 0:
+                            break
+                        child_info = walk(child, current_depth + 1)
+                        if child_info:
+                            children.append(child_info)
+                            
+                except PermissionError:
+                    pass
+                    
             entries_left -= 1
             return {
                 "name": node.name,
-                "path": str(node.relative_to(WORKSPACE_ROOT)),
+                "path": str(node.relative_to(WORKSPACE_ROOT)).replace('\\', '/'),
                 "type": "dir",
                 "children": children,
             }
@@ -1865,11 +2259,13 @@ def _build_file_tree(path: Path, depth: int = 6, max_entries: int = 800):
             entries_left -= 1
             return {
                 "name": node.name,
-                "path": str(node.relative_to(WORKSPACE_ROOT)),
+                "path": str(node.relative_to(WORKSPACE_ROOT)).replace('\\', '/'),
                 "type": "file",
             }
 
     return walk(root, 0)
+    print(f"✅ File tree built. Entries remaining: {entries_left}/{max_entries}")
+    return result
 
 @socketio.on('set_workspace_root')
 def set_workspace_root(data):
@@ -1901,8 +2297,8 @@ def handle_list_files(data):
     if not target.exists() or not target.is_dir():
         emit('file_error', {'message': 'Directory not found'})
         return
-    tree = _build_file_tree(target, depth=4, max_entries=400)
-    emit('file_tree', {'tree': [tree] if tree else []})
+    tree = _build_file_tree(target, depth=8, max_entries=2000)
+    emit('file_tree', {'tree': [tree] if tree else [], 'workspaceRoot': str(WORKSPACE_ROOT)})
 
 @socketio.on('read_file')
 def handle_read_file(data):
@@ -1917,11 +2313,22 @@ def handle_read_file(data):
     if not target.exists() or not target.is_file():
         emit('file_error', {'message': 'File not found'})
         return
+    
+    # Check if file is a binary type that Monaco can't edit
+    binary_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', 
+                        '.mp3', '.mp4', '.wav', '.avi', '.mov', '.pdf', '.zip', 
+                        '.tar', '.gz', '.exe', '.dll', '.so', '.dylib', '.bin'}
+    file_ext = target.suffix.lower()
+    
+    if file_ext in binary_extensions:
+        emit('file_error', {'message': f'Cannot open binary file type: {file_ext}. Monaco editor only supports text files.'})
+        return
+        
     try:
         content = target.read_text(encoding='utf-8')
         emit('file_content', {'path': str(path), 'content': content})
     except UnicodeDecodeError:
-        emit('file_error', {'message': 'File is not UTF-8 text'})
+        emit('file_error', {'message': f'File is not UTF-8 text. This file may be binary or use a different encoding.'})
     except Exception as e:
         emit('file_error', {'message': f'Error reading file: {e}'})
 
@@ -2029,60 +2436,411 @@ def handle_parliament_request(data):
       - parliament_update { key, status, payload? }
       - parliament_summary { roles: [{key, name, model, provider, prompt, response}], merged_prompt }
     """
+    print("\n" + "="*80)
+    print("🏛️ PARLIAMENT REQUEST RECEIVED")
+    print("="*80)
+
     try:
         message = data.get('message', '')
         roles = data.get('roles', [])
         session_id = data.get('session_id')
+
+        print(f"📝 Message: {message}")
+        print(f"👥 Roles: {len(roles)} roles configured")
+        for role in roles:
+            print(f"   - {role.get('name')} ({role.get('provider')}/{role.get('model')})")
+
         if not message or not roles:
+            print("⚠️ Missing message or roles, aborting")
             emit('parliament_summary', {'roles': [], 'merged_prompt': ''})
             return
 
         results = []
+        results_lock = threading.Lock()  # Thread safety for results list
 
+        # Stream router map (same as regular chat)
+        streamer_map = {
+            "llama.cpp": stream_llamacpp,
+            "ollama": stream_ollama,
+            "safetensors": stream_safetensors,
+            "api": {
+                "google": stream_google,
+                "openai": stream_openai,
+                "anthropic": stream_anthropic,
+                "meta": stream_meta,
+                "xai": stream_xai,
+                "qwen": stream_qwen,
+                "deepseek": stream_deepseek,
+                "perplexity": stream_perplexity,
+                "openrouter": stream_openrouter
+            }
+        }
+
+        # Define function to process each role in parallel
+        def process_role(role):
+            key = role.get('key')
+            prompt = role.get('prompt', '')
+            model = role.get('model', 'default')
+            provider = role.get('provider', 'cloud')
+            backend = role.get('backend', 'api')
+            name = role.get('name', key)
+
+            try:
+                print(f"🔄 Parliament: Processing {name} ({provider}/{model})...")
+
+                # Build the full prompt for this role - ONLY role prompt + user question, NO HISTORY
+                role_prompt = f"{prompt}\n\nUser request:\n{message}"
+
+                # Get the appropriate streamer function
+                streamer = None
+                if backend == 'api':
+                    streamer = streamer_map.get('api', {}).get(provider)
+                else:
+                    streamer = streamer_map.get(backend)
+
+                if not streamer:
+                    raise ValueError(f"No valid streamer found for backend '{backend}' and provider '{provider}'")
+
+                # Collect the full response (non-streaming for Parliament)
+                # Some providers don't accept timezone parameter
+                providers_with_timezone = ['google', 'openai', 'anthropic', 'deepseek']
+
+                # CRITICAL: Pass None for model_id to skip memory manager initialization
+                # Parliament doesn't need chat history/memories, and parallel loads cause PyTorch errors
+                streamer_args = {
+                    'model_instance': model,
+                    'model_id_str': None,  # None = skip memory context loading
+                    'user_input': role_prompt,
+                    'conversation_history': [],  # Empty - no history for Parliament
+                    'should_stop': lambda: False,
+                    'image_data': None
+                }
+
+                if provider in providers_with_timezone:
+                    streamer_args['timezone'] = 'UTC'
+
+                response_chunks = []
+                for chunk in streamer(**streamer_args):
+                    # Extract text from chunk
+                    if isinstance(chunk, dict):
+                        token = chunk.get('token', '')
+                    else:
+                        token = str(chunk)
+                    response_chunks.append(token)
+
+                response_text = ''.join(response_chunks)
+
+                print(f"✅ Parliament: {name} responded ({len(response_text)} chars)")
+
+                # Assign confidence score based on provider
+                # API models typically have higher confidence than local models
+                confidence = 0.90 if provider.lower() in ['cloud', 'api', 'openai', 'anthropic', 'google', 'xai', 'qwen', 'deepseek', 'perplexity', 'openrouter', 'meta'] else 0.85
+
+                result = {
+                    'key': key,
+                    'name': name,
+                    'model': model,
+                    'provider': provider,
+                    'prompt': prompt,
+                    'response': response_text,
+                    'confidence': confidence,
+                    'status': 'done'
+                }
+
+                return result
+
+            except Exception as e:
+                # Errors get lower confidence
+                error_msg = str(e)
+                print(f"❌ Parliament error for {name} ({provider}/{model}): {error_msg}")
+
+                error_result = {
+                    'key': key,
+                    'name': name,
+                    'model': model,
+                    'provider': provider,
+                    'prompt': prompt,
+                    'response': f"Error: {error_msg}",
+                    'confidence': 0.1,
+                    'status': 'error'
+                }
+
+                return error_result
+
+        # Send "working" status for all roles
         for role in roles:
-          key = role.get('key')
-          prompt = role.get('prompt', '')
-          model = role.get('model', 'default')
-          provider = role.get('provider', 'cloud')
-          name = role.get('name', key)
-          emit('parliament_update', {'key': key, 'status': 'working'})
-          try:
-              # Use orchestrator to fetch a completion for this role
-              role_prompt = f"{prompt}\n\nUser request:\n{message}\n\nReturn JSON only."
-              response_text = orchestrator_module.get_orchestrator_response(
-                  role_prompt,
-                  model_override=model,
-                  provider_override=provider,
-                  stream=False
-              )
-              results.append({
-                  'key': key,
-                  'name': name,
-                  'model': model,
-                  'provider': provider,
-                  'prompt': prompt,
-                  'response': response_text
-              })
-              emit('parliament_update', {'key': key, 'status': 'done', 'payload': response_text})
-          except Exception as e:
-              results.append({
-                  'key': key,
-                  'name': name,
-                  'model': model,
-                  'provider': provider,
-                  'prompt': prompt,
-                  'response': f"Error: {e}"
-              })
-              emit('parliament_update', {'key': key, 'status': 'done', 'payload': f"Error: {e}"})
+            emit('parliament_update', {'key': role.get('key'), 'status': 'working'})
+
+        # Execute all roles in parallel
+        from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
+
+        print(f"\n🏛️ Parliament: Starting parallel execution for {len(roles)} roles...")
+
+        with ThreadPoolExecutor(max_workers=len(roles)) as executor:
+            # Submit all tasks
+            future_to_role = {executor.submit(process_role, role): role for role in roles}
+
+            # Process results as they complete and emit updates
+            # Timeout after 60 seconds per role to prevent hanging
+            for future in as_completed(future_to_role, timeout=60):
+                try:
+                    result = future.result()
+
+                    # Add to results list (thread-safe)
+                    with results_lock:
+                        results.append(result)
+
+                    # Emit update from main thread (works properly here)
+                    emit('parliament_update', {
+                        'key': result['key'],
+                        'status': result['status'],
+                        'payload': result['response']
+                    })
+
+                except Exception as e:
+                    role = future_to_role[future]
+                    print(f"❌ Thread execution error for {role.get('name')}: {e}")
+
+                    # Create error result
+                    error_result = {
+                        'key': role.get('key'),
+                        'name': role.get('name'),
+                        'model': role.get('model'),
+                        'provider': role.get('provider'),
+                        'prompt': role.get('prompt'),
+                        'response': f"Thread error: {e}",
+                        'confidence': 0.1,
+                        'status': 'error'
+                    }
+
+                    with results_lock:
+                        results.append(error_result)
+
+                    emit('parliament_update', {
+                        'key': error_result['key'],
+                        'status': 'error',
+                        'payload': error_result['response']
+                    })
+
+        print(f"✅ Parliament: All {len(results)} responses collected")
+
+        # Perform voting on responses to find consensus
+        vote_result = None
+        if len(results) > 0:
+            try:
+                vote_result = parliament_voter.vote(results)
+                print(f"Parliament voting complete: {vote_result['votes']} votes, {vote_result['total_clusters']} clusters")
+            except Exception as e:
+                print(f"Parliament voting failed: {e}")
+                vote_result = {
+                    'winning_answer': '',
+                    'winning_model': '',
+                    'confidence': 0.0,
+                    'votes': 0,
+                    'total_clusters': 0,
+                    'cluster_details': []
+                }
 
         merged_prompt = build_parliament_prompt(message, results)
-        emit('parliament_summary', {'roles': results, 'merged_prompt': merged_prompt})
+        emit('parliament_summary', {
+            'roles': results,
+            'merged_prompt': merged_prompt,
+            'vote_result': vote_result
+        })
 
         if session_id:
             _save_message_to_db(session_id, {"sender": "Parliament", "message": merged_prompt, "type": "info"})
 
+        # Now send the winning answer to the main model as context for final response
+        if vote_result and vote_result.get('winning_answer'):
+            print(f"\n🏛️ Building consensus context for main model...")
+            print(f"   Winning model: {vote_result['winning_model']}")
+            print(f"   Votes: {vote_result['votes']}/{len(results)}")
+            print(f"   Confidence: {vote_result['confidence']:.2f}")
+
+            consensus_context = f"""Parliament Consensus ({vote_result['votes']}/{len(results)} models agreed):
+{vote_result['winning_answer']}
+
+Original Question: {message}
+
+Please provide your own response to the user's question, informed by the Parliament consensus above."""
+
+            print(f"📤 Emitting parliament_complete event...")
+
+            # Trigger regular chat with the consensus context
+            # This will be handled by emitting a chat event back to trigger normal chat flow
+            emit('parliament_complete', {
+                'consensus_context': consensus_context,
+                'original_message': message,
+                'vote_result': vote_result
+            })
+
+            print(f"✅ Parliament complete event sent!")
+
     except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        print("\n" + "="*80)
+        print("❌ PARLIAMENT ERROR")
+        print("="*80)
+        print(f"Error: {e}")
+        print("\nFull traceback:")
+        print(error_trace)
+        print("="*80)
         emit('parliament_update', {'status': 'error', 'message': str(e)})
+
+
+def _default_usage_window(days: int):
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+    return {
+        "from": start.isoformat() + "Z",
+        "to": now.isoformat() + "Z",
+        "totalCost": 0.0,
+        "totalTokens": 0,
+        "byDay": [],
+        "byModel": [],
+    }
+
+
+@app.route('/api/usage/summary')
+def get_usage_summary():
+    """Return aggregated usage metrics for the given window."""
+    try:
+        days = int(request.args.get('days', 7))
+    except Exception:
+        days = 7
+
+    if usage_events_collection is None:
+        return jsonify(_default_usage_window(days))
+
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+    start_ms = int(start.timestamp() * 1000)
+
+    events = list(usage_events_collection.find({"timestamp": {"$gte": start_ms}}))
+
+    total_cost = 0.0
+    total_tokens = 0
+    by_day_map = {}
+    by_model_map = {}
+
+    for evt in events:
+        tokens = int(evt.get("totalTokens", evt.get("inputTokens", 0) + evt.get("outputTokens", 0)))
+        cost = float(evt.get("estimatedCost", 0) or 0)
+        total_cost += cost
+        total_tokens += tokens
+
+        ts = evt.get("timestamp")
+        if ts:
+            day_key = datetime.utcfromtimestamp(ts / 1000).strftime("%Y-%m-%d")
+            if day_key not in by_day_map:
+                by_day_map[day_key] = {"date": day_key, "totalTokens": 0, "totalCost": 0.0}
+            by_day_map[day_key]["totalTokens"] += tokens
+            by_day_map[day_key]["totalCost"] += cost
+
+        model_key = evt.get("model", "unknown")
+        provider = evt.get("provider", "unknown")
+        key = f"{provider}:{model_key}"
+        if key not in by_model_map:
+            by_model_map[key] = {
+                "model": model_key,
+                "provider": provider,
+                "totalTokens": 0,
+                "totalCost": 0.0,
+                "messages": 0,
+            }
+        by_model_map[key]["totalTokens"] += tokens
+        by_model_map[key]["totalCost"] += cost
+        by_model_map[key]["messages"] += 1
+
+    return jsonify({
+        "from": start.isoformat() + "Z",
+        "to": now.isoformat() + "Z",
+        "totalCost": round(total_cost, 6),
+        "totalTokens": total_tokens,
+        "byDay": sorted(by_day_map.values(), key=lambda x: x["date"]),
+        "byModel": sorted(by_model_map.values(), key=lambda x: x["totalTokens"], reverse=True),
+    })
+
+
+@app.route('/api/usage/model/<path:model_name>')
+def get_usage_for_model(model_name):
+    """Return usage metrics for a specific model."""
+    try:
+        days = int(request.args.get('days', 7))
+    except Exception:
+        days = 7
+
+    normalized_model = normalize_model_name(model_name)
+
+    if usage_events_collection is None:
+        return jsonify({
+            "model": normalized_model,
+            "provider": _detect_provider_from_model(model_name),
+            "days": days,
+            "totalTokens": 0,
+            "totalCost": 0.0,
+            "messages": 0,
+            "avgTokensPerMessage": 0,
+            "avgCostPerMessage": 0.0,
+            "byDay": [],
+        })
+
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+    start_ms = int(start.timestamp() * 1000)
+
+    events = list(usage_events_collection.find({
+        "timestamp": {"$gte": start_ms},
+        "model": normalized_model
+    }))
+
+    total_tokens = 0
+    total_cost = 0.0
+    by_day_map = {}
+
+    for evt in events:
+        tokens = int(evt.get("totalTokens", evt.get("inputTokens", 0) + evt.get("outputTokens", 0)))
+        cost = float(evt.get("estimatedCost", 0) or 0)
+        total_tokens += tokens
+        total_cost += cost
+
+        ts = evt.get("timestamp")
+        if ts:
+            day_key = datetime.utcfromtimestamp(ts / 1000).strftime("%Y-%m-%d")
+            if day_key not in by_day_map:
+                by_day_map[day_key] = {"date": day_key, "totalTokens": 0, "totalCost": 0.0}
+            by_day_map[day_key]["totalTokens"] += tokens
+            by_day_map[day_key]["totalCost"] += cost
+
+    messages = len(events)
+    provider = events[0].get("provider") if events else _detect_provider_from_model(normalized_model)
+    avg_tokens = int(total_tokens / messages) if messages else 0
+    avg_cost = round(total_cost / messages, 6) if messages else 0.0
+
+    return jsonify({
+        "model": normalized_model,
+        "provider": provider,
+        "days": days,
+        "totalTokens": total_tokens,
+        "totalCost": round(total_cost, 6),
+        "messages": messages,
+        "avgTokensPerMessage": avg_tokens,
+        "avgCostPerMessage": avg_cost,
+        "byDay": sorted(by_day_map.values(), key=lambda x: x["date"]),
+    })
+
+
+@app.route('/api/models/pricing/<path:model_name>')
+def get_model_pricing(model_name):
+    """Return pricing info for a given model using backend pricing table."""
+    normalized_model = normalize_model_name(model_name)
+    pricing = MODEL_PRICING.get(normalized_model, MODEL_PRICING.get('default', {}))
+    return jsonify({
+        "model": normalized_model,
+        "pricing": pricing,
+    })
 
 def background_loop():
     logger.info("🔄 Maintenance thread started")

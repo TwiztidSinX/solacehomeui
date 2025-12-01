@@ -1,4 +1,6 @@
 import React, { useState } from "react";
+import { ParliamentVoting } from "./ParliamentVoting";
+import EmbeddedBrowser from "./EmbeddedBrowser";
 
 export type LeftPanelMode =
   | "chats"
@@ -59,6 +61,7 @@ interface LeftPanelProps {
     status: "idle" | "working" | "done";
   }>;
   parliamentRoleOutputs?: Array<any>;
+  parliamentVoteResult?: any;
   onUpdateRole?: (key: string, updates: ParliamentMemberUpdate) => void;
   debugMode?: boolean;
 
@@ -78,10 +81,11 @@ const LeftPanel: React.FC<LeftPanelProps> = ({
   onRenameChat,
   searchResults = [],
   searchQuery = "",
-  onSearchResultClick,
-  onSearchResultPreview,
+  onSearchResultClick: _onSearchResultClick,
+  onSearchResultPreview: _onSearchResultPreview,
   parliamentRoles = [],
   parliamentRoleOutputs = [],
+  parliamentVoteResult,
   onUpdateRole,
   browserUrl,
   debugMode = false,
@@ -178,7 +182,7 @@ const LeftPanel: React.FC<LeftPanelProps> = ({
                           }}
                           className="opacity-0 group-hover:opacity-100 ml-1"
                         >
-                          ✏️
+                          Rename
                         </button>
                         <button
                           onClick={(e) => {
@@ -198,67 +202,123 @@ const LeftPanel: React.FC<LeftPanelProps> = ({
           </>
         );
 
-      case "search":
+      case "search": {
+        const searchUrl = searchQuery
+          ? `http://localhost:8088/?q=${encodeURIComponent(searchQuery)}`
+          : "";
+        const hasResults = searchResults.length > 0;
         return (
-          <div className="flex-grow overflow-y-auto">
-            {searchQuery && (
-              <div className="mb-4 p-3 bg-blue-500/20 rounded-lg">
-                <p className="text-sm text-gray-300">Search query:</p>
-                <p className="text-white font-semibold">{searchQuery}</p>
-              </div>
-            )}
-
-            {searchResults.length > 0 ? (
-              <div className="space-y-3">
-                {searchResults.map((result, index) => (
+          <div className="flex-grow flex flex-col h-full space-y-3">
+            {hasResults ? (
+              <div className="flex-grow overflow-y-auto space-y-2">
+                {searchResults.map((result, idx) => (
                   <div
-                    key={index}
-                    className="p-3 bg-white/10 hover:bg-white/20 rounded-lg transition-colors"
+                    key={`${result.url}-${idx}`}
+                    className="p-3 bg-white/10 rounded-lg space-y-1"
                   >
-                    <h3
-                      className="text-white font-semibold mb-1 line-clamp-2 cursor-pointer"
-                      onClick={() =>
-                        onSearchResultPreview &&
-                        onSearchResultPreview(result.url)
-                      }
-                    >
-                      {result.title}
-                    </h3>
-                    <p className="text-blue-400 text-xs mb-2 truncate">
-                      {result.url}
-                    </p>
-                    <p className="text-gray-300 text-sm line-clamp-3">
-                      {result.snippet}
-                    </p>
-                    <div className="mt-2 flex gap-2">
-                      <button
-                        onClick={() =>
-                          onSearchResultPreview &&
-                          onSearchResultPreview(result.url)
-                        }
-                        className="px-2 py-1 text-xs rounded bg-blue-500/80 hover:bg-blue-600 text-white"
-                      >
-                        Preview
-                      </button>
-                      {onSearchResultClick && (
-                        <button
-                          onClick={() => onSearchResultClick(result.url)}
-                          className="px-2 py-1 text-xs rounded bg-gray-600 hover:bg-gray-500 text-white"
-                        >
-                          Open
-                        </button>
-                      )}
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <p className="text-white font-semibold text-sm truncate">
+                          {result.title || "Untitled result"}
+                        </p>
+                        <p className="text-blue-300 text-xs truncate">
+                          {result.url || "No URL"}
+                        </p>
+                      </div>
+                      <div className="flex gap-1 shrink-0">
+                        {_onSearchResultPreview && result.url && (
+                          <button
+                            onClick={() => _onSearchResultPreview(result.url)}
+                            className="px-2 py-1 text-xs rounded bg-gray-700 hover:bg-gray-600 text-white"
+                          >
+                            Preview
+                          </button>
+                        )}
+                        {_onSearchResultClick && result.url && (
+                          <button
+                            onClick={() => _onSearchResultClick(result.url)}
+                            className="px-2 py-1 text-xs rounded bg-blue-500 hover:bg-blue-600 text-white"
+                          >
+                            Open
+                          </button>
+                        )}
+                      </div>
                     </div>
+                    <p className="text-gray-300 text-sm line-clamp-3">
+                      {result.snippet || "No description available."}
+                    </p>
                   </div>
                 ))}
               </div>
+            ) : searchUrl ? (
+              <iframe
+                title="Search Results"
+                src={searchUrl}
+                className="w-full h-full border-0"
+                sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+              />
             ) : (
               <div className="flex items-center justify-center h-full text-gray-400">
-                <p>No search results</p>
+                <p>No search query</p>
               </div>
             )}
           </div>
         );
+      }
+
+      case "browser": {
+        const proxyUrl = browserUrl
+          ? `http://localhost:8001/proxy?url=${encodeURIComponent(browserUrl)}`
+          : null;
+        const isTauri =
+          typeof window !== "undefined" &&
+          Boolean(
+            (window as any).__TAURI__ ||
+              (window as any).__TAURI_IPC__ ||
+              (window as any).__TAURI_METADATA__ ||
+              (window as any).__TAURI_INTERNALS__ ||
+              (navigator.userAgent || "").toLowerCase().includes("tauri"),
+          );
+
+        return (
+          <div className="w-full h-full flex flex-col">
+            {!browserUrl && (
+              <div className="w-full h-full flex flex-col items-center justify-center text-gray-400 space-y-2">
+                <p>No page loaded</p>
+                <p className="text-sm">Use /browser &lt;url&gt; to browse</p>
+                <p className="text-xs text-gray-500 mt-4">
+                  Agentic browsing enabled - Solace can interact with pages
+                </p>
+              </div>
+            )}
+
+            {browserUrl && (
+              <div className="w-full h-full flex flex-col">
+                <div className="bg-blue-500/20 px-3 py-1 text-xs text-gray-300 flex items-center justify-between">
+                  <span>Target: {browserUrl}</span>
+                  <span className="text-green-400">
+                    {isTauri ? "WebView (agentic)" : "Proxy fallback"}
+                  </span>
+                </div>
+                {isTauri ? (
+                  <div className="flex-1">
+                    <EmbeddedBrowser url={browserUrl} label="solace-browser" />
+                  </div>
+                ) : (
+                  proxyUrl && (
+                    <iframe
+                      title="Web Browser"
+                      src={proxyUrl}
+                      className="w-full flex-1 border-0"
+                      sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox"
+                    />
+                  )
+                )}
+              </div>
+            )}
+          </div>
+        );
+      }
 
       case "parliament":
         return (
@@ -270,6 +330,11 @@ const LeftPanel: React.FC<LeftPanelProps> = ({
                 expectations.
               </p>
             </div>
+
+            {/* Voting Results */}
+            <ParliamentVoting voteResult={parliamentVoteResult} />
+
+            {/* Role Configuration */}
             <div className="space-y-2">
               {parliamentRoles.map((role) => (
                 <div
@@ -323,13 +388,13 @@ const LeftPanel: React.FC<LeftPanelProps> = ({
                     </div>
                     <div className="text-sm">
                       {role.status === "working" && (
-                        <span className="text-blue-400">● Working</span>
+                        <span className="text-blue-400">Working</span>
                       )}
                       {role.status === "done" && (
-                        <span className="text-green-400">● Done</span>
+                        <span className="text-green-400">Done</span>
                       )}
                       {role.status === "idle" && (
-                        <span className="text-gray-400">● Idle</span>
+                        <span className="text-gray-400">Idle</span>
                       )}
                     </div>
                   </div>
@@ -366,7 +431,7 @@ const LeftPanel: React.FC<LeftPanelProps> = ({
                       </p>
                       <pre className="whitespace-pre-wrap text-gray-300 max-h-32 overflow-auto">
                         {parliamentRoleOutputs.find((o) => o.key === role.key)
-                          ?.response || "—"}
+                          ?.response || "No response yet"}
                       </pre>
                       <div className="flex justify-end mt-1">
                         <button
@@ -398,62 +463,36 @@ const LeftPanel: React.FC<LeftPanelProps> = ({
     return null;
   }
 
-  if (mode === "browser") {
-    return (
-      <div
-        className="h-full bg-gray-800/90 backdrop-blur-sm flex flex-col panel-surface"
-        style={panelWidth ? { width: panelWidth } : { width: 360 }}
-      >
-        <div className="flex items-center justify-between p-4 border-b border-white/10">
-          <h2 className="text-lg font-semibold text-white">
-            {getPanelTitle()}
-          </h2>
-          {onClose && (
-            <button
-              onClick={onClose}
-              className="p-2 rounded-md hover:bg-white/20 text-white text-xl leading-none"
-            >
-              &times;
-            </button>
-          )}
-        </div>
-        <div className="flex-1 min-h-0 bg-black/60">
-          {browserUrl ? (
-            <iframe
-              title="Web view"
-              src={browserUrl}
-              className="w-full h-full border-0"
-              sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
-            />
-          ) : (
-            <div className="w-full h-full flex items-center justify-center text-gray-400">
-              <p>No page loaded</p>
-            </div>
-          )}
-        </div>
-      </div>
-    );
-  }
+  const panelTitle = getPanelTitle();
+  const content = renderContent();
 
   return (
     <div
-      className={`h-full bg-gray-800/80 backdrop-blur-sm p-4 flex flex-col transition-transform duration-300 translate-x-0 panel-surface`}
+      className="w-full h-full flex flex-col bg-transparent"
       style={panelWidth ? { width: panelWidth } : undefined}
     >
-      <div className="flex items-center justify-between mb-4">
-        <h2 className="text-lg font-semibold text-white">{getPanelTitle()}</h2>
-        {onClose && mode !== "chats" && (
-          <button
-            onClick={onClose}
-            className="p-2 rounded-md hover:bg-white/20 text-white text-xl leading-none"
-          >
-            &times;
-          </button>
-        )}
-      </div>
-      {renderContent()}
+      {(panelTitle || onClose) && (
+        <div className="flex items-center justify-between mb-3">
+          {panelTitle && (
+            <span className="text-sm font-semibold text-white">
+              {panelTitle}
+            </span>
+          )}
+          {onClose && (
+            <button
+              onClick={onClose}
+              className="text-xs text-gray-300 hover:text-white px-2 py-1 rounded hover:bg-white/10 transition-colors"
+            >
+              Close
+            </button>
+          )}
+        </div>
+      )}
+      {content}
     </div>
   );
 };
 
 export default LeftPanel;
+
+

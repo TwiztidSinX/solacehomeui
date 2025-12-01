@@ -4,6 +4,7 @@ import ToolSettings from './ToolSettings';
 import TtsPanel from './TtsPanel';
 import SttPanel from './SttPanel';
 import NovaCustomizations from './NovaCustomizations'; // Import the new component
+import ModelUsagePreview from './ModelUsagePreview';
 declare global {
   interface Window {
     socket: any;
@@ -530,6 +531,13 @@ const SettingsPanel: React.FC<SettingsPanelProps> = (props) => {
                 ))}
               </select>
             </div>
+
+            <ModelUsagePreview
+              modelName={selectedModel}
+              days={7}
+              contextTokens={modelConfigOptions?.context_tokens}
+              providerHint={currentBackend === 'api' ? apiProvider : currentBackend}
+            />
 
             <div id="model-config-options">{renderBackendOptions()}</div>
 

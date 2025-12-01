@@ -28,6 +28,7 @@ interface RightPanelProps {
   // YouTube mode props
   youtubeVideoId?: string;
   youtubeUrl?: string;
+  onPopOutVideo?: (videoId: string) => void;
 
   // Code editor mode props
   codeContent?: string;
@@ -35,6 +36,7 @@ interface RightPanelProps {
   onCodeChange?: (code: string) => void;
   onCodeLanguageChange?: (language: string) => void;
   fileTree?: FileNode[];
+  workspaceRoot?: string;
   onRefreshFileTree?: () => void;
   onOpenFileFromTree?: (path: string) => void;
   openFiles?: OpenFile[];
@@ -78,18 +80,20 @@ interface RightPanelProps {
 const RightPanel: React.FC<RightPanelProps> = ({
   mode,
   onClose,
-  panelWidth,
+  panelWidth: _panelWidth,
   socket,
   isHandsFreeMode = false,
   onHandsFreeModeChange,
   onVisualizerReady,
   youtubeVideoId,
   youtubeUrl,
+  onPopOutVideo,
   codeContent = "",
   codeLanguage = "javascript",
   onCodeChange,
   onCodeLanguageChange,
   fileTree = [],
+  workspaceRoot: _workspaceRoot = '',
   onRefreshFileTree,
   onOpenFileFromTree,
   openFiles = [],
@@ -362,23 +366,6 @@ const RightPanel: React.FC<RightPanelProps> = ({
     }
   };
 
-  const getPanelTitle = () => {
-    switch (mode) {
-      case "voice":
-        return "Voice Mode";
-      case "youtube":
-        return "YouTube Player";
-      case "code":
-        return "Code Editor";
-      case "media":
-        return "Media Browser";
-      case "tools":
-        return "Tools";
-      default:
-        return "";
-    }
-  };
-
   const getYoutubeEmbedUrl = () => {
     if (youtubeVideoId) {
       return `https://www.youtube.com/embed/${youtubeVideoId}`;
@@ -466,8 +453,25 @@ const RightPanel: React.FC<RightPanelProps> = ({
 
       case "youtube":
         const embedUrl = getYoutubeEmbedUrl();
+        // Extract video ID for pop-out
+        let extractedVideoId = youtubeVideoId;
+        if (!extractedVideoId && youtubeUrl) {
+          const match = youtubeUrl.match(/(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/);
+          extractedVideoId = match ? match[1] : '';
+        }
         return (
           <div className="flex-grow flex flex-col">
+            {embedUrl && extractedVideoId && onPopOutVideo && (
+              <div className="mb-2 flex justify-end">
+                <button
+                  onClick={() => onPopOutVideo(extractedVideoId)}
+                  className="px-3 py-1 text-xs rounded bg-purple-600 hover:bg-purple-700 text-white transition-colors flex items-center gap-1"
+                  title="Open in floating mini-player"
+                >
+                  <span>⬈</span> Pop Out
+                </button>
+              </div>
+            )}
             {embedUrl ? (
               <iframe
                 src={embedUrl}
@@ -832,22 +836,9 @@ const RightPanel: React.FC<RightPanelProps> = ({
 
   return (
     <div
-      className={`flex-shrink-0 h-full bg-gray-800/80 backdrop-blur-sm p-4 flex flex-col transform transition-transform duration-300 ease-in-out z-20 translate-x-0 panel-surface`}
-      style={
-        panelWidth
-          ? { width: panelWidth }
-          : { width: mode === "code" ? 950 : 384 }
-      }
+      className="w-full h-full bg-gray-800/80 backdrop-blur-sm flex flex-col panel-surface"
+      style={{ padding: 0 }}
     >
-      <div className="flex items-center justify-between mb-4">
-        <h2 className="text-xl font-bold text-white">{getPanelTitle()}</h2>
-        <button
-          onClick={onClose}
-          className="p-2 rounded-md hover:bg-white/20 text-white text-2xl leading-none"
-        >
-          &times;
-        </button>
-      </div>
       {renderContent()}
     </div>
   );

@@ -51,8 +51,14 @@ const FileBrowser: React.FC<FileBrowserProps> = ({
 
   React.useEffect(() => {
     if (sortedTree.length > 0) {
-      const rootPath = sortedTree[0].path;
-      setExpanded((prev) => ({ ...prev, [rootPath]: true }));
+      // Auto-expand ALL root-level directories
+      const newExpanded: Record<string, boolean> = {};
+      sortedTree.forEach((node) => {
+        if (node.type === "dir") {
+          newExpanded[node.path] = true;
+        }
+      });
+      setExpanded((prev) => ({ ...prev, ...newExpanded }));
     }
   }, [sortedTree]);
 

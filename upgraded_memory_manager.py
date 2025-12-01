@@ -17,6 +17,9 @@ import logging
 # Set up logging
 logger = logging.getLogger(__name__)
 
+# Configurable memory score threshold
+MEMORY_SCORE_THRESHOLD = float(os.getenv("MEMORY_SCORE_THRESHOLD", "25"))
+
 # --- Emotion Analysis ---
 vader = SentimentIntensityAnalyzer()
 
@@ -219,11 +222,9 @@ class Memory:
                 self.reinforce_memory(similar_memory['_id'], new_content=content)
                 return str(similar_memory['_id'])
 
-            # Compute importance score (0-100) and only store if high enough
+            # Compute importance score (0-100) for metadata and visibility
             importance_score = self._calculate_memory_score(content)
-            if importance_score < 50.0:
-                logger.info(f"Memory importance below threshold (score={importance_score}), not storing.")
-                return None
+            logger.debug(f"Memory importance score: {importance_score}")
 
             embedding = self.model.encode([content])[0]
             emotion = analyze_emotion(content)
@@ -271,7 +272,7 @@ class Memory:
             logger.error(f"Memory storage failed: {str(e)}")
             return None
 
-    def recall(self, query, limit=5, model_id=None, min_score=20, include_emotional_context=False):
+    def recall(self, query, limit=5, model_id=None, min_score=MEMORY_SCORE_THRESHOLD, include_emotional_context=False):
         """Recalls memories based on a query, optionally filtered by model_id."""
         if not self.index:
             logger.warning("No FAISS index available for recall")
@@ -279,14 +280,17 @@ class Memory:
 
         try:
             # Build filter query
-            filter_query = {"score": {"$gte": min_score}}
+            filter_query = {}
+            if min_score is not None:
+                # Use importance (0-100) instead of dynamic score so fresh memories are eligible
+                filter_query["importance"] = {"$gte": min_score}
             if model_id:
                 filter_query["metadata.model_id"] = model_id
             
             # Get all memories matching the filter
             memories = list(self.collection.find(filter_query))
             if not memories:
-                logger.debug(f"No memories found for query: {query}")
+                logger.debug(f"No memories found for query '{query}' with filter {filter_query}")
                 return []
 
             # Extract embeddings and prepare for similarity search
@@ -299,7 +303,7 @@ class Memory:
                     valid_memories.append(mem)
             
             if not memory_embeddings:
-                logger.debug("No valid embeddings found in memories")
+                logger.debug("No valid embeddings found in filtered memories")
                 return []
                 
             embeddings_array = np.array(memory_embeddings).astype('float32')
@@ -314,6 +318,7 @@ class Memory:
             
             # Get the most relevant memories
             recalled_memories = [valid_memories[i] for i in indices[0]]
+            logger.debug(f"Recall query '{query}' -> {len(recalled_memories)}/{len(valid_memories)} memories after similarity search")
             
             # Add emotional context if requested
             if include_emotional_context:
@@ -381,7 +386,7 @@ class Memory:
             
         return f"{intensity_desc} {descriptors[0]}".strip()
 
-    def get_memories_for_prompt(self, query, model_id=None, limit=5, min_score=20):
+    def get_memories_for_prompt(self, query, model_id=None, limit=5, min_score=MEMORY_SCORE_THRESHOLD):
         """Get formatted memories for inclusion in AI prompts."""
         memories = self.recall(query, limit=limit, model_id=model_id, min_score=min_score, include_emotional_context=True)
         
@@ -408,7 +413,8 @@ class Memory:
         try:
             score = 0.0
             word_count = len(content.split())
-            score += min(word_count * 0.5, 10)
+            # Reward longer, more detailed facts a bit more
+            score += min(word_count * 1.0, 20)
 
             emotion = analyze_emotion(content)
             if emotion["vader_mood"] in ["happy", "excited"]:
@@ -419,7 +425,9 @@ class Memory:
             patterns = {
                 r'\b(important|remember|note that)\b': 20,
                 r'\b(my goal is|i want to|i need to)\b': 15,
-                r'\b(i love|i hate|i enjoy)\b': 25,
+                r'\b(i\s+love|i\s+really\s+love|i\s+enjoy|i\s+like)\b': 30,
+                r'\b(love|loves|enjoy|enjoys|like|likes|favorite|favourite|prefer|prefers|passionate about)\b': 25,
+                r'\b(working on|building|debugging|using|learning)\b': 10,
                 r'!+$': 5,
                 r'\?+$': -5,
             }
@@ -504,9 +512,17 @@ class Memory:
             return False
 
     def extract_facts(self, text: str):
-        """Extracts facts from a given text."""
-        text = re.sub(r"[\n]+", " ", text)
-        return [s.strip() for s in re.split(r'[.?!;]\s+', text) if len(s.strip().split()) >= 5]
+        """Extract meaningful sentence-level facts from text."""
+        # Normalize whitespace
+        text = re.sub(r"\s+", " ", text).strip()
+
+        # Split only on proper sentence boundaries: . ? !
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+
+        # Keep only sentences with 5+ words (avoid fragments)
+        facts = [s.strip() for s in sentences if len(s.strip().split()) >= 5]
+
+        return facts
 
     def learn_from_text(self, text: str, source: str, model_id=None, force: bool = False, user_id: str = "default_user"):
         """Learns from a given text by extracting facts and remembering them. Also updates ToM profile if source is user."""
@@ -526,11 +542,19 @@ class Memory:
 
         for fact in facts:
             score = self._calculate_memory_score(fact)
-            if force or score >= 60:
-                if self.add_memory(fact, source=source, model_id=model_id):
-                    remembered_count += 1
+            logger.info(f" Fact: {fact[:80]}... | Score: {score:.1f} | Threshold: {MEMORY_SCORE_THRESHOLD}")
 
-        logger.info(f"📚 Learned {remembered_count} facts from text of length {len(text)} | Emotion: {emotion_data.get('vader_mood', 'unknown')}")
+            if force or score >= MEMORY_SCORE_THRESHOLD:
+                result = self.add_memory(fact, source=source, model_id=model_id)
+                if result:
+                    remembered_count += 1
+                    logger.info(f"   ✅ STORED (ID: {result})")
+                else:
+                    logger.warning(f"   ❌ REJECTED by add_memory (possible duplicate)")
+            else:
+                logger.info(f"   ⚠️ BELOW THRESHOLD (needs {MEMORY_SCORE_THRESHOLD - score:.1f} more points)")
+
+        logger.info(f"📚 Learned {remembered_count}/{len(facts)} facts from text | Emotion: {emotion_data.get('vader_mood', 'unknown')}")
         return remembered_count
 
     def summarize_memories(self, topic: str, model_instance, model_id="summary") -> str:
@@ -1093,6 +1117,10 @@ def get_context_for_model(query: str, model_id: str, user_id: str = "default_use
     """
     Gets comprehensive context for a model including memories, beliefs, user profile, and CURRENT emotion.
     """
+    # Skip memory context if model_id is None (used for Parliament to avoid parallel loading issues)
+    if model_id is None:
+        return ""
+
     db = setup_mongodb()
     if db is None:
         return ""

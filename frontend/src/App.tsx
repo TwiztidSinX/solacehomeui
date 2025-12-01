@@ -1,7 +1,7 @@
-import React, { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import io from "socket.io-client";
-import LeftPanel, { type LeftPanelMode } from "./components/LeftPanel";
-import RightPanel, { type RightPanelMode } from "./components/RightPanel";
+import LeftPanel from "./components/LeftPanel";
+import RightPanel from "./components/RightPanel";
 import ChatView from "./components/ChatView";
 import MessageInput from "./components/MessageInput";
 import SettingsPanel from "./components/SettingsPanel";
@@ -9,96 +9,26 @@ import MemoryGraph from "./components/MemoryGraph";
 import { type Message } from "./types";
 import { VoiceVisualizer } from "./VoiceVisualizer";
 import ImageGenerator from "./components/ImageGenerator";
+import AgentCodingPanel from "./components/AgentCodingPanel";
+import { PanelManager } from "./components/PanelManager";
+import { Toolbar } from "./components/Toolbar";
+import { CommandPalette } from "./components/CommandPalette";
+import { MiniPlayer } from "./components/MiniPlayer";
 import toast, { Toaster } from "react-hot-toast";
-import { type FileNode, type OpenFile } from "./types/files";
-
-type ProviderType = "local" | "cloud";
-
-interface ParliamentRoleConfig {
-  key: string;
-  name: string;
-  defaultModel: string;
-  provider: ProviderType;
-  model: string;
-  prompt: string;
-  enabled: boolean;
-  status: "idle" | "working" | "done";
-}
-
-const PARLIAMENT_ROLES: ParliamentRoleConfig[] = [
-  {
-    key: "analyst",
-    name: "Analyst - GPT-5.1",
-    defaultModel: "gpt-5.1",
-    provider: "cloud",
-    model: "gpt-5.1",
-    enabled: true,
-    status: "idle",
-    prompt: `You are the Analyst. Deliver crisp analysis of the user's request.
-Return JSON: {"analysis":"","strengths":"","weaknesses":"","proposal":"","confidence":0-100}. Stay concise.`,
-  },
-  {
-    key: "researcher",
-    name: "Researcher - DeepSeek",
-    defaultModel: "deepseek-chat",
-    provider: "cloud",
-    model: "deepseek-chat",
-    enabled: true,
-    status: "idle",
-    prompt: `You are the Researcher. Validate facts and surface missing info.
-Return JSON: {"analysis":"","strengths":"","weaknesses":"","proposal":"","confidence":0-100}. Cite sources when possible.`,
-  },
-  {
-    key: "specialist",
-    name: "Specialist - Qwen3-Max",
-    defaultModel: "qwen3-max",
-    provider: "cloud",
-    model: "qwen3-max",
-    enabled: true,
-    status: "idle",
-    prompt: `You are the Specialist. Provide technical depth and edge cases.
-Return JSON: {"analysis":"","strengths":"","weaknesses":"","proposal":"","confidence":0-100}.`,
-  },
-  {
-    key: "philosopher",
-    name: "Philosopher - Claude Sonnet 4.5",
-    defaultModel: "claude-sonnet-4.5",
-    provider: "cloud",
-    model: "claude-sonnet-4.5",
-    enabled: false,
-    status: "idle",
-    prompt: `You are the Philosopher. Clarify principles, ethics, and ambiguity.
-Return JSON: {"analysis":"","strengths":"","weaknesses":"","proposal":"","confidence":0-100}.`,
-  },
-  {
-    key: "synthesizer",
-    name: "Synthesizer - Gemini 3.0",
-    defaultModel: "gemini-3.0",
-    provider: "cloud",
-    model: "gemini-3.0",
-    enabled: false,
-    status: "idle",
-    prompt: `You are the Synthesizer. Combine insights and recommend a plan.
-Return JSON: {"analysis":"","strengths":"","weaknesses":"","proposal":"","confidence":0-100}.`,
-  },
-  {
-    key: "maverick",
-    name: "Maverick - Grok 4.1",
-    defaultModel: "grok-4.1",
-    provider: "cloud",
-    model: "grok-4.1",
-    enabled: false,
-    status: "idle",
-    prompt: `You are the Maverick. Offer bold alternatives and risks.
-Return JSON: {"analysis":"","strengths":"","weaknesses":"","proposal":"","confidence":0-100}.`,
-  },
-];
-// Type definitions
-interface ChatSession {
-  _id: string;
-  name: string;
-  messages: Message[];
-}
+import {
+  PARLIAMENT_ROLES,
+  type ChatSession,
+  type ParliamentRoleConfig,
+} from "./constants/parliament";
+import { detectProviderFromModel } from "./utils/models";
+import { detectLanguageFromPath } from "./utils/fileUtils";
+import usePanels from "./hooks/usePanels";
+import useTheme from "./hooks/useTheme";
+import useCodePanel from "./hooks/useCodePanel";
+import useTools from "./hooks/useTools";
+import { type FileNode } from "./types/files";
+import UsagePanel from "./components/UsagePanel";
+import { invoke } from "@tauri-apps/api/core";
 interface ModelConfig {
   [key: string]: any;
 }
@@ -107,64 +37,16 @@ interface GraphData {
   edges: any[];
 }
 
-const detectProviderFromModel = (
-  model: string,
-  fallback: ProviderType | string = "cloud",
-) => {
-  const m = (model || "").toLowerCase();
-  if (fallback !== "cloud" && fallback !== "local") return fallback as string;
-  if (m.includes("deepseek")) return "deepseek";
-  if (m.includes("qwen")) return "qwen";
-  if (m.includes("gpt") || m.includes("openai")) return "openai";
-  if (m.includes("claude") || m.includes("anthropic")) return "anthropic";
-  if (m.includes("gemini")) return "google";
-  return fallback as string;
-};
-
 const App: React.FC = () => {
-  // UI State - New Panel System
-  const [activeTab, setActiveTab] = useState("chat");
-  const [leftPanelMode, setLeftPanelMode] = useState<LeftPanelMode>("chats");
-  const [rightPanelMode, setRightPanelMode] =
-    useState<RightPanelMode>("closed");
-  const [leftPanelWidth, setLeftPanelWidth] = useState(280);
-  const [rightPanelWidth, setRightPanelWidth] = useState(384);
-  const [isResizingLeft, setIsResizingLeft] = useState(false);
-  const [isResizingRight, setIsResizingRight] = useState(false);
-
-  // Panel-specific state
-  const [searchResults, setSearchResults] = useState<any[]>([]);
-  const [searchQuery, setSearchQuery] = useState("");
-  const [browserUrl, setBrowserUrl] = useState("");
-  const [youtubeVideoId, setYoutubeVideoId] = useState("");
-  const [youtubeUrl, setYoutubeUrl] = useState("");
-  const [codeContent, setCodeContent] = useState("");
-  const [codeLanguage, setCodeLanguage] = useState("javascript");
-  const [fileTree, setFileTree] = useState<FileNode[]>([]);
-  const [workspaceRoot, setWorkspaceRoot] = useState<string>('');
-  const [isLoadingFileTree, setIsLoadingFileTree] = useState(false);
-  const [openFiles, setOpenFiles] = useState<OpenFile[]>([]);
-  const [activeFilePath, setActiveFilePath] = useState<string | null>(null);
-  const [parliamentRoles, setParliamentRoles] =
-    useState<ParliamentRoleConfig[]>(PARLIAMENT_ROLES);
-  const [parliamentRoleOutputs, setParliamentRoleOutputs] = useState<any[]>([]);
-  const [toolQuery, setToolQuery] = useState("");
-  const [toolResults, setToolResults] = useState<
-    Array<{ title: string; url: string; snippet: string }>
-  >([]);
-  const [toolLoading, setToolLoading] = useState(false);
-  const [toolError, setToolError] = useState<string | null>(null);
-  const [toolList, setToolList] = useState<
-    Array<{ name: string; description?: string }>
-  >([]);
-  const [selectedTool, setSelectedTool] = useState("");
-  const [toolArgsText, setToolArgsText] = useState("{}");
-  const [toolCallResult, setToolCallResult] = useState<string | null>(null);
-  const [toolParamsByName, setToolParamsByName] = useState<Record<string, any>>(
-    {},
-  );
-
-  // Socket and Timeout Refs
+  const {
+    activeTab,
+    setActiveTab,
+    leftPanelMode,
+    setLeftPanelMode,
+    rightPanelMode,
+    setRightPanelMode,
+  } = usePanels();
+  const { theme, handleThemeChange } = useTheme();
   const socketRef = useRef<any>(null);
   const streamingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const inThinkingMode = useRef(false);
@@ -174,12 +56,85 @@ const App: React.FC = () => {
   const isPlayingAudioRef = useRef(false); // Flag to prevent concurrent playback
   const lastParliamentUserMessage = useRef<string | null>(null);
 
+  const [
+    {
+      codeContent,
+      codeLanguage,
+      fileTree,
+      workspaceRoot,
+      isLoadingFileTree,
+      openFiles,
+      activeFilePath,
+    },
+    {
+      requestFileTree,
+      handleFileContent,
+      openFileFromTree,
+      closeOpenFile,
+      saveActiveFile,
+      selectOpenFile,
+      handleCodeEditorChange,
+      createFile,
+      createFolder,
+      renamePath,
+      deletePath,
+      requestWorkspaceChange,
+      openLocalFile,
+      setWorkspaceRoot,
+      setFileTree,
+      setIsLoadingFileTree,
+      setCodeContent,
+      setCodeLanguage,
+    },
+  ] = useCodePanel(socketRef);
+
+  const {
+    toolQuery,
+    setToolQuery,
+    toolResults,
+    toolLoading,
+    toolError,
+    toolList,
+    selectedTool,
+    setSelectedTool,
+    toolArgsText,
+    setToolArgsText,
+    toolCallResult,
+    runToolSearch,
+    fetchToolList,
+    runToolCall,
+  } = useTools();
+
+  const [searchResults, setSearchResults] = useState<any[]>([]);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [browserUrl, setBrowserUrl] = useState("");
+  const [youtubeVideoId, setYoutubeVideoId] = useState("");
+  const [youtubeUrl, setYoutubeUrl] = useState("");
+  const [miniPlayerVideoId, setMiniPlayerVideoId] = useState("");
+  const [parliamentRoles, setParliamentRoles] =
+    useState<ParliamentRoleConfig[]>(PARLIAMENT_ROLES);
+  const [parliamentRoleOutputs, setParliamentRoleOutputs] = useState<any[]>([]);
+  const [parliamentVoteResult, setParliamentVoteResult] = useState<any>(null);
+  const [parliamentExpanded, setParliamentExpanded] = useState<
+    Record<string, boolean>
+  >({});
+  const [parliamentPanelCollapsed, setParliamentPanelCollapsed] =
+    useState<boolean>(false);
+  const [showUsagePanel, setShowUsagePanel] = useState(false);
+  const [activePanels, setActivePanels] = useState(["chat", "chats", "code"]);
+  const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
+  const leftPanelIds = ["chats", "browser", "search", "parliament"];
+
   // Chat State
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const [imageToSend, setImageToSend] = useState<string | null>(null);
+  const [imageMimeToSend, setImageMimeToSend] = useState<string>("image/png");
+  const [pendingAttachments, setPendingAttachments] = useState<
+    { name: string; content: string }[]
+  >([]);
   const [isAgentMode, setIsAgentMode] = useState<boolean>(false);
   const [messageInputText, setMessageInputText] = useState(""); // New state for the input
   const [isHandsFreeMode, setIsHandsFreeMode] = useState(false); // State for speech-to-speech
@@ -231,51 +186,39 @@ const App: React.FC = () => {
     model: "",
   });
   const [debugMode, setDebugMode] = useState(false);
-  const [theme, setTheme] = useState({
-    primaryColor: "#4a90e2",
-    backgroundColor: "#1a1a2e",
-    chatBackgroundColor: "#22223b",
-    chatInputBackgroundColor: "#333355",
-    userMessageColor: "#4a236b",
-    aiMessageColor: "#333355",
-    textColor: "#e0e0e0",
-  });
-
-  const handleThemeChange = (property: string, value: string) => {
-    setTheme((prevTheme) => ({ ...prevTheme, [property]: value }));
-  };
-
-  const detectLanguageFromPath = (path: string) => {
-    const ext = path.split(".").pop()?.toLowerCase();
-    switch (ext) {
-      case "ts":
-      case "tsx":
-        return "typescript";
-      case "js":
-      case "jsx":
-        return "javascript";
-      case "py":
-        return "python";
-      case "html":
-        return "html";
-      case "css":
-        return "css";
-      case "json":
-        return "json";
-      case "md":
-        return "markdown";
-      case "sql":
-        return "sql";
-      case "sh":
-      case "bash":
-        return "shell";
-      default:
-        return "plaintext";
-    }
-  };
+  const triggerBrowserSync = useCallback(() => {
+    window.dispatchEvent(new CustomEvent("solace-browser-sync"));
+  }, []);
 
   const handleNovaSettingsChange = (settings: any) => {
     setNovaSettings(settings);
+  };
+
+  const isTauriEnv =
+    typeof window !== "undefined" &&
+    Boolean(
+      (window as any).__TAURI__ ||
+        (window as any).__TAURI_IPC__ ||
+        (window as any).__TAURI_METADATA__ ||
+        (window as any).__TAURI_INTERNALS__ ||
+        (navigator.userAgent || "").toLowerCase().includes("tauri"),
+    );
+
+  const toggleParliamentRole = (key: string) => {
+    setParliamentExpanded((prev) => ({
+      ...prev,
+      [key]: !prev[key],
+    }));
+  };
+
+  const formatParliamentPayload = (payload: string) => {
+    if (!payload) return "";
+    try {
+      const parsed = JSON.parse(payload);
+      return JSON.stringify(parsed, null, 2);
+    } catch {
+      return payload;
+    }
   };
 
   const updateParliamentRole = useCallback(
@@ -287,154 +230,73 @@ const App: React.FC = () => {
     [],
   );
 
-  // --- Code panel: file operations ---
-  const requestFileTree = useCallback((path = ".") => {
-    if (!socketRef.current) return;
-    setIsLoadingFileTree(true);
-    socketRef.current.emit("list_files", { path });
-  }, []);
-
-  const handleFileContent = useCallback(
-    (data: { path: string; content: string }) => {
-      const language = detectLanguageFromPath(data.path);
-      setOpenFiles((prev) => {
-        const existing = prev.find((f) => f.path === data.path);
-        if (existing) {
-          return prev.map((f) =>
-            f.path === data.path
-              ? { ...f, content: data.content, language }
-              : f,
-          );
-        }
-        return [...prev, { path: data.path, content: data.content, language }];
-      });
-      setActiveFilePath(data.path);
-      setCodeContent(data.content);
-      setCodeLanguage(language);
-    },
-    [],
-  );
-
-  const openFileFromTree = useCallback(
-    (path: string) => {
-      setActiveFilePath(path);
-      const existing = openFiles.find((f) => f.path === path);
-      if (existing) {
-        setCodeContent(existing.content);
-        setCodeLanguage(existing.language);
-        return;
+  const runBrowserControl = useCallback(
+    async (payload: any) => {
+      if (!isTauriEnv) {
+        return {
+          success: false,
+          error: "Browser control only available in Tauri (embedded webview).",
+        };
       }
-      if (socketRef.current) {
-        socketRef.current.emit("read_file", { path });
-      } else {
-        toast.error("Socket not connected; cannot load file");
+
+      const { action, selector = "", value = "", code = "" } = payload || {};
+      const esc = (s: string) => s.replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$/g, "\\$");
+
+      let script = "";
+      switch (action) {
+        case "click":
+          script = `
+            (() => {
+              const el = document.querySelector(\`${esc(selector)}\`);
+              if (!el) return;
+              el.click();
+            })();
+          `;
+          break;
+        case "fill":
+          script = `
+            (() => {
+              const el = document.querySelector(\`${esc(selector)}\`);
+              if (!el) return;
+              el.value = \`${esc(value)}\`;
+              el.dispatchEvent(new Event('input', { bubbles: true }));
+              el.dispatchEvent(new Event('change', { bubbles: true }));
+            })();
+          `;
+          break;
+        case "scroll":
+          script = `
+            (() => {
+              const el = document.querySelector(\`${esc(selector)}\`);
+              if (!el) return;
+              el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            })();
+          `;
+          break;
+        case "exec":
+          script = `
+            (() => { ${code} })();
+          `;
+          break;
+        default:
+          return { success: false, error: `Unknown action: ${action}` };
       }
-    },
-    [openFiles],
-  );
 
-  const closeOpenFile = useCallback(
-    (path: string) => {
-      setOpenFiles((prev) => {
-        const remaining = prev.filter((f) => f.path !== path);
-        if (activeFilePath === path) {
-          if (remaining.length > 0) {
-            const next = remaining[0];
-            setActiveFilePath(next.path);
-            setCodeContent(next.content);
-            setCodeLanguage(next.language);
-          } else {
-            setActiveFilePath(null);
-            setCodeContent("");
-            setCodeLanguage("javascript");
-          }
-        }
-        return remaining;
-      });
-    },
-    [activeFilePath],
-  );
-
-  const saveActiveFile = useCallback(() => {
-    if (!activeFilePath) {
-      toast.error("No file selected to save");
-      return;
-    }
-    if (!socketRef.current) {
-      toast.error("Socket not connected; cannot save file");
-      return;
-    }
-    socketRef.current.emit("save_file", {
-      path: activeFilePath,
-      content: codeContent,
-    });
-    toast("Saving file...", { icon: "💾" });
-  }, [activeFilePath, codeContent]);
-
-  const selectOpenFile = useCallback(
-    (path: string) => {
-      const target = openFiles.find((f) => f.path === path);
-      if (target) {
-        setActiveFilePath(path);
-        setCodeContent(target.content);
-        setCodeLanguage(target.language);
+      try {
+        await invoke("agent_execute_js", {
+          label: "solace-browser",
+          script,
+        });
+        return { success: true, message: "Dispatched to embedded webview." };
+      } catch (err) {
+        console.error("browser control failed", err);
+        return {
+          success: false,
+          error: err instanceof Error ? err.message : String(err),
+        };
       }
     },
-    [openFiles],
-  );
-
-  const handleCodeEditorChange = useCallback(
-    (value: string) => {
-      setCodeContent(value);
-      if (activeFilePath) {
-        setOpenFiles((prev) =>
-          prev.map((f) =>
-            f.path === activeFilePath ? { ...f, content: value } : f,
-          ),
-        );
-      }
-    },
-    [activeFilePath],
-  );
-
-  const createFile = useCallback((path: string) => {
-    if (!socketRef.current) return;
-    socketRef.current.emit("create_file", { path });
-  }, []);
-
-  const createFolder = useCallback((path: string) => {
-    if (!socketRef.current) return;
-    socketRef.current.emit("create_folder", { path });
-  }, []);
-
-  const renamePath = useCallback(
-    (oldPath: string, newPath: string) => {
-      if (!socketRef.current) return;
-      socketRef.current.emit("rename_path", {
-        old_path: oldPath,
-        new_path: newPath,
-      });
-      setOpenFiles((prev) =>
-        prev.map((f) => (f.path === oldPath ? { ...f, path: newPath } : f)),
-      );
-      if (activeFilePath === oldPath) {
-        setActiveFilePath(newPath);
-      }
-    },
-    [activeFilePath],
-  );
-
-  const deletePath = useCallback(
-    (path: string) => {
-      if (!socketRef.current) return;
-      socketRef.current.emit("delete_path", { path });
-      setOpenFiles((prev) => prev.filter((f) => f.path !== path));
-      if (activeFilePath === path) {
-        setActiveFilePath(null);
-        setCodeContent("");
-      }
-    },
-    [activeFilePath],
+    [isTauriEnv],
   );
 
   const handleReloadOrchestrator = () => {
@@ -455,23 +317,6 @@ const App: React.FC = () => {
   };
 
   useEffect(() => {
-    const savedTheme = localStorage.getItem("nova_theme");
-    if (savedTheme) {
-      setTheme(JSON.parse(savedTheme));
-    }
-  }, []);
-
-  useEffect(() => {
-    localStorage.setItem("nova_theme", JSON.stringify(theme));
-    Object.keys(theme).forEach((key) => {
-      document.documentElement.style.setProperty(
-        `--${key.replace(/([A-Z])/g, "-$1").toLowerCase()}`,
-        theme[key as keyof typeof theme],
-      );
-    });
-  }, [theme]);
-
-  useEffect(() => {
     if (
       rightPanelMode === "code" &&
       fileTree.length === 0 &&
@@ -481,36 +326,17 @@ const App: React.FC = () => {
     }
   }, [rightPanelMode, fileTree.length, isLoadingFileTree, requestFileTree]);
 
-  // Panel resizing: add listeners once to handle mouse move/up for left/right gutters
+  // Command Palette keyboard listener
   useEffect(() => {
-    const handleMouseMove = (e: MouseEvent) => {
-      if (isResizingLeft) {
-        const newWidth = Math.min(480, Math.max(220, e.clientX));
-        setLeftPanelWidth(newWidth);
-        return;
-      }
-      if (isResizingRight) {
-        const newWidth = Math.min(
-          1000,
-          Math.max(320, window.innerWidth - e.clientX),
-        );
-        setRightPanelWidth(newWidth);
-        return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+        e.preventDefault();
+        setIsCommandPaletteOpen(prev => !prev);
       }
     };
-
-    const handleMouseUp = () => {
-      if (isResizingLeft) setIsResizingLeft(false);
-      if (isResizingRight) setIsResizingRight(false);
-    };
-
-    window.addEventListener("mousemove", handleMouseMove);
-    window.addEventListener("mouseup", handleMouseUp);
-    return () => {
-      window.removeEventListener("mousemove", handleMouseMove);
-      window.removeEventListener("mouseup", handleMouseUp);
-    };
-  }, [isResizingLeft, isResizingRight]);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
 
   // Graph State
   const [graphData, setGraphData] = useState<GraphData | null>(null);
@@ -622,7 +448,37 @@ const App: React.FC = () => {
     socket.on("connect", handleConnect);
     socket.on("disconnect", handleDisconnect);
     socket.on("reconnect", handleReconnect);
+    socket.on('file_tree', (data: { tree: FileNode[], workspaceRoot?: string }) => {
+      console.log('📁 File tree received:', data.tree.length, 'root nodes');
+      setFileTree(data.tree);
+      if (data.workspaceRoot) {
+        setWorkspaceRoot(data.workspaceRoot);
+      }
+      setIsLoadingFileTree(false);
+    });
 
+    socket.on('workspace_root_changed', (data: { root: string }) => {
+      console.log('📂 Workspace root changed to:', data.root);
+      setWorkspaceRoot(data.root);
+      toast.success(`Workspace changed to: ${data.root}`);
+      requestFileTree('.');
+    });
+
+    socket.on('file_error', (data: { message: string }) => {
+      console.error('❌ File operation error:', data.message);
+      toast.error(data.message);
+      setIsLoadingFileTree(false);
+    });
+
+    socket.on('file_saved', (data: { path: string }) => {
+      console.log('💾 File saved:', data.path);
+      toast.success(`Saved: ${data.path}`);
+    });
+
+    socket.on('file_content', (data: { path: string, content: string }) => {
+      console.log('📄 File content received for:', data.path);
+      handleFileContent(data);
+    });
     const handleSessionsLoaded = (data: { sessions: ChatSession[] }) => {
       if (data.sessions && data.sessions.length > 0) {
         setChatSessions(data.sessions);
@@ -821,7 +677,7 @@ const App: React.FC = () => {
         }
       }
     };
-    const handleStreamEnd = () => {
+    const handleStreamEnd = (data?: { aiName?: string; tokenMetrics?: any }) => {
       if (streamingTimeoutRef.current)
         clearTimeout(streamingTimeoutRef.current);
       setIsStreaming(false);
@@ -840,11 +696,18 @@ const App: React.FC = () => {
         const last = { ...prev[prev.length - 1] };
         if (last.sender === aiName) {
           last.isThinking = false;
+
+          // Attach token metrics if available
+          if (data?.tokenMetrics) {
+            last.tokenMetrics = data.tokenMetrics;
+          }
+
           if (last.message.trim() && activeChatId) {
             const messageToSave = {
               sender: aiName,
               message: last.message,
               type: "ai" as const,
+              tokenMetrics: last.tokenMetrics,
             };
             if (socketRef.current) {
               socketRef.current.emit("save_message", {
@@ -917,6 +780,19 @@ const App: React.FC = () => {
       if (visualizerRef.current)
         visualizerRef.current.startProcessing(data.text);
     };
+    const handleLowConfidence = (data: {
+      confidence?: number;
+      reasoning?: string;
+      query?: string;
+    }) => {
+      const confidenceText =
+        typeof data.confidence === "number"
+          ? `${data.confidence.toFixed(1)}%`
+          : "unknown";
+      const msg = `Low confidence (${confidenceText}). ${data.reasoning || "Consider a web search for more context."}`;
+      addMessage(aiName, msg, "info");
+      toast(msg, { icon: "💡" });
+    };
     const handleCommandResponse = (data: {
       type: string;
       message: string;
@@ -941,10 +817,14 @@ const App: React.FC = () => {
         if (data.video_id) setYoutubeVideoId(data.video_id);
         if (data.url) setYoutubeUrl(data.url);
         setRightPanelMode("youtube");
+        ensurePanelActive("youtube");
+        return; // Panel-only update; no chat iframe
       } else if (data.type === "iframe") {
         if (data.url) {
           setBrowserUrl(data.url);
           setLeftPanelMode("browser");
+          ensurePanelActive("browser");
+          return; // Panel-only update; no chat iframe
         }
       }
 
@@ -1021,6 +901,17 @@ const App: React.FC = () => {
     socket.on("voice_stream_end", handleVoiceStreamEnd);
     socket.on("transcription_result", handleTranscriptionResult);
     socket.on("command_response", handleCommandResponse);
+    socket.on("low_confidence_warning", handleLowConfidence);
+    socket.on("browser_control", async (data: any) => {
+      const res = await runBrowserControl(data);
+      socket.emit("browser_control_result", {
+        action: data?.action,
+        selector: data?.selector,
+        value: data?.value,
+        code: data?.code,
+        ...res,
+      });
+    });
     socket.on("nova_settings_loaded", handleNovaSettingsLoaded);
     // Backend state sync
     socket.on("backend_set", (data: { backend: string }) => {
@@ -1071,10 +962,41 @@ const App: React.FC = () => {
 
     // Search results listener
     socket.on("search_results", (data: { results: any[]; query: string }) => {
-      console.log("🔍 Search results received:", data);
+      console.log("dY\"? Search results received:", data);
       setSearchResults(data.results);
       setSearchQuery(data.query);
       setLeftPanelMode("search");
+      // Add search panel to active panels if not already there
+      setActivePanels((prev) =>
+        prev.includes("search") ? prev : [...prev, "search"],
+      );
+    });
+
+    // Parliament complete listener - forwards consensus to main model
+    socket.on("parliament_complete", (data: { consensus_context: string; original_message: string; vote_result: any }) => {
+      console.log("🏛️ Parliament complete! Voting result:", data.vote_result);
+      console.log("📝 Consensus context:", data.consensus_context);
+      console.log("🚀 Sending to main model...", { backend: currentBackend, provider: apiProvider });
+
+      // Store vote result for display in Parliament panel
+      setParliamentVoteResult(data.vote_result);
+
+      // Show user that we're forwarding to main model
+      toast(`Parliament consensus reached (${data.vote_result.votes} votes). Asking ${aiName}...`, { icon: "🏛️" });
+
+      // Automatically send the consensus context to the main loaded model
+      // This triggers a regular chat response with Parliament consensus as context
+      socket.emit("chat", {
+        text: data.consensus_context,
+        history: messages.map(({ thought, ...rest }) => rest),  // Clean history without thoughts
+        session_id: activeChatId,
+        userName: userName,
+        aiName: aiName,
+        backend: currentBackend,
+        provider: apiProvider,
+        model_name: selectedModel,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      });
     });
 
     // File system listeners for code panel
@@ -1083,7 +1005,7 @@ const App: React.FC = () => {
       setIsLoadingFileTree(false);
       if (Array.isArray(data.tree) && data.tree.length > 0) {
         // Use top-level path as current workspace root hint
-        setWorkspaceRoot(data.tree[0].path ? data.tree[0].path.split(/[\\\\/]/).slice(0, 1).join("") : workspaceRoot);
+        setWorkspaceRoot(data.tree[0].path ? data.tree[0].path.split(/[\\\/]/).slice(0, 1).join("") : workspaceRoot);
       }
     });
 
@@ -1155,6 +1077,7 @@ const App: React.FC = () => {
             aiName: aiName,
             backend: currentBackend,
             provider: apiProvider,
+            model_name: selectedModel, // Include model name for token tracking
             timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
             mode: "parliament_synthesis",
           };
@@ -1173,7 +1096,14 @@ const App: React.FC = () => {
     );
 
     return () => {
+
       socket.disconnect();
+      socket.off('file_tree');
+      socket.off('workspace_root_changed');
+      socket.off('file_error');
+      socket.off('file_saved');
+      socket.off('file_content');
+      socket.off("low_confidence_warning");
     };
   }, [handleFileContent]);
 
@@ -1235,6 +1165,7 @@ const App: React.FC = () => {
         aiName,
         backend: currentBackend,
         provider: apiProvider,
+        model_name: selectedModel, // Include model name for token tracking
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       };
       if (socketRef.current) {
@@ -1254,6 +1185,50 @@ const App: React.FC = () => {
       currentBackend,
       apiProvider,
       isAgentMode,
+    ],
+  );
+
+  const ensurePanelActive = useCallback(
+    (panelId: string) =>
+      setActivePanels((prev) =>
+        prev.includes(panelId) ? prev : [...prev, panelId],
+      ),
+    [],
+  );
+
+  const sendSlashToBackend = useCallback(
+    (text: string) => {
+      if (!socketRef.current) return;
+      const historyForModel = messages.map(({ thought, ...rest }) => rest);
+      const payload: any = {
+        text,
+        history: historyForModel,
+        session_id: activeChatId,
+        userName,
+        aiName,
+        backend: currentBackend,
+        provider: apiProvider,
+        model_name: selectedModel,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      };
+      addMessage(userName, text, "user");
+      setIsStreaming(true);
+      if (isAgentMode) {
+        socketRef.current.emit("agent_command", payload);
+      } else {
+        socketRef.current.emit("chat", payload);
+      }
+    },
+    [
+      messages,
+      activeChatId,
+      userName,
+      aiName,
+      currentBackend,
+      apiProvider,
+      selectedModel,
+      isAgentMode,
+      addMessage,
     ],
   );
 
@@ -1287,9 +1262,38 @@ const App: React.FC = () => {
         setYoutubeUrl(urlToUse);
         setYoutubeVideoId(videoId);
         setRightPanelMode("youtube");
+        ensurePanelActive("youtube");
         toast.success("YouTube video loaded");
         if (activeChatId) {
           sendNowPlayingNotice(title || urlToUse, urlToUse);
+        }
+        break;
+      }
+
+      case "browser":
+      case "b": {
+        if (args.trim()) {
+          const query = args.trim();
+          // If the user passed a URL or domain, browse it directly; otherwise fall back to search.
+          const searxUrl = getSearxUrl();
+          const base = searxUrl ? searxUrl.replace(/\/$/, "") : "";
+          let targetUrl = "";
+          if (/^https?:\/\//i.test(query)) {
+            targetUrl = query;
+          } else if (/^[\w.-]+\.[a-zA-Z]{2,}/.test(query)) {
+            targetUrl = `https://${query}`;
+          } else {
+            targetUrl = searxUrl
+              ? `${base}/?q=${encodeURIComponent(query)}`
+              : `https://www.google.com/search?q=${encodeURIComponent(query)}`;
+          }
+          setBrowserUrl(targetUrl);
+          setLeftPanelMode("browser");
+          ensurePanelActive("browser");
+          sendSlashToBackend(`/browser ${query}`);
+          toast(`Browsing: ${query}`);
+        } else {
+          toast.error("Please provide a query: /browser <query>");
         }
         break;
       }
@@ -1299,18 +1303,13 @@ const App: React.FC = () => {
         if (args.trim()) {
           const query = args.trim();
           setSearchQuery(query);
-          const searxUrl = getSearxUrl();
-          if (searxUrl) {
-            const base = searxUrl.replace(/\/$/, "");
-            setBrowserUrl(`${base}/?q=${encodeURIComponent(query)}`);
-          } else {
-            setBrowserUrl(
-              `https://www.google.com/search?q=${encodeURIComponent(query)}`,
-            );
-          }
-          setLeftPanelMode("browser");
+          setLeftPanelMode("search");
+          ensurePanelActive("search");
+          setRightPanelMode("youtube");
+          ensurePanelActive("youtube");
           setSearchResults([]);
           toast(`Searching: ${query}`);
+          sendSlashToBackend(`/search ${query}`);
         } else {
           toast.error("Please provide a search query: /search <query>");
         }
@@ -1355,22 +1354,13 @@ const App: React.FC = () => {
         toast("Voice mode activated");
         break;
 
-      case "help":
+                    case "help":
       case "?":
-        const helpMessage = `📚 Available Slash Commands:
-
-/youtube or /yt <url> - Load YouTube video in right panel
-/search or /s <query> - Search the web (left panel)
-/parliament or /p - Activate AI Parliament mode
-/code or /c [code] - Open code editor
-/media or /m [query] - Open media browser
-/voice or /v - Activate voice mode
-/close [left|right] - Close panels
-/help or /? - Show this help message`;
+        const helpMessage = `dY\"s Available Slash Commands:\n\n/youtube or /yt <url|query> - Load YouTube video in right panel\n/browser or /b <query> - Open SearXNG/browser panel for a query\n/search or /s <query> - Open search + YouTube panels and enrich the model\n/parliament or /p - Activate AI Parliament mode\n/code or /c [code] - Open code editor\n/media or /m [query] - Open media browser\n/voice or /v - Activate voice mode\n/close [left|right] - Close panels\n/help or /? - Show this help message`;
 
         toast(helpMessage, {
           duration: 10000,
-          icon: "❓",
+          icon: "i",
           style: {
             maxWidth: "500px",
             whiteSpace: "pre-line",
@@ -1421,7 +1411,10 @@ const App: React.FC = () => {
       );
 
       const enabledRoles = parliamentRoles.filter((r) => r.enabled);
-      if (enabledRoles.length > 0 && leftPanelMode === "parliament") {
+      const isParliamentActive = enabledRoles.length > 0 && activePanels.includes("parliament");
+      
+      if (isParliamentActive) {
+        // Parliament mode: Send request to Parliament, DON'T send regular chat yet
         socketRef.current.emit("parliament_request", {
           message: currentMessage,
           roles: enabledRoles.map((r) => ({
@@ -1438,29 +1431,40 @@ const App: React.FC = () => {
         );
         lastParliamentUserMessage.current = currentMessage;
         setParliamentRoleOutputs([]);
-      }
-
-      const messagePayload: any = {
-        text: currentMessage,
-        history: historyForModel, // Use the cleaned history
-        session_id: activeChatId,
-        userName: userName,
-        aiName: aiName, // Use the model-specific aiName from state
-        backend: currentBackend, // Use currentBackend state
-        provider: apiProvider, // Use apiProvider state
-        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-      };
-
-      if (imageToSend) {
-        messagePayload.image_base_64 = imageToSend;
-        setImageToSend(null);
-      }
-
-      if (isAgentMode) {
-        socketRef.current.emit("agent_command", messagePayload);
+        setIsStreaming(true); // Set streaming state since we're waiting for Parliament
       } else {
-        socketRef.current.emit("chat", messagePayload);
+        // Normal mode: Send regular chat message
+        const messagePayload: any = {
+          text: currentMessage,
+          history: historyForModel, // Use the cleaned history
+          session_id: activeChatId,
+          userName: userName,
+          aiName: aiName, // Use the model-specific aiName from state
+          backend: currentBackend, // Use currentBackend state
+          provider: apiProvider, // Use apiProvider state
+          model_name: selectedModel, // Include model name for token tracking
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        };
+
+        if (imageToSend) {
+          messagePayload.image_base_64 = imageToSend;
+          messagePayload.image_mime_type = imageMimeToSend || "image/png";
+          setImageToSend(null);
+          setImageMimeToSend("image/png");
+        }
+
+        if (pendingAttachments.length > 0) {
+          messagePayload.attachments = pendingAttachments;
+          setPendingAttachments([]);
+        }
+
+        if (isAgentMode) {
+          socketRef.current.emit("agent_command", messagePayload);
+        } else {
+          socketRef.current.emit("chat", messagePayload);
+        }
       }
+      
       setMessageInputText(""); // Clear the input after sending
     }
   };
@@ -1574,13 +1578,6 @@ const App: React.FC = () => {
     }
   };
 
-  const requestWorkspaceChange = useCallback(() => {
-    const next = prompt("Enter new workspace absolute path (directory):", workspaceRoot || "");
-    if (next && socketRef.current) {
-      socketRef.current.emit("set_workspace_root", { path: next });
-    }
-  }, [workspaceRoot]);
-
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
   };
@@ -1588,13 +1585,14 @@ const App: React.FC = () => {
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
     const files = e.dataTransfer.files;
-    if (files && files[0]) {
-      const file = files[0];
+    if (files && files.length > 0) {
+      Array.from(files).forEach((file) => {
       if (file.type.startsWith("image/")) {
         const reader = new FileReader();
         reader.onload = (event) => {
           const base64 = (event.target?.result as string)?.split(",")[1];
           setImageToSend(base64);
+          setImageMimeToSend(file.type || "image/png");
         };
         reader.readAsDataURL(file);
         return;
@@ -1611,22 +1609,17 @@ const App: React.FC = () => {
           const language = detectLanguageFromPath(file.name);
           const pseudoPath = file.name;
           setRightPanelMode("code");
-          setActiveFilePath(pseudoPath);
-          setCodeContent(content);
-          setCodeLanguage(language);
-          setOpenFiles((prev) => {
-            const existing = prev.find((f) => f.path === pseudoPath);
-            if (existing) {
-              return prev.map((f) =>
-                f.path === pseudoPath ? { ...f, content, language } : f,
-              );
-            }
-            return [...prev, { path: pseudoPath, content, language }];
+          openLocalFile(pseudoPath, content, language);
+          setPendingAttachments((prev) => {
+            const filtered = prev.filter((f) => f.name !== file.name);
+            return [...filtered, { name: file.name, content }];
           });
+          toast.success(`Attached ${file.name} for context`);
         };
         reader.readAsText(file);
         return;
       }
+      });
     }
   };
 
@@ -1643,440 +1636,481 @@ const App: React.FC = () => {
     });
   };
 
-  const runToolSearch = useCallback(async () => {
-    if (!toolQuery.trim()) {
-      setToolError("Enter a query");
-      return;
-    }
-    setToolError(null);
-    setToolLoading(true);
-    try {
-      const res = await fetch(
-        `http://localhost:8000/search?query=${encodeURIComponent(toolQuery.trim())}`,
-      );
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`);
-      }
-      const data = await res.json();
-      setToolResults(data.results || []);
-    } catch (e: any) {
-      setToolError(e.message || "Tool search failed");
-    } finally {
-      setToolLoading(false);
-    }
-  }, [toolQuery]);
+  const handleTogglePanel = (panelId: string) => {
+    const leftModes: Record<string, typeof leftPanelMode> = {
+      chats: "chats",
+      browser: "browser",
+      search: "search",
+      parliament: "parliament",
+    };
+    const rightModes: Record<string, typeof rightPanelMode> = {
+      code: "code",
+      voice: "voice",
+      youtube: "youtube",
+      tools: "tools",
+    };
 
-  const fetchToolList = useCallback(async () => {
-    try {
-      const res = await fetch("http://localhost:8000/tools");
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      const list = data.tools || [];
-      setToolList(list);
-      const map: Record<string, any> = {};
-      list.forEach((t: any) => {
-        if (t?.name) map[t.name] = t;
-      });
-      setToolParamsByName(map);
-    } catch (e) {
-      console.error("Failed to load tool list", e);
+    if (leftModes[panelId]) {
+      setLeftPanelMode(leftModes[panelId]);
     }
-  }, []);
 
-  const runToolCall = useCallback(async () => {
-    if (!selectedTool) {
-      setToolError("Select a tool");
-      return;
+    if (rightModes[panelId]) {
+      setRightPanelMode(rightModes[panelId]);
     }
-    let argsObj: any = {};
-    try {
-      argsObj = toolArgsText ? JSON.parse(toolArgsText) : {};
-      setToolError(null);
-    } catch (e: any) {
-      setToolError("Arguments must be valid JSON");
-      return;
-    }
-    try {
-      setToolLoading(true);
-      const res = await fetch("http://localhost:8000/tool_call", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: selectedTool, arguments: argsObj }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      setToolCallResult(
-        typeof data.result === "string"
-          ? data.result
-          : JSON.stringify(data.result, null, 2),
-      );
-    } catch (e: any) {
-      setToolError(e.message || "Tool call failed");
-    } finally {
-      setToolLoading(false);
-    }
-  }, [selectedTool, toolArgsText]);
 
-  useEffect(() => {
-    if (!selectedTool) return;
-    const spec = toolParamsByName[selectedTool];
-    if (!spec?.parameters?.properties) return;
-    const props = spec.parameters.properties || {};
-    const required: string[] = spec.parameters.required || [];
-    const template: any = {};
-    Object.keys(props).forEach((k) => {
-      if (props[k]?.type === "object") {
-        template[k] = {};
-      } else if (props[k]?.type === "array") {
-        template[k] = [];
-      } else {
-        template[k] = required.includes(k) ? "" : "";
-      }
-    });
-    setToolArgsText(JSON.stringify(template, null, 2));
-  }, [selectedTool, toolParamsByName]);
+    setActivePanels((prev) =>
+      prev.includes(panelId)
+        ? prev.filter((id) => id !== panelId)
+        : [...prev, panelId],
+    );
+  };
 
-  return (
-    <div
-      className="flex h-screen w-screen overflow-hidden"
-      style={{ backgroundColor: theme.backgroundColor }}
-      onDragOver={handleDragOver}
-      onDrop={handleDrop}
-    >
-      <Toaster position="top-right" />
+  const handleExecuteCommand = (command: string) => {
+    // Set the command in the message input and trigger processing
+    setMessageInputText(command);
+    // The command will be processed by the existing slash command handler
+  };
 
-      {/* Left Panel - Multi-mode */}
-      {leftPanelMode !== "closed" && (
-        <div style={{ width: leftPanelWidth }} className="flex-shrink-0 h-full">
-          <LeftPanel
-            mode={leftPanelMode}
-            onClose={() => setLeftPanelMode("closed")}
-            panelWidth={leftPanelWidth}
-            // Chat mode props
-            chats={chatSessions.map((c) => ({ id: c._id, name: c.name }))}
-            activeChatId={activeChatId}
-            onNewChat={newChat}
-            onLoadChat={loadChatById}
-            onDeleteChat={deleteChat}
-            onRenameChat={renameChat}
-            // Search mode props
-            searchResults={searchResults}
-            searchQuery={searchQuery}
-            onSearchResultClick={(url) => {
-              window.open(url, "_blank");
-              toast.success("Opening in new tab");
-            }}
-            onSearchResultPreview={(url) => {
-              setBrowserUrl(url);
-              setLeftPanelMode("browser");
-            }}
-            browserUrl={browserUrl}
-            // Parliament mode props
-            parliamentRoles={parliamentRoles}
-            parliamentRoleOutputs={parliamentRoleOutputs}
-            onUpdateRole={updateParliamentRole}
-            debugMode={debugMode}
-          />
-        </div>
-      )}
-      {leftPanelMode !== "closed" && (
+  const hideLeftPanel = () => {
+    setLeftPanelMode("closed");
+    setActivePanels((prev) =>
+      prev.filter((id) => !leftPanelIds.includes(id)),
+    );
+  };
+
+  const visiblePanelIds = useMemo(() => {
+    const ids = new Set<string>([...activePanels, "chat"]);
+    return Array.from(ids);
+  }, [activePanels]);
+  const panels = [
+    {
+      id: "chat",
+      title: "Chat",
+      component: (
         <div
-          className="w-2 cursor-col-resize hover:bg-white/10"
-          onMouseDown={() => setIsResizingLeft(true)}
-        />
-      )}
-
-      {/* Main Content */}
-      <div className="flex-1 flex flex-col min-w-0">
-        {/* Header */}
-        <header className="flex-shrink-0 bg-gray-900/80 backdrop-blur-sm flex items-center justify-between p-2 z-10">
-          <button
-            onClick={() =>
-              setLeftPanelMode(leftPanelMode === "closed" ? "chats" : "closed")
-            }
-            className="p-2 rounded-md hover:bg-gray-700 focus:outline-none text-white icon-button"
-            aria-label="Toggle left panel"
-          >
-            <svg
-              className="w-6 h-6"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-              xmlns="http://www.w3.org/2000/svg"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth="2"
-                d="M4 6h16M4 12h16M4 18h16"
-              ></path>
-            </svg>
-          </button>
-          <div className="flex items-center space-x-6">
-            <button
-              onClick={() => handleTabChange("chat")}
-              className={`tab-button px-4 py-2 mx-2 rounded-lg transition-colors duration-300 ${activeTab === "chat" ? "bg-blue-600 text-white" : "bg-gray-700 hover:bg-gray-600"} custom-button`}
-            >
-              Chat
-            </button>
-            <button
-              onClick={() => handleTabChange("graph")}
-              className={`tab-button px-4 py-2 mx-2 rounded-lg transition-colors duration-300 ${activeTab === "graph" ? "bg-blue-600 text-white" : "bg-gray-700 hover:bg-gray-600"} custom-button`}
-            >
-              Memory Graph
-            </button>
-            <button
-              onClick={() => handleTabChange("settings")}
-              className={`tab-button px-4 py-2 mx-2 rounded-lg transition-colors duration-300 ${activeTab === "settings" ? "bg-blue-600 text-white" : "bg-gray-700 hover:bg-gray-600"} custom-button`}
-            >
-              Settings
-            </button>
-          </div>
-          <button
-            onClick={() =>
-              setLeftPanelMode(
-                leftPanelMode === "parliament" ? "closed" : "parliament",
-              )
-            }
-            className="p-2 rounded-md hover:bg-gray-700 focus:outline-none text-white icon-button"
-            aria-label="Toggle parliament panel"
-            title="AI Parliament"
-          >
-            <svg
-              className="w-6 h-6"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-              xmlns="http://www.w3.org/2000/svg"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth="2"
-                d="M3 9l9-6 9 6-9 6-9-6z"
-              />
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth="2"
-                d="M3 15l9 6 9-6"
-              />
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth="2"
-                d="M3 9l9 6 9-6"
-              />
-            </svg>
-          </button>
-          <button
-            onClick={() =>
-              setRightPanelMode(
-                rightPanelMode === "closed" ? "voice" : "closed",
-              )
-            }
-            className="p-2 rounded-md hover:bg-gray-700 focus:outline-none text-white icon-button"
-            aria-label="Toggle right panel"
-          >
-            <svg
-              className="w-6 h-6"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-              xmlns="http://www.w3.org/2000/svg"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth="2"
-                d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"
-              ></path>
-            </svg>
-          </button>
-        </header>
-
-        {/* Tab Content Area */}
-        <main
-          className={`flex-1 flex flex-col min-h-0 relative ${activeTab !== "chat" ? "items-center" : ""}`}
+          className="flex h-full w-full flex-col"
+          style={{ backgroundColor: theme.backgroundColor }}
+          onDragOver={handleDragOver}
+          onDrop={handleDrop}
         >
-          {activeTab === "chat" && (
-            <div className="flex-1 flex flex-col min-h-0 p-4 relative">
-              {leftPanelMode === "parliament" &&
-                parliamentRoles.some((r) => r.enabled) && (
-                  <div className="mb-3 bg-gray-900/70 border border-white/10 rounded-lg p-3">
-                    <div className="flex items-center justify-between text-xs text-gray-200 mb-2">
-                      <span>Parliament role streams</span>
-                      <span className="px-2 py-1 rounded-full text-[11px] bg-white/10 border border-white/10">
-                        Live
-                      </span>
-                    </div>
-                    <div className="flex flex-wrap gap-2">
-                      {parliamentRoles
-                        .filter((r) => r.enabled)
-                        .map((role) => {
-                          const payload =
-                            parliamentRoleOutputs.find(
-                              (o) => o.key === role.key,
-                            )?.response || "";
-                          const statusColor =
-                            role.status === "done"
-                              ? "bg-green-500"
-                              : role.status === "working"
-                                ? "bg-blue-400"
-                                : "bg-gray-500";
-                          return (
-                            <div
-                              key={role.key}
-                              className="min-w-[200px] bg-black/40 border border-white/10 rounded-md p-2"
-                            >
-                              <div className="flex items-center gap-2">
-                                <span
-                                  className={`h-2 w-2 rounded-full ${statusColor}`}
-                                />
-                                <span className="text-sm text-white truncate flex-1">
-                                  {role.name}
-                                </span>
-                                <span className="text-[10px] text-gray-400 truncate">
-                                  {role.model}
-                                </span>
-                              </div>
-                              <p className="text-[11px] text-gray-300 mt-1 line-clamp-3">
-                                {payload ||
-                                  (role.status === "working"
-                                    ? "Streaming..."
-                                    : "Waiting...")}
-                              </p>
-                            </div>
-                          );
-                        })}
-                    </div>
-                  </div>
-                )}
-              <ChatView
-                messages={messages}
-                userAvatar={userAvatar}
-                aiAvatar={aiAvatar}
-              />
-              <div className="absolute bottom-4 left-4 right-4 z-10">
-                <MessageInput
-                  onSendMessage={handleSendMessage}
-                  onStop={handleStop}
-                  isStreaming={isStreaming}
-                  image={imageToSend}
-                  setImage={setImageToSend}
-                  isAgentMode={isAgentMode}
-                  onAgentModeChange={setIsAgentMode}
-                  message={messageInputText}
-                  onMessageChange={setMessageInputText}
-                />
-              </div>
+          <header className="flex-shrink-0 bg-gray-900/80 backdrop-blur-sm flex items-center justify-between p-2 z-10">
+            <button
+              onClick={() => handleTogglePanel("chats")}
+              className="p-2 rounded-md hover:bg-gray-700 focus:outline-none text-white icon-button"
+              aria-label="Toggle left panel"
+            >
+              <svg
+                className="w-6 h-6"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+                xmlns="http://www.w3.org/2000/svg"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth="2"
+                  d="M4 6h16M4 12h16M4 18h16"
+                ></path>
+              </svg>
+            </button>
+            <div className="flex items-center space-x-6">
+              <button
+                onClick={() => handleTabChange("chat")}
+                className={`tab-button px-4 py-2 mx-2 rounded-lg transition-colors duration-300 ${activeTab === "chat" ? "bg-blue-600 text-white" : "bg-gray-700 hover:bg-gray-600"} custom-button`}
+              >
+                Chat
+              </button>
+              <button
+                onClick={() => handleTabChange("graph")}
+                className={`tab-button px-4 py-2 mx-2 rounded-lg transition-colors duration-300 ${activeTab === "graph" ? "bg-blue-600 text-white" : "bg-gray-700 hover:bg-gray-600"} custom-button`}
+              >
+                Memory Graph
+              </button>
+              <button
+                onClick={() => handleTabChange("settings")}
+                className={`tab-button px-4 py-2 mx-2 rounded-lg transition-colors duration-300 ${activeTab === "settings" ? "bg-blue-600 text-white" : "bg-gray-700 hover:bg-gray-600"} custom-button`}
+              >
+                Settings
+              </button>
             </div>
-          )}
-          {activeTab === "graph" && <MemoryGraph data={graphData} />}
-          {activeTab === "settings" && (
-            <div className="flex justify-center w-full h-full p-8">
-              <div className="w-full max-w-6xl">
-                <SettingsPanel
-                  allConfigs={allConfigs}
-                  availableModels={availableModels || []}
-                  currentBackend={currentBackend}
-                  selectedModel={selectedModel}
-                  apiProvider={apiProvider}
-                  apiKey={apiKey}
-                  modelConfigOptions={modelConfigOptions}
-                  systemPrompt={systemPrompt}
-                  userName={userName}
-                  aiName={aiName}
-                  ollamaKvCache={ollamaKvCache}
-                  onBackendChange={handleBackendChange}
-                  onApiProviderChange={handleApiProviderChange}
-                  onApiKeyChange={setApiKey}
-                  onSaveApiKey={() =>
-                    socketRef.current.emit("set_backend", {
-                      backend: "api",
-                      provider: apiProvider,
-                      api_key: apiKey,
-                    })
-                  }
-                  onClearApiKey={() => {
-                    setApiKey("");
-                    socketRef.current.emit("set_backend", {
-                      backend: "api",
-                      provider: apiProvider,
-                      api_key: "",
-                    });
-                  }}
-                  onModelChange={handleModelChange}
-                  onModelConfigChange={(key: string, value: any) =>
-                    setModelConfigOptions((prev) => ({ ...prev, [key]: value }))
-                  }
-                  onSystemPromptChange={setSystemPrompt}
-                  onLoadModel={handleLoadModel}
-                  onUnloadModel={handleUnloadModel}
-                  onSaveConfig={handleSaveConfig}
-                  onUserNameChange={setUserName}
-                  onAiNameChange={setAiName}
-                  onUserAvatarChange={handleUserAvatarChange}
-                  onAiAvatarChange={handleAiAvatarChange}
-                  theme={theme}
-                  onThemeChange={handleThemeChange}
-                  toolSettings={toolSettings}
-                  onToolSettingsChange={setToolSettings}
-                  ttsSettings={ttsSettings}
-                  onTtsSettingsChange={setTtsSettings}
-                  sttSettings={sttSettings}
-                  onSttSettingsChange={setSttSettings}
-                  onOllamaKvCacheChange={setOllamaKvCache}
-                  onStopOllama={() =>
-                    socketRef.current.emit("manage_ollama", { action: "stop" })
-                  }
-                  onRestartOllama={() =>
-                    socketRef.current.emit("manage_ollama", {
-                      action: "restart",
-                      env: { OLLAMA_KV_CACHE_TYPE: ollamaKvCache },
-                    })
-                  }
-                  onSaveToolSettings={handleSaveToolSettings}
-                  onSaveVoiceSettings={handleSaveVoiceSettings}
-                  novaSettings={novaSettings}
-                  onNovaSettingsChange={handleNovaSettingsChange}
-                  onSaveNovaSettings={handleSaveNovaSettings}
-                  onReloadOrchestrator={handleReloadOrchestrator}
-                  debugMode={debugMode}
-                  onDebugModeChange={setDebugMode}
+            <button
+              onClick={() => setShowUsagePanel(true)}
+              className="px-3 py-2 rounded-lg text-sm bg-gray-800 hover:bg-gray-700 text-white border border-white/10 transition-colors"
+            >
+              Usage
+            </button>
+            <button
+              onClick={() => handleTogglePanel("parliament")}
+              className="p-2 rounded-md hover:bg-gray-700 focus:outline-none text-white icon-button"
+              aria-label="Toggle parliament panel"
+              title="AI Parliament"
+            >
+              <svg
+                className="w-6 h-6"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+                xmlns="http://www.w3.org/2000/svg"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth="2"
+                  d="M3 9l9-6 9 6-9 6-9-6z"
                 />
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth="2"
+                  d="M3 15l9 6 9-6"
+                />
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth="2"
+                  d="M3 9l9 6 9-6"
+                />
+              </svg>
+            </button>
+            <button
+              onClick={() => handleTogglePanel("voice")}
+              className="p-2 rounded-md hover:bg-gray-700 focus:outline-none text-white icon-button"
+              aria-label="Toggle right panel"
+            >
+              <svg
+                className="w-6 h-6"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+                xmlns="http://www.w3.org/2000/svg"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth="2"
+                  d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"
+                ></path>
+              </svg>
+            </button>
+          </header>
+          <main
+            className={`flex-1 flex flex-col min-h-0 relative ${activeTab !== "chat" ? "items-center" : ""}`}
+          >
+            {activeTab === "chat" && (
+              <div className="flex-1 flex flex-col min-h-0 p-4 relative">
+                {activePanels.includes("parliament") &&
+                  parliamentRoles.some((r) => r.enabled) && (
+                    <div className="mb-3 bg-gray-900/70 border border-white/10 rounded-lg p-3">
+                      <div className="flex items-center justify-between text-xs text-gray-200 mb-2">
+                        <div className="flex items-center gap-2">
+                          <span>Parliament Live</span>
+                          <span className="px-2 py-1 rounded-full text-[11px] bg-white/10 border border-white/10">
+                            Live
+                          </span>
+                          <span className="text-[11px] text-gray-400">
+                            {
+                              parliamentRoles.filter(
+                                (r) => r.enabled && r.status === "done",
+                              ).length
+                            }
+                            /
+                            {
+                              parliamentRoles.filter((r) => r.enabled).length
+                            }{" "}
+                            done
+                          </span>
+                        </div>
+                        <button
+                          onClick={() =>
+                            setParliamentPanelCollapsed((prev) => !prev)
+                          }
+                          className="px-2 py-1 rounded border border-white/10 text-[11px] hover:bg-white/5 transition"
+                        >
+                          {parliamentPanelCollapsed ? "Expand" : "Minimize"}
+                        </button>
+                      </div>
+                      {!parliamentPanelCollapsed && (
+                        <div className="flex flex-wrap gap-2">
+                          {parliamentRoles
+                            .filter((r) => r.enabled)
+                            .map((role) => {
+                              const payload =
+                                parliamentRoleOutputs.find(
+                                  (o) => o.key === role.key,
+                                )?.response || "";
+                              const statusColor =
+                                role.status === "done"
+                                  ? "bg-green-500"
+                                  : role.status === "working"
+                                    ? "bg-blue-400"
+                                    : "bg-gray-500";
+                              const isExpanded = parliamentExpanded[role.key];
+                              const formattedPayload = formatParliamentPayload(
+                                payload,
+                              );
+                              const statusLabel =
+                                role.status === "working"
+                                  ? "Streaming… (click to view)"
+                                  : role.status === "done"
+                                    ? "Done – click to view output"
+                                    : "Waiting to start";
+                              return (
+                                <button
+                                  key={role.key}
+                                  onClick={() => toggleParliamentRole(role.key)}
+                                  className="min-w-[220px] bg-black/40 border border-white/10 rounded-md p-2 text-left hover:bg-white/5 transition"
+                                >
+                                  <div className="flex items-center gap-2">
+                                    <span
+                                      className={`h-2 w-2 rounded-full ${statusColor}`}
+                                    />
+                                    <span className="text-sm text-white truncate flex-1">
+                                      {role.name}
+                                    </span>
+                                    <span className="text-[10px] text-gray-400 truncate">
+                                      {role.model}
+                                    </span>
+                                    <span className="text-[11px] text-gray-300">
+                                      {isExpanded ? "Hide" : "Show"}
+                                    </span>
+                                  </div>
+                                  {isExpanded ? (
+                                    <pre className="text-[11px] text-gray-200 bg-gray-900/70 border border-white/5 rounded mt-2 p-2 max-h-48 overflow-auto whitespace-pre-wrap">
+                                      {formattedPayload ||
+                                        (role.status === "working"
+                                          ? "Streaming..."
+                                          : "Waiting...")}
+                                    </pre>
+                                  ) : (
+                                    <p className="text-[11px] text-gray-200 mt-1">
+                                      {statusLabel}
+                                    </p>
+                                  )}
+                                </button>
+                              );
+                            })}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                <ChatView
+                  messages={messages}
+                  userAvatar={userAvatar}
+                  aiAvatar={aiAvatar}
+                />
+                <div className="absolute bottom-4 left-4 right-4 z-10">
+                  <MessageInput
+                    onSendMessage={handleSendMessage}
+                    onStop={handleStop}
+                    isStreaming={isStreaming}
+                    image={imageToSend}
+                    setImage={(img) => {
+                      setImageToSend(img);
+                      if (!img) setImageMimeToSend("image/png");
+                    }}
+                    isAgentMode={isAgentMode}
+                    onAgentModeChange={setIsAgentMode}
+                    message={messageInputText}
+                    onMessageChange={setMessageInputText}
+                  />
+                </div>
               </div>
-            </div>
-          )}
-        </main>
-      </div>
-
-      {/* Right Panel - Multi-mode */}
-      {rightPanelMode !== "closed" && (
-        <>
-          <div
-            className="w-2 cursor-col-resize hover:bg-white/10"
-            onMouseDown={() => setIsResizingRight(true)}
-          />
-          <RightPanel
-            mode={rightPanelMode}
-            panelWidth={rightPanelWidth}
-            onClose={() => setRightPanelMode("closed")}
-            // Voice mode props
-            socket={socketRef.current}
-            isHandsFreeMode={isHandsFreeMode}
-            onHandsFreeModeChange={setIsHandsFreeMode}
-            onVisualizerReady={(visualizer) => {
-              visualizerRef.current = visualizer;
-            }}
-            // YouTube mode props
-            youtubeVideoId={youtubeVideoId}
-            youtubeUrl={youtubeUrl}
-            // Code mode props
-            codeContent={codeContent}
-            codeLanguage={codeLanguage}
-            onCodeChange={handleCodeEditorChange}
-            onCodeLanguageChange={setCodeLanguage}
+            )}
+            {activeTab === "graph" && <MemoryGraph data={graphData} />}
+            {activeTab === "settings" && (
+              <div className="flex justify-center w-full h-full p-8">
+                <div className="w-full max-w-6xl">
+                  <SettingsPanel
+                    allConfigs={allConfigs}
+                    availableModels={availableModels || []}
+                    currentBackend={currentBackend}
+                    selectedModel={selectedModel}
+                    apiProvider={apiProvider}
+                    apiKey={apiKey}
+                    modelConfigOptions={modelConfigOptions}
+                    systemPrompt={systemPrompt}
+                    userName={userName}
+                    aiName={aiName}
+                    ollamaKvCache={ollamaKvCache}
+                    onBackendChange={handleBackendChange}
+                    onApiProviderChange={handleApiProviderChange}
+                    onApiKeyChange={setApiKey}
+                    onSaveApiKey={() =>
+                      socketRef.current.emit("set_backend", {
+                        backend: "api",
+                        provider: apiProvider,
+                        api_key: apiKey,
+                      })
+                    }
+                    onClearApiKey={() => {
+                      setApiKey("");
+                      socketRef.current.emit("set_backend", {
+                        backend: "api",
+                        provider: apiProvider,
+                        api_key: "",
+                      });
+                    }}
+                    onModelChange={handleModelChange}
+                    onModelConfigChange={(key: string, value: any) =>
+                      setModelConfigOptions((prev) => ({
+                        ...prev,
+                        [key]: value,
+                      }))
+                    }
+                    onSystemPromptChange={setSystemPrompt}
+                    onLoadModel={handleLoadModel}
+                    onUnloadModel={handleUnloadModel}
+                    onSaveConfig={handleSaveConfig}
+                    onUserNameChange={setUserName}
+                    onAiNameChange={setAiName}
+                    onUserAvatarChange={handleUserAvatarChange}
+                    onAiAvatarChange={handleAiAvatarChange}
+                    theme={theme}
+                    onThemeChange={handleThemeChange}
+                    toolSettings={toolSettings}
+                    onToolSettingsChange={setToolSettings}
+                    ttsSettings={ttsSettings}
+                    onTtsSettingsChange={setTtsSettings}
+                    sttSettings={sttSettings}
+                    onSttSettingsChange={setSttSettings}
+                    onOllamaKvCacheChange={setOllamaKvCache}
+                    onStopOllama={() =>
+                      socketRef.current.emit("manage_ollama", {
+                        action: "stop",
+                      })
+                    }
+                    onRestartOllama={() =>
+                      socketRef.current.emit("manage_ollama", {
+                        action: "restart",
+                        env: { OLLAMA_KV_CACHE_TYPE: ollamaKvCache },
+                      })
+                    }
+                    onSaveToolSettings={handleSaveToolSettings}
+                    onSaveVoiceSettings={handleSaveVoiceSettings}
+                    novaSettings={novaSettings}
+                    onNovaSettingsChange={handleNovaSettingsChange}
+                    onSaveNovaSettings={handleSaveNovaSettings}
+                    onReloadOrchestrator={handleReloadOrchestrator}
+                    debugMode={debugMode}
+                    onDebugModeChange={setDebugMode}
+                  />
+                </div>
+              </div>
+            )}
+          </main>
+        </div>
+      ),
+    },
+    {
+      id: "chats",
+      title: "Chats",
+      component: (
+        <LeftPanel
+          mode="chats"
+          onClose={hideLeftPanel}
+          // Chat mode props
+          chats={chatSessions.map((c) => ({ id: c._id, name: c.name }))}
+          activeChatId={activeChatId}
+          onNewChat={newChat}
+          onLoadChat={loadChatById}
+          onDeleteChat={deleteChat}
+          onRenameChat={renameChat}
+          // Search mode props
+          searchResults={searchResults}
+          searchQuery={searchQuery}
+          onSearchResultClick={(url) => {
+            setBrowserUrl(url);
+            setLeftPanelMode("browser");
+            ensurePanelActive("browser");
+            toast.success("Opening in browser panel");
+          }}
+          onSearchResultPreview={(url) => {
+            setBrowserUrl(url);
+            setLeftPanelMode("browser");
+          }}
+          browserUrl={browserUrl}
+          // Parliament mode props
+          parliamentRoles={parliamentRoles}
+          parliamentRoleOutputs={parliamentRoleOutputs}
+          onUpdateRole={updateParliamentRole}
+          debugMode={debugMode}
+        />
+      ),
+    },
+    {
+      id: "search",
+      title: "Search",
+      component: (
+        <LeftPanel
+          mode="search"
+          onClose={() => handleTogglePanel("search")}
+          searchResults={searchResults}
+          searchQuery={searchQuery}
+          onSearchResultClick={(url) => {
+            setBrowserUrl(url);
+            setLeftPanelMode("browser");
+            ensurePanelActive("browser");
+            toast.success("Opening in browser panel");
+          }}
+          onSearchResultPreview={(url) => {
+            setBrowserUrl(url);
+            setLeftPanelMode("browser");
+          }}
+          browserUrl={browserUrl}
+        />
+      ),
+    },
+    {
+      id: "browser",
+      title: "Browser",
+      component: (
+        <LeftPanel
+          mode="browser"
+          onClose={() => handleTogglePanel("browser")}
+          browserUrl={browserUrl}
+          searchResults={searchResults}
+          searchQuery={searchQuery}
+        />
+      ),
+    },
+    {
+      id: "parliament",
+      title: "Parliament",
+      component: (
+        <LeftPanel
+          mode="parliament"
+          onClose={() => handleTogglePanel("parliament")}
+          parliamentRoles={parliamentRoles}
+          parliamentRoleOutputs={parliamentRoleOutputs}
+          parliamentVoteResult={parliamentVoteResult}
+          onUpdateRole={updateParliamentRole}
+          debugMode={debugMode}
+        />
+      ),
+    },
+    {
+      id: "code",
+      title: "Code",
+      component: (
+        <RightPanel
+          mode="code"
+          onClose={() => handleTogglePanel("code")}
+          // Voice mode props
+          socket={socketRef.current}
+          isHandsFreeMode={isHandsFreeMode}
+          onHandsFreeModeChange={setIsHandsFreeMode}
+          onVisualizerReady={(visualizer) => {
+            visualizerRef.current = visualizer;
+          }}
+          // YouTube mode props
+          youtubeVideoId={youtubeVideoId}
+          youtubeUrl={youtubeUrl}
+          // Code mode props
+          codeContent={codeContent}
+          codeLanguage={codeLanguage}
+          onCodeChange={handleCodeEditorChange}
+          onCodeLanguageChange={setCodeLanguage}
           fileTree={fileTree}
           workspaceRoot={workspaceRoot}
           onRefreshFileTree={() => requestFileTree(".")}
@@ -2092,29 +2126,216 @@ const App: React.FC = () => {
           onRenameFile={renamePath}
           onDeleteFile={deletePath}
           onChangeWorkspace={requestWorkspaceChange}
-            // Tools panel props
-            toolQuery={toolQuery}
-            onToolQueryChange={setToolQuery}
-            onRunToolSearch={runToolSearch}
-            toolResults={toolResults}
-            toolLoading={toolLoading}
-            toolError={toolError}
-            toolList={toolList}
-            selectedTool={selectedTool}
-            onSelectTool={setSelectedTool}
-            toolArgsText={toolArgsText}
-            onToolArgsChange={setToolArgsText}
-            onRunToolCall={runToolCall}
-            toolCallResult={toolCallResult}
-            // Media browser props
-            mediaBrowserQuery={mediaBrowserQuery}
-            onPlayMedia={handlePlayMedia}
-            novaSettings={novaSettings}
-          />
-        </>
-      )}
+          // Tools panel props
+          toolQuery={toolQuery}
+          onToolQueryChange={setToolQuery}
+          onRunToolSearch={runToolSearch}
+          toolResults={toolResults}
+          toolLoading={toolLoading}
+          toolError={toolError}
+          toolList={toolList}
+          selectedTool={selectedTool}
+          onSelectTool={setSelectedTool}
+          toolArgsText={toolArgsText}
+          onToolArgsChange={setToolArgsText}
+          onRunToolCall={runToolCall}
+          toolCallResult={toolCallResult}
+          // Media browser props
+          mediaBrowserQuery={mediaBrowserQuery}
+          onPlayMedia={handlePlayMedia}
+          novaSettings={novaSettings}
+        />
+      ),
+    },
+    {
+      id: "agent-coding",
+      title: "Agent Coding",
+      component: (
+        <AgentCodingPanel
+          socket={socketRef.current}
+          workspaceRoot={workspaceRoot}
+          onFileOpen={(path) => {
+            openFileFromTree(path);
+            setRightPanelMode("code");
+          }}
+        />
+      ),
+    },
+    {
+      id: "voice",
+      title: "Voice",
+      component: (
+        <RightPanel
+          mode="voice"
+          onClose={() => handleTogglePanel("voice")}
+          socket={socketRef.current}
+          isHandsFreeMode={isHandsFreeMode}
+          onHandsFreeModeChange={setIsHandsFreeMode}
+          onVisualizerReady={(visualizer) => {
+            visualizerRef.current = visualizer;
+          }}
+          youtubeVideoId={youtubeVideoId}
+          youtubeUrl={youtubeUrl}
+          codeContent={codeContent}
+          codeLanguage={codeLanguage}
+          onCodeChange={handleCodeEditorChange}
+          onCodeLanguageChange={setCodeLanguage}
+          fileTree={fileTree}
+          workspaceRoot={workspaceRoot}
+          onRefreshFileTree={() => requestFileTree(".")}
+          onOpenFileFromTree={openFileFromTree}
+          openFiles={openFiles}
+          activeFilePath={activeFilePath}
+          onSelectOpenFile={selectOpenFile}
+          onCloseFile={closeOpenFile}
+          onSaveActiveFile={saveActiveFile}
+          isLoadingFileTree={isLoadingFileTree}
+          onCreateFile={createFile}
+          onCreateFolder={createFolder}
+          onRenameFile={renamePath}
+          onDeleteFile={deletePath}
+          onChangeWorkspace={requestWorkspaceChange}
+          toolQuery={toolQuery}
+          onToolQueryChange={setToolQuery}
+          onRunToolSearch={runToolSearch}
+          toolResults={toolResults}
+          toolLoading={toolLoading}
+          toolError={toolError}
+          toolList={toolList}
+          selectedTool={selectedTool}
+          onSelectTool={setSelectedTool}
+          toolArgsText={toolArgsText}
+          onToolArgsChange={setToolArgsText}
+          onRunToolCall={runToolCall}
+          toolCallResult={toolCallResult}
+          mediaBrowserQuery={mediaBrowserQuery}
+          onPlayMedia={handlePlayMedia}
+          novaSettings={novaSettings}
+        />
+      ),
+    },
+    {
+      id: "youtube",
+      title: "YouTube",
+      component: (
+        <RightPanel
+          mode="youtube"
+          onClose={() => handleTogglePanel("youtube")}
+          socket={socketRef.current}
+          isHandsFreeMode={isHandsFreeMode}
+          onHandsFreeModeChange={setIsHandsFreeMode}
+          youtubeVideoId={youtubeVideoId}
+          youtubeUrl={youtubeUrl}
+          onPopOutVideo={(videoId) => setMiniPlayerVideoId(videoId)}
+          codeContent={codeContent}
+          codeLanguage={codeLanguage}
+          onCodeChange={handleCodeEditorChange}
+          onCodeLanguageChange={setCodeLanguage}
+          fileTree={fileTree}
+          workspaceRoot={workspaceRoot}
+          onRefreshFileTree={() => requestFileTree(".")}
+          onOpenFileFromTree={openFileFromTree}
+          openFiles={openFiles}
+          activeFilePath={activeFilePath}
+          onSelectOpenFile={selectOpenFile}
+          onCloseFile={closeOpenFile}
+          onSaveActiveFile={saveActiveFile}
+          isLoadingFileTree={isLoadingFileTree}
+          onCreateFile={createFile}
+          onCreateFolder={createFolder}
+          onRenameFile={renamePath}
+          onDeleteFile={deletePath}
+          onChangeWorkspace={requestWorkspaceChange}
+          toolQuery={toolQuery}
+          onToolQueryChange={setToolQuery}
+          onRunToolSearch={runToolSearch}
+          toolResults={toolResults}
+          toolLoading={toolLoading}
+          toolError={toolError}
+          toolList={toolList}
+          selectedTool={selectedTool}
+          onSelectTool={setSelectedTool}
+          toolArgsText={toolArgsText}
+          onToolArgsChange={setToolArgsText}
+          onRunToolCall={runToolCall}
+          toolCallResult={toolCallResult}
+          mediaBrowserQuery={mediaBrowserQuery}
+          onPlayMedia={handlePlayMedia}
+          novaSettings={novaSettings}
+        />
+      ),
+    },
+    {
+      id: "tools",
+      title: "Tools",
+      component: (
+        <RightPanel
+          mode="tools"
+          onClose={() => handleTogglePanel("tools")}
+          socket={socketRef.current}
+          isHandsFreeMode={isHandsFreeMode}
+          onHandsFreeModeChange={setIsHandsFreeMode}
+          youtubeVideoId={youtubeVideoId}
+          youtubeUrl={youtubeUrl}
+          codeContent={codeContent}
+          codeLanguage={codeLanguage}
+          onCodeChange={handleCodeEditorChange}
+          onCodeLanguageChange={setCodeLanguage}
+          fileTree={fileTree}
+          workspaceRoot={workspaceRoot}
+          onRefreshFileTree={() => requestFileTree(".")}
+          onOpenFileFromTree={openFileFromTree}
+          openFiles={openFiles}
+          activeFilePath={activeFilePath}
+          onSelectOpenFile={selectOpenFile}
+          onCloseFile={closeOpenFile}
+          onSaveActiveFile={saveActiveFile}
+          isLoadingFileTree={isLoadingFileTree}
+          onCreateFile={createFile}
+          onCreateFolder={createFolder}
+          onRenameFile={renamePath}
+          onDeleteFile={deletePath}
+          onChangeWorkspace={requestWorkspaceChange}
+          toolQuery={toolQuery}
+          onToolQueryChange={setToolQuery}
+          onRunToolSearch={runToolSearch}
+          toolResults={toolResults}
+          toolLoading={toolLoading}
+          toolError={toolError}
+          toolList={toolList}
+          selectedTool={selectedTool}
+          onSelectTool={setSelectedTool}
+          toolArgsText={toolArgsText}
+          onToolArgsChange={setToolArgsText}
+          onRunToolCall={runToolCall}
+          toolCallResult={toolCallResult}
+          mediaBrowserQuery={mediaBrowserQuery}
+          onPlayMedia={handlePlayMedia}
+          novaSettings={novaSettings}
+        />
+      ),
+    },
+  ].filter((panel) => visiblePanelIds.includes(panel.id));
 
-      {/* Image Generator Modal */}
+  return (
+    <div
+      className="h-screen w-screen overflow-hidden"
+      style={{ backgroundColor: theme.backgroundColor }}
+    >
+      <Toaster position="top-right" />
+      <Toolbar activePanels={activePanels} onTogglePanel={handleTogglePanel} />
+      <div className="grid-wrapper">
+        <PanelManager
+          panels={panels}
+          onPanelMoveOrResize={(id) => {
+            if (id === "browser") triggerBrowserSync();
+          }}
+        />
+      </div>
+      <UsagePanel
+        isOpen={showUsagePanel}
+        onClose={() => setShowUsagePanel(false)}
+      />
       {showImageGenerator && (
         <ImageGenerator
           prompt={imageGenerationPrompt}
@@ -2122,8 +2343,29 @@ const App: React.FC = () => {
           onClose={() => setShowImageGenerator(false)}
         />
       )}
+      <CommandPalette
+        isOpen={isCommandPaletteOpen}
+        onClose={() => setIsCommandPaletteOpen(false)}
+        onTogglePanel={handleTogglePanel}
+        onExecuteCommand={handleExecuteCommand}
+        activePanels={activePanels}
+      />
+      {miniPlayerVideoId && (
+        <MiniPlayer
+          videoId={miniPlayerVideoId}
+          onClose={() => setMiniPlayerVideoId("")}
+        />
+      )}
     </div>
   );
 };
 
 export default App;
+
+
+
+
+
+
+
+

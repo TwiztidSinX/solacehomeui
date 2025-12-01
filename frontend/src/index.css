@@ -409,3 +409,91 @@ body {
     text-align: center;
     padding: 40px;
 }
+
+/* Panel Manager Styles */
+.layout {
+  background: #1a1a1a;
+  min-height: 100vh;
+  min-width: 1200px;
+  padding: 8px;
+}
+
+.panel-container {
+  background: #2a2a2a;
+  border: 1px solid #3a3a3a;
+  border-radius: 8px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  height: 100%; /* Fill grid cell vertically */
+}
+
+.panel-header {
+  background: #333;
+  padding: 8px 12px;
+  cursor: move;
+  font-weight: 600;
+  border-bottom: 1px solid #3a3a3a;
+  flex-shrink: 0; /* Prevent header from shrinking */
+}
+
+.panel-content {
+  flex: 1;
+  overflow: auto; /* Scroll only panel content, not page */
+  padding: 0; /* No padding - panels handle their own spacing */
+  min-height: 0; /* Allow flex child to shrink below content size */
+}
+
+.grid-wrapper {
+  height: calc(100vh - 60px);
+  padding-top: 60px;
+  overflow: auto; /* Allow page scroll - panels handle their own scroll */
+}
+
+/* Toolbar Styles */
+.toolbar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 50px;
+  background: #1a1a1a;
+  border-bottom: 1px solid #3a3a3a;
+  display: flex;
+  gap: 8px;
+  padding: 8px;
+  z-index: 1000;
+}
+
+.toolbar-button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: #2a2a2a;
+  border: 1px solid #3a3a3a;
+  border-radius: 6px;
+  color: #ffffff;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.toolbar-button:hover {
+  background: #3a3a3a;
+}
+
+.toolbar-button.active {
+  background: #4a4a4a;
+  border-color: #5a5a5a;
+}
+
+.toolbar-button .icon {
+  font-size: 18px;
+}
+
+.toolbar-button .label {
+  font-size: 14px;
+}
+#chat-container {
+  overscroll-behavior: contain;
+}

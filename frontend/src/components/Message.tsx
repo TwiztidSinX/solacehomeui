@@ -2,6 +2,8 @@ import React, { useEffect } from 'react';
 import hljs from 'highlight.js';
 import 'highlight.js/styles/github-dark.css';
 import ThoughtBubble from './ThoughtBubble';
+import TokenBadge from './TokenBadge';
+import { TokenMetrics } from '../types';
 
 interface MessageProps {
   sender: string;
@@ -15,6 +17,7 @@ interface MessageProps {
   youtubeVideoId?: string;
   imageGalleryUrls?: string[];
   imageUrl?: string;
+  tokenMetrics?: TokenMetrics;
 }
 
 const formatMarkdown = (content: string) => {
@@ -55,6 +58,7 @@ const Message: React.FC<MessageProps> = ({
   youtubeVideoId,
   imageGalleryUrls,
   imageUrl,
+  tokenMetrics,
 }) => {
   useEffect(() => {
     // This re-highlights blocks when message content changes (e.g., streaming)
@@ -163,10 +167,10 @@ const Message: React.FC<MessageProps> = ({
   return (
     <div className="flex items-start gap-4 w-full">
       {/* AI Avatar */}
-      <img 
-        src={avatar || '/nova-logo.png'} 
-        alt="AI Avatar" 
-        className="w-8 h-8 rounded-full object-cover" 
+      <img
+        src={avatar || '/nova-logo.png'}
+        alt="AI Avatar"
+        className="w-8 h-8 rounded-full object-cover"
       />
       {/* AI Message Panel Content */}
       <div className="flex-1 min-w-0 pt-1">
@@ -175,6 +179,12 @@ const Message: React.FC<MessageProps> = ({
           <ThoughtBubble isThinking={isThinking} thought={thought} />
         )}
         {renderMessageContent()}
+        {/* Token Metrics Badge - only show for completed AI messages */}
+        {tokenMetrics && !isThinking && (
+          <div className="mt-2 flex justify-end">
+            <TokenBadge metrics={tokenMetrics} />
+          </div>
+        )}
       </div>
     </div>
   );

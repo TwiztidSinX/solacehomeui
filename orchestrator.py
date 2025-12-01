@@ -349,17 +349,23 @@ Remember: Think as much as you need, then output TITLE_START your title TITLE_EN
 """
 
     messages = [
-        {"role": "system", "content": "You are a title generator. Think deeply about the user's message, then output a concise title wrapped in TITLE_START and TITLE_END tags."},
+        {
+            "role": "system",
+            "content": (
+                "You are a title generator. If you think through the task, put your reasoning inside <think>...</think>.\n"
+                "Then output ONLY the final title wrapped in TITLE_START and TITLE_END tags.\n"
+                "Never leave <think> text in the final title."
+            ),
+        },
         {"role": "user", "content": prompt}
     ]
 
     try:
-        # Give Nova PLENTY of tokens for her verbose reasoning
         response = orchestrator_model.create_chat_completion(
             messages=messages,
             temperature=0.3,
-            max_tokens=8192,  # Enough for 4K reasoning + output
-            # NO stop sequences - let her finish naturally
+            max_tokens=200,  # Allow thinking + final title for CoT models
+            stop=["---", "User:", "AI:"]
         )
         raw_content = response.get('choices', [{}])[0].get('message', {}).get('content', '').strip()
 
@@ -368,8 +374,13 @@ Remember: Think as much as you need, then output TITLE_START your title TITLE_EN
         print(f"  First 200 chars: {raw_content[:200]}")
         print(f"  Last 200 chars: {raw_content[-200:]}")
 
+        # Strip think blocks before parsing
+        cleaned_output = re.sub(r'<think>.*?</think>', '', raw_content, flags=re.DOTALL | re.IGNORECASE).strip()
+
+        parse_target = cleaned_output or raw_content
+
         # Extract title using the TITLE_START/TITLE_END markers
-        title_match = re.search(r'TITLE_START\s*(.+?)\s*TITLE_END', raw_content, re.DOTALL | re.IGNORECASE)
+        title_match = re.search(r'TITLE_START\s*(.+?)\s*TITLE_END', parse_target, re.DOTALL | re.IGNORECASE)
         
         if title_match:
             title = title_match.group(1).strip()
@@ -386,7 +397,7 @@ Remember: Think as much as you need, then output TITLE_START your title TITLE_EN
             return title if title else "Chat Summary"
 
         # Fallback 1: Try the old [TITLE] format in case model uses it anyway
-        legacy_match = re.search(r'\[TITLE\](.+?)\[/TITLE\]', raw_content, re.IGNORECASE | re.DOTALL)
+        legacy_match = re.search(r'\[TITLE\](.+?)\[/TITLE\]', parse_target, re.IGNORECASE | re.DOTALL)
         if legacy_match:
             title = legacy_match.group(1).strip().strip('"').strip("'").strip()
             title = ' '.join(title.split())
@@ -396,7 +407,7 @@ Remember: Think as much as you need, then output TITLE_START your title TITLE_EN
             return title if title else "Chat Summary"
 
         # Fallback 2: Look for "Chat Title:" pattern
-        chat_title_match = re.search(r'Chat Title:\s*(.+?)(?:\n|$)', raw_content, re.IGNORECASE)
+        chat_title_match = re.search(r'Chat Title:\s*(.+?)(?:\n|$)', parse_target, re.IGNORECASE)
         if chat_title_match:
             title = chat_title_match.group(1).strip().strip('"').strip("'").strip()
             title = ' '.join(title.split())
@@ -406,7 +417,7 @@ Remember: Think as much as you need, then output TITLE_START your title TITLE_EN
             return title if title else "Chat Summary"
 
         # Fallback 3: Find the last short line (likely the final answer after reasoning)
-        lines = [line.strip() for line in raw_content.split('\n') if line.strip()]
+        lines = [line.strip() for line in parse_target.split('\n') if line.strip()]
         for line in reversed(lines):
             # Skip lines that are clearly reasoning/thinking
             if any(word in line.lower() for word in [
@@ -497,37 +508,40 @@ def score_response_confidence(response: str, user_query: str) -> dict:
 
     # Quick heuristic checks first (fast path)
     uncertainty_phrases = [
-        "i don't know", "i'm not sure", "i cannot", "i can't",
-        "not certain", "unclear", "uncertain", "probably", "maybe",
-        "possibly", "might be", "could be", "i think", "i believe",
-        "as far as i know", "to the best of my knowledge",
-        "i don't have access", "i cannot access", "my knowledge cutoff"
+        r"\bi don't know\b", r"\bi’m not sure\b", r"\bi'm not sure\b",
+        r"\bi cannot\b", r"\bi can't\b", r"\bnot certain\b", r"\bunclear\b", r"\buncertain\b",
+        r"\bprobably\b", r"\bmaybe\b", r"\bpossibly\b", r"\bmight be\b", r"\bcould be\b",
+        r"\bi think\b", r"\bi believe\b", r"\bas far as i know\b", r"\bto the best of my knowledge\b",
+        r"\bi don't have access\b", r"\bi cannot access\b", r"\bmy knowledge cutoff\b"
     ]
 
     response_lower = response.lower()
-    uncertainty_count = sum(1 for phrase in uncertainty_phrases if phrase in response_lower)
+    uncertainty_count = 0
+    for pattern in uncertainty_phrases:
+        if re.search(pattern, response_lower):
+            uncertainty_count += 1
 
-    # If response is very short, it might be evasive
+    # If response is very short, it might be light-weight but not necessarily evasive
     if len(response.strip()) < 20:
         return {
-            'score': 40.0,
-            'reasoning': 'Response too short/evasive',
+            'score': 70.0,
+            'reasoning': 'Very short response',
             'should_search': True
         }
 
-    # If multiple uncertainty markers, immediate low score
+    # Softer penalty for uncertainty markers to avoid over-triggering
     if uncertainty_count >= 3:
         return {
-            'score': 30.0,
+            'score': 55.0,
             'reasoning': f'High uncertainty ({uncertainty_count} markers)',
             'should_search': True
         }
     elif uncertainty_count >= 1:
-        base_score = 60.0 - (uncertainty_count * 15)
+        base_score = max(60.0, 85.0 - (uncertainty_count * 10))
         return {
             'score': base_score,
             'reasoning': f'Moderate uncertainty ({uncertainty_count} markers)',
-            'should_search': base_score < 80
+            'should_search': base_score < 70
         }
     # Check if user was TELLING information (not asking)
     # These should NEVER trigger low confidence or search
@@ -649,22 +663,23 @@ def summarize_for_memory(user_input: str, ai_response: str) -> list:
     if len(user_input) < 10 and len(ai_response) < 20:
         return []
 
-    prompt = f"""Extract key facts from this conversation exchange. Focus on:
-- What the user is interested in or working on
-- Specific information shared (names, technologies, preferences)
-- Problems the user is trying to solve
-- User's skill level or background (if mentioned)
+    prompt = f"""Extract ONLY genuinely meaningful facts from this conversation. 
 
-Remove conversational fluff like greetings, pleasantries, and filler phrases.
-Output ONLY factual statements, one per line. Maximum 5 facts.
+Guidelines:
+- Focus on: user interests, specific information (names/tech/preferences), problems being solved, skill level
+- IGNORE: greetings, pleasantries, casual conversation, generic responses
+- Quality over quantity: Extract 0-5 facts depending on information density
+- If the exchange is just casual chat with no real info, return NOTHING
+
+Output format: One fact per line. No numbering, bullets, or labels.
 
 User: {user_input}
 AI: {ai_response}
 
-Key Facts:"""
+Meaningful Facts (if any):"""
 
     messages = [
-        {"role": "system", "content": "You are a fact extractor. Output only concise factual statements, one per line. No explanations, no fluff."},
+        {"role": "system", "content": "You are a fact extractor. Only output genuinely meaningful facts. If there are no meaningful facts, output nothing. No meta-commentary, no fluff, no generic observations."},
         {"role": "user", "content": prompt}
     ]
 
@@ -686,25 +701,28 @@ Key Facts:"""
             line = re.sub(r'^[\d\.\-\*\•]+\s*', '', line)
             line = line.strip()
 
-            # Skip empty lines, meta-commentary, or very short lines
-            if len(line) < 10:
+            # Skip empty lines or very short lines
+            if len(line) < 20:
                 continue
             if line.lower().startswith(('note:', 'fact:', 'key fact:', 'summary:')):
                 line = re.sub(r'^[^:]+:\s*', '', line, flags=re.IGNORECASE).strip()
 
             # Skip lines that are too generic
-            generic_phrases = ['the user asked', 'the ai responded', 'conversation about', 'discussion about']
+            generic_phrases = [
+                'the user asked', 'the ai responded', 'conversation about', 'discussion about',
+                'user wants', 'user is asking', 'ai explains', 'ai suggests',
+                'greeting exchange', 'casual conversation'
+            ]
             if any(phrase in line.lower() for phrase in generic_phrases):
                 continue
 
-            if line:
+            if line and len(line) >= 20:
                 facts.append(line)
 
-        # Limit to top 5 most meaningful facts
-        facts = facts[:5]
-
         if facts:
-            print(f"📝 Extracted {len(facts)} facts for memory")
+            print(f" Extracted {len(facts)} facts for memory")
+        else:
+            print(f" No meaningful facts extracted (casual conversation)")
         return facts
 
     except Exception as e:
@@ -941,7 +959,7 @@ def parse_command(user_input: str):
         
         # Define all valid commands
         valid_commands = [
-            "search", "youtube", "go", "read", "image",
+            "search", "youtube", "browser", "go", "read", "image",
             "map", "maps", "wiki", "weather", "calc", "define", "play",
             "media"
         ]

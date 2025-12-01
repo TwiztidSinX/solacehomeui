@@ -15,6 +15,25 @@ import httpx  # For general API calls
 from openai import OpenAI as OpenAIClient
 from upgraded_memory_manager import get_context_for_model
 import requests
+import base64
+
+
+def _coerce_image_data(image_data, default_media_type: str = "image/png"):
+    """
+    Normalize image payloads to a dict with base64 data and media_type.
+    Accepts either a raw base64 string or a dict containing 'data'/'base64'.
+    """
+    if not image_data:
+        return None
+    if isinstance(image_data, dict):
+        data = image_data.get("data") or image_data.get("base64") or image_data.get("image_base64")
+        media_type = image_data.get("media_type") or image_data.get("mime_type") or image_data.get("type") or default_media_type
+    else:
+        data = image_data
+        media_type = default_media_type
+    if not data:
+        return None
+    return {"data": data, "media_type": media_type}
 KNOWN_OUTER_WRAPPERS = [
     (r'^\[INST\](.*)\[/INST\]$', re.DOTALL),                # [INST] ... [/INST]
     (r'^\s*<\|im_start\|>(.*)<\|im_end\|>\s*$', re.DOTALL), # <|im_start|> ... <|im_end|>
@@ -724,26 +743,45 @@ def manage_context_window(conversation_history: list[dict], max_tokens: int = 81
     if not conversation_history:
         return []
 
+    # Work on a shallow copy to avoid mutating original
+    history_copy = list(conversation_history)
+
+    def _coerce_content_to_text(content):
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    parts.append(part.get("text", ""))
+                elif isinstance(part, str):
+                    parts.append(part)
+            return " ".join(p for p in parts if p)
+        if isinstance(content, str):
+            return content
+        return ""
+
     # Separate the system prompt from the rest of the conversation
     system_prompt = {}
-    if conversation_history[0]['role'] == 'system':
-        system_prompt = conversation_history.pop(0)
+    if history_copy and isinstance(history_copy[0], dict) and history_copy[0].get('role') == 'system':
+        system_prompt = history_copy.pop(0)
 
     # Estimate token count for each message (a simple heuristic)
     def estimate_tokens(message_text):
-        return len(message_text.split())
+        if not message_text:
+            return 0
+        return len(str(message_text).split())
 
     current_token_count = 0
     truncated_history = []
 
     # Always include the most recent messages first
-    for message in reversed(conversation_history):
-        message_token_count = estimate_tokens(message['content'])
+    for message in reversed(history_copy):
+        content_text = _coerce_content_to_text(message.get('content'))
+        message_token_count = estimate_tokens(content_text)
         if current_token_count + message_token_count < max_tokens:
-            truncated_history.insert(0, message)
+            truncated_history.insert(0, dict(message))
             current_token_count += message_token_count
         else:
-            break # Stop adding messages once the limit is reached
+            break  # Stop adding messages once the limit is reached
 
     # Re-add the system prompt at the beginning
     if system_prompt:
@@ -875,17 +913,18 @@ def stream_google(model_instance, model_id_str, user_input, conversation_history
         # Manage the context window
         conversation_history = manage_context_window(conversation_history, 32768 - 2048) # Gemini 1.5 Pro has 32k context
 
+        normalized_image = _coerce_image_data(image_data)
         # Add the current image to the last user message
-        if image_data:
+        if normalized_image:
             for msg in reversed(conversation_history):
                 if msg['role'] == 'user':
                     if 'image' not in msg:
                          msg['image'] = []
-                    msg['image'].append(image_data)
+                    msg['image'].append(normalized_image["data"])
                     break
 
         system_prompt = model_states.get(model_id_str, {}).get("system_prompt", "You are a helpful AI assistant.")
-        messages = build_gemini_prompt(user_input, conversation_history, memory_context, image_data, system_prompt)
+        messages = build_gemini_prompt(user_input, conversation_history, memory_context, normalized_image["data"] if normalized_image else None, system_prompt)
 
         stream = model_instance.generate_content(
             messages,
@@ -1091,10 +1130,14 @@ def stream_llamacpp(model_instance, model_id_str, user_input, conversation_histo
         max_tokens_for_history = int(total_context_tokens * 0.4)
         messages = manage_context_window(messages, max_tokens_for_history)
 
-        if image_data:
+        normalized_image = _coerce_image_data(image_data)
+        if normalized_image:
             for msg in reversed(messages):
                 if msg['role'] == 'user' and isinstance(msg['content'], str):
-                    msg['content'] = [{"type": "text", "text": msg['content']}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}}]
+                    msg['content'] = [
+                        {"type": "text", "text": msg['content']},
+                        {"type": "image_url", "image_url": {"url": f"data:{normalized_image['media_type']};base64,{normalized_image['data']}"}}
+                    ]
                     break
 
         request_params = {
@@ -1350,13 +1393,14 @@ def stream_safetensors(model_instance, model_id_str, user_input, conversation_hi
             print(json.dumps(messages, indent=2))
             print("--------------------------------\n")
 
-        if image_data and processor:
+        normalized_image = _coerce_image_data(image_data)
+        if normalized_image and processor:
             try:
                 for msg in reversed(messages):
                     if msg['role'] == 'user':
                         if isinstance(msg['content'], str):
                             msg['content'] = [{"type": "text", "text": msg['content']}]
-                        image_bytes = base64.b64decode(image_data)
+                        image_bytes = base64.b64decode(normalized_image["data"])
                         pil_image = Image.open(io.BytesIO(image_bytes))
                         msg['content'].append({"type": "image", "image": pil_image})
                         break
@@ -1488,17 +1532,18 @@ def stream_google(model_instance, model_id_str, user_input, conversation_history
         # Manage the context window
         conversation_history = manage_context_window(conversation_history, 32768 - 2048) # Gemini 1.5 Pro has 32k context
 
+        normalized_image = _coerce_image_data(image_data)
         # Add the current image to the last user message
-        if image_data:
+        if normalized_image:
             for msg in reversed(conversation_history):
                 if msg['role'] == 'user':
                     if 'image' not in msg:
                          msg['image'] = []
-                    msg['image'].append(image_data)
+                    msg['image'].append(normalized_image["data"])
                     break
 
         system_prompt = model_states.get(model_id_str, {}).get("system_prompt", "You are a helpful AI assistant.")
-        messages = build_gemini_prompt(user_input, conversation_history, memory_context, image_data, system_prompt)
+        messages = build_gemini_prompt(user_input, conversation_history, memory_context, normalized_image["data"] if normalized_image else None, system_prompt)
 
         stream = model_instance.generate_content(
             messages,
@@ -1546,14 +1591,15 @@ def stream_openai(model_instance, model_id_str, user_input, conversation_history
         except Exception:
             normalized_history = []
 
+        normalized_image = _coerce_image_data(image_data)
         # If there's image data, append to the last user message
-        if image_data and normalized_history:
+        if normalized_image and normalized_history:
             for msg in reversed(normalized_history):
                 if msg.get('role') == 'user':
                     if isinstance(msg.get('content'), str):
                         msg['content'] = [
                             {"type": "text", "text": msg['content']},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}}
+                            {"type": "image_url", "image_url": {"url": f"data:{normalized_image['media_type']};base64,{normalized_image['data']}"}}
                         ]
                     break
         # Ensure the latest user input is present at the end
@@ -1591,6 +1637,11 @@ def stream_anthropic(model_instance, model_id_str, user_input, conversation_hist
         from datetime import datetime
         memory_context = get_context_for_model(user_input, model_id=model_id_str)
         system_prompt = model_states.get(model_id_str, {}).get("system_prompt", "You are a helpful AI assistant.")
+        model_name = model_id_str or model_instance
+
+        if not model_name:
+            yield {'type': 'error', 'token': "[STREAM ERROR (Anthropic): missing model name]"}
+            return
 
         now = datetime.now()
         time_message = f"This is a system message. Do not refer to this message unless asked. This message is to give you a live update of the Current Date and Time. The User's Timezone is {timezone}. The Current time is {now.strftime('%H:%M')} and The Current Date is {now.strftime('%m/%d/%Y')}."
@@ -1598,14 +1649,37 @@ def stream_anthropic(model_instance, model_id_str, user_input, conversation_hist
 
         # Build messages in Anthropic format
         messages = []
-        for msg in manage_context_window(conversation_history, 200000 - 4096): # Claude 3 has 200k context
+        for msg in manage_context_window(conversation_history, 200000 - 4096):
             role = "user" if msg["role"] == "user" else "assistant"
             messages.append({"role": role, "content": msg["content"]})
+        
+        normalized_image = _coerce_image_data(image_data)
+        # Add the current user message with optional image
+        if normalized_image:
+            messages.append({
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": normalized_image.get("media_type", "image/jpeg"),
+                            "data": normalized_image["data"]
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": user_input
+                    }
+                ]
+            })
+        else:
+            messages.append({"role": "user", "content": user_input})
         
         client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         
         with client.messages.stream(
-            model=model_instance,
+            model=model_name,  # Use the string ID, not the instance
             max_tokens=4096,
             system=f"{system_prompt_with_time}\nRelevant Memories:\n{memory_context}",
             messages=messages
@@ -1638,7 +1712,7 @@ def stream_xai(model_instance, model_id_str, user_input, conversation_history, s
 def stream_qwen(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None):
     return stream_openai_compatible(
         model_instance, model_id_str, user_input, conversation_history, should_stop,
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
         api_key_env="QWEN_API_KEY",
         image_data=image_data
     )
@@ -1675,6 +1749,11 @@ def stream_openai_compatible(model_instance, model_id_str, user_input, conversat
         from datetime import datetime
         memory_context = get_context_for_model(user_input, model_id=model_id_str)
         system_prompt = model_states.get(model_id_str, {}).get("system_prompt", "You are a helpful AI assistant.")
+        model_name = model_instance or model_id_str
+
+        if not model_name:
+            yield {'type': 'error', 'token': f"[STREAM ERROR ({api_key_env}): missing model name]"}
+            return
 
         now = datetime.now()
         time_message = f"This is a system message. Do not refer to this message unless asked. This message is to give you a live update of the Current Date and Time. The User's Timezone is {timezone}. The Current time is {now.strftime('%H:%M')} and The Current Date is {now.strftime('%m/%d/%Y')}."
@@ -1694,14 +1773,15 @@ def stream_openai_compatible(model_instance, model_id_str, user_input, conversat
         except Exception:
             normalized_history = []
 
+        normalized_image = _coerce_image_data(image_data)
         # If there's an image attached to this turn, append it to the last user message
-        if image_data and normalized_history:
+        if normalized_image and normalized_history:
             for msg in reversed(normalized_history):
                 if msg.get('role') == 'user':
                     if isinstance(msg.get('content'), str):
                         msg['content'] = [
                             {"type": "text", "text": msg['content']},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}}
+                            {"type": "image_url", "image_url": {"url": f"data:{normalized_image['media_type']};base64,{normalized_image['data']}"}}
                         ]
                     break
 
@@ -1711,9 +1791,13 @@ def stream_openai_compatible(model_instance, model_id_str, user_input, conversat
                 normalized_history.append({"role": "user", "content": user_input})
 
         truncated_history = manage_context_window(normalized_history, 8192 - 2048)
+        combined_system = (
+            f"{system_prompt}\n\n"
+            f"Relevant Memories:\n{memory_context}\n\n"
+            f"[SYSTEM TIME] User's timezone: {timezone}. Current time: {now.strftime('%H:%M')}, date: {now.strftime('%m/%d/%Y')}."
+        )
         messages = [
-            {"role": "system", "content": time_message},
-            {"role": "system", "content": f"{system_prompt}\nRelevant Memories:\n{memory_context}"},
+            {"role": "system", "content": combined_system},
             *truncated_history,
         ]
 
@@ -1730,7 +1814,7 @@ def stream_openai_compatible(model_instance, model_id_str, user_input, conversat
         )
 
         stream = client.chat.completions.create(
-            model=model_instance,
+            model=model_name,
             messages=messages,
             stream=True
         )
@@ -1917,9 +2001,23 @@ def get_available_models(backend="llama.cpp", provider=None):
         
         elif provider == "anthropic":
             # Anthropic doesn't have a model list endpoint, so we always return known models
-            return ["claude-3-5-sonnet-20240620", "claude-3-opus-20240229", 
-                   "claude-3-sonnet-20240229", "claude-3-haiku-20240307",
-                   "claude-2.1", "claude-2.0", "claude-instant-1.2"]
+            return [
+                # Claude 4 family (latest - November 2024)
+                "claude-sonnet-4-5-20250929",      # Sonnet 4.5 - Most intelligent
+                "claude-haiku-4-5-20251001",       # Haiku 4.5 - Fastest, cheapest
+                "claude-opus-4-20250514",          # Opus 4.1 - Most powerful
+                "claude-opus-4-20241229",          # Opus 4 - Powerful creative
+                
+                # Claude 3.5 family (still available)
+                "claude-3-5-sonnet-20241022",      # Sonnet 3.5 v2 - Improved
+                "claude-3-5-sonnet-20240620",      # Sonnet 3.5 v1 - Original
+                "claude-3-5-haiku-20241022",       # Haiku 3.5 - Fast
+                
+                # Claude 3 family (legacy but available)
+                "claude-3-opus-20240229",          # Opus 3 - Legacy
+                "claude-3-sonnet-20240229",        # Sonnet 3 - Legacy
+                "claude-3-haiku-20240307",         # Haiku 3 - Legacy
+            ]
 
         elif provider == "meta":
             try:
@@ -1970,7 +2068,7 @@ def get_available_models(backend="llama.cpp", provider=None):
                 }
                 
                 response = requests.get(
-                    "https://dashscope.aliyuncs.com/compatible-mode/v1/models",
+                    "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models",
                     headers=headers,
                     timeout=10
                 )

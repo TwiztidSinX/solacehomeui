@@ -149,7 +149,9 @@ class APIOrchestrator:
         temperature: float = 0.7,
         max_tokens: int = 1000,
         stop: Optional[List[str]] = None,
-        stream: bool = False
+        stream: bool = False,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         llama.cpp-style chat completion interface.
@@ -170,7 +172,7 @@ class APIOrchestrator:
         }
         
         # Build request
-        payload = {
+        payload: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "temperature": temperature
@@ -182,6 +184,10 @@ class APIOrchestrator:
         
         if stop:
             payload["stop"] = stop
+        if tools:
+            payload["tools"] = tools
+        if tool_choice:
+            payload["tool_choice"] = tool_choice
         
         # Make request
         try:

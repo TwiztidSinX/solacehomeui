@@ -16,7 +16,7 @@ from gnews import GNews
 from bson import ObjectId
 import platform
 from typing import Optional, Dict, Any
-
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 try:
     import psutil
 except ImportError:
@@ -38,6 +38,9 @@ try:
     from orchestrator import summarize_text
 except Exception:
     summarize_text = None
+
+from agentic_coding import CODING_TOOLS_SCHEMA
+from agent_coding_socket import get_coding_tool_registry
 
 # Path for dynamically registered tools
 DYNAMIC_TOOLS_PATH = Path(__file__).resolve().parent / 'dynamic_tools.json'
@@ -845,8 +848,135 @@ TOOLS_SCHEMA = [
                 "required": ["category"],
             },
         },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_click",
+            "description": "Clicks an element on the current browser page. Use CSS selectors to target elements (e.g., 'button.submit', '#login-btn', 'a[href=\"/tickets\"]'). The browser must already be open via /browser command.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector of the element to click (e.g., 'button.buy-now', '#submit', 'a.movie-title')",
+                    }
+                },
+                "required": ["selector"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_fill",
+            "description": "Fills a form field on the current browser page. Works with input, textarea, and select elements. Triggers input and change events for compatibility.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector of the form field (e.g., 'input[name=\"email\"]', '#password', 'select[name=\"quantity\"]')",
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "The value to enter into the field",
+                    }
+                },
+                "required": ["selector", "value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_get_content",
+            "description": "Gets the current page's content including title, URL, visible text, and HTML. Use this to understand what's on the page before taking actions.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_get_links",
+            "description": "Gets all clickable links on the current page with their text and URLs. Useful for navigation and finding specific links.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_get_form_fields",
+            "description": "Gets all form fields (inputs, selects, textareas) on the current page with their names, types, values, IDs, and placeholders. Use this to understand what information a form needs.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_scroll_to",
+            "description": "Scrolls to a specific element on the page, bringing it into view. Useful for accessing elements that are off-screen.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector of the element to scroll to",
+                    }
+                },
+                "required": ["selector"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_exec",
+            "description": "Executes custom JavaScript code in the browser page context. Advanced tool for complex interactions. Returns the result of the code execution.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "JavaScript code to execute (e.g., 'document.querySelectorAll(\".item\").length')",
+                    }
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_navigate",
+            "description": "Navigates the browser to a new URL. Opens the browser panel if not already open.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The URL to navigate to (e.g., 'https://example.com', 'google.com')",
+                    }
+                },
+                "required": ["url"],
+            },
+        },
     }
 ] + INTROSPECTION_TOOLS_SCHEMA  # Add introspection tools dynamically
+# Agentic coding tool schema (Nova-style coding agent)
+TOOLS_SCHEMA.extend(CODING_TOOLS_SCHEMA)
 
 # --- Dynamic tools storage ---
 
@@ -1827,6 +1957,112 @@ def validate_tool_params(tool_name: str, params: dict):
         "validated_params": params
     }
 
+# --- Browser Control Tools ---
+
+def browser_click(selector: str):
+    """
+    Clicks an element on the current browser page using the injected control bridge.
+    Returns a command payload for the frontend to execute.
+    """
+    print(f"Executing browser_click with selector: {selector}")
+    return {
+        "type": "browser_control",
+        "action": "click",
+        "selector": selector,
+        "message": f"Clicking element: {selector}"
+    }
+
+def browser_fill(selector: str, value: str):
+    """
+    Fills a form field on the current browser page.
+    Returns a command payload for the frontend to execute.
+    """
+    print(f"Executing browser_fill with selector: {selector}, value: {value[:50]}...")
+    return {
+        "type": "browser_control",
+        "action": "fill",
+        "selector": selector,
+        "value": value,
+        "message": f"Filling {selector} with value"
+    }
+
+def browser_get_content():
+    """
+    Gets the current page's content (title, URL, text, HTML).
+    Returns a command payload for the frontend to execute.
+    """
+    print("Executing browser_get_content")
+    return {
+        "type": "browser_control",
+        "action": "getContent",
+        "message": "Getting page content"
+    }
+
+def browser_get_links():
+    """
+    Gets all links on the current page.
+    Returns a command payload for the frontend to execute.
+    """
+    print("Executing browser_get_links")
+    return {
+        "type": "browser_control",
+        "action": "getLinks",
+        "message": "Getting all links on page"
+    }
+
+def browser_get_form_fields():
+    """
+    Gets all form fields on the current page.
+    Returns a command payload for the frontend to execute.
+    """
+    print("Executing browser_get_form_fields")
+    return {
+        "type": "browser_control",
+        "action": "getFormFields",
+        "message": "Getting all form fields on page"
+    }
+
+def browser_scroll_to(selector: str):
+    """
+    Scrolls to a specific element on the page.
+    Returns a command payload for the frontend to execute.
+    """
+    print(f"Executing browser_scroll_to with selector: {selector}")
+    return {
+        "type": "browser_control",
+        "action": "scrollTo",
+        "selector": selector,
+        "message": f"Scrolling to element: {selector}"
+    }
+
+def browser_exec(code: str):
+    """
+    Executes custom JavaScript code in the browser context.
+    Returns a command payload for the frontend to execute.
+    """
+    print(f"Executing browser_exec with code: {code[:100]}...")
+    return {
+        "type": "browser_control",
+        "action": "exec",
+        "code": code,
+        "message": "Executing custom JavaScript"
+    }
+
+def browser_navigate(url: str):
+    """
+    Navigates the browser to a new URL.
+    Returns a command payload for the frontend to execute.
+    """
+    print(f"Executing browser_navigate to: {url}")
+    # Add protocol if missing
+    if not url.startswith('http'):
+        url = 'https://' + url
+    return {
+        "type": "browser_navigate",
+        "url": url,
+        "message": f"Navigating to {url}"
+    }
+
 # --- Tool Dispatcher ---
 
 TOOL_REGISTRY = {
@@ -1883,11 +2119,25 @@ TOOL_REGISTRY = {
     "comfyui_generate": comfyui_generate,
     "searx_query": searx_query,
     "browser_iframe": browser_iframe,
+    "browser_click": browser_click,
+    "browser_fill": browser_fill,
+    "browser_get_content": browser_get_content,
+    "browser_get_links": browser_get_links,
+    "browser_get_form_fields": browser_get_form_fields,
+    "browser_scroll_to": browser_scroll_to,
+    "browser_exec": browser_exec,
+    "browser_navigate": browser_navigate,
     **INTROSPECTION_TOOL_REGISTRY  # Add introspection tools dynamically
 }
 
 # Load and register dynamic tools after base registry is defined
 load_dynamic_tools()
+
+# Register agentic coding tools (filesystem-aware coding operations)
+try:
+    TOOL_REGISTRY.update(get_coding_tool_registry(workspace_root="."))
+except Exception as e:
+    print(f"Failed to register agentic coding tools: {e}")
 
 def dispatch_tool(tool_name: str, arguments: dict):
     """

@@ -5,10 +5,15 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   build: {
-    outDir: '../static/react',
+    outDir: 'dist',
     emptyOutDir: true,
   },
+  // Vite options tailored for Tauri development
+  clearScreen: false,
   server: {
+    port: 5173,
+    strictPort: true,
+    // Proxy settings for development without Tauri
     proxy: {
       '/socket.io': {
         target: 'http://localhost:5000',
@@ -18,5 +23,6 @@ export default defineConfig({
         target: 'http://localhost:5000',
       }
     }
-  }
+  },
+  envPrefix: ['VITE_', 'TAURI_'],
 })
