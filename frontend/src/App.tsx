@@ -9,6 +9,7 @@ import MemoryGraph from "./components/MemoryGraph";
 import { type Message } from "./types";
 import { VoiceVisualizer } from "./VoiceVisualizer";
 import ImageGenerator from "./components/ImageGenerator";
+import MediaBrowser from "./components/MediaBrowser";
 import AgentCodingPanel from "./components/AgentCodingPanel";
 import { PanelManager } from "./components/PanelManager";
 import { Toolbar } from "./components/Toolbar";
@@ -29,6 +30,7 @@ import useTools from "./hooks/useTools";
 import { type FileNode } from "./types/files";
 import UsagePanel from "./components/UsagePanel";
 import { invoke } from "@tauri-apps/api/core";
+import { saveUIState, loadUIState, validateModelForBackend } from "./utils/stateStorage";
 interface ModelConfig {
   [key: string]: any;
 }
@@ -36,6 +38,8 @@ interface GraphData {
   nodes: any[];
   edges: any[];
 }
+
+const ACTIVE_PANEL_STORAGE_KEY = "solace-active-panels";
 
 const App: React.FC = () => {
   const {
@@ -110,6 +114,10 @@ const App: React.FC = () => {
   const [browserUrl, setBrowserUrl] = useState("");
   const [youtubeVideoId, setYoutubeVideoId] = useState("");
   const [youtubeUrl, setYoutubeUrl] = useState("");
+  const [mediaPlaybackUrl, setMediaPlaybackUrl] = useState("");
+  const [mediaTitle, setMediaTitle] = useState("");
+  const [mediaDescription, setMediaDescription] = useState("");
+  const [_mediaMetadata, setMediaMetadata] = useState<any>(null);
   const [miniPlayerVideoId, setMiniPlayerVideoId] = useState("");
   const [parliamentRoles, setParliamentRoles] =
     useState<ParliamentRoleConfig[]>(PARLIAMENT_ROLES);
@@ -140,6 +148,7 @@ const App: React.FC = () => {
   const [isHandsFreeMode, setIsHandsFreeMode] = useState(false); // State for speech-to-speech
   const [showImageGenerator, setShowImageGenerator] = useState(false);
   const [imageGenerationPrompt, setImageGenerationPrompt] = useState("");
+  const [showMediaBrowser, setShowMediaBrowser] = useState(false);
   const [mediaBrowserQuery, setMediaBrowserQuery] = useState("");
 
   // Settings State
@@ -147,7 +156,7 @@ const App: React.FC = () => {
     {},
   );
   const [availableModels, setAvailableModels] = useState<string[]>([]);
-  const [currentBackend, setCurrentBackend] = useState("llama.cpp");
+  const [currentBackend, setCurrentBackend] = useState("llama-cpp-python");
   const [selectedModel, setSelectedModel] = useState("");
   const [apiProvider, setApiProvider] = useState("openai");
   const [apiKey, setApiKey] = useState("");
@@ -804,6 +813,9 @@ const App: React.FC = () => {
       prompt?: string;
       query?: string;
       image_url?: string;
+      title?: string;
+      description?: string;
+      metadata?: any;
     }) => {
       if (data.type === "image_generation") {
         setImageGenerationPrompt(data.prompt || "");
@@ -811,8 +823,25 @@ const App: React.FC = () => {
         return; // Don't add a message for this, it's a UI action
       } else if (data.type === "media_browser") {
         setMediaBrowserQuery(data.query || "");
-        setRightPanelMode("media");
+        setShowMediaBrowser(true);
         return; // Don't add a message for this, it's a UI action
+      } else if (data.type === "media_embed") {
+        // Don't add to chat - open in panel instead
+        if (data.embed_url) {
+          setMediaPlaybackUrl(data.embed_url);
+          setMediaTitle(data.title || "Playing Media");
+          setMediaDescription(data.description || "");
+          setMediaMetadata(data.metadata || null);
+          setRightPanelMode("media-player");
+          ensurePanelActive("media-player");
+          
+          // Send context to AI if we have metadata
+          if (data.metadata && activeChatId) {
+            const contextMessage = `Now watching: ${data.title || "Media"}${data.description ? "\n" + data.description : ""}`;
+            addMessage("System", contextMessage, "info");
+          }
+        }
+        return; // Don't add to messages
       } else if (data.type === "youtube_embed") {
         if (data.video_id) setYoutubeVideoId(data.video_id);
         if (data.url) setYoutubeUrl(data.url);
@@ -847,8 +876,6 @@ const App: React.FC = () => {
           // Update specific command response fields
           if (data.type === "iframe") {
             updatedLastMessage.iframeUrl = data.url;
-          } else if (data.type === "media_embed") {
-            updatedLastMessage.iframeUrl = data.embed_url;
           } else if (data.type === "youtube_embed") {
             updatedLastMessage.youtubeVideoId = data.video_id;
           } else if (data.type === "image_gallery") {
@@ -869,9 +896,7 @@ const App: React.FC = () => {
             iframeUrl:
               data.type === "iframe"
                 ? data.url
-                : data.type === "media_embed"
-                  ? data.embed_url
-                  : undefined,
+                : undefined,
             youtubeVideoId:
               data.type === "youtube_embed" ? data.video_id : undefined,
             imageGalleryUrls:
@@ -1095,6 +1120,40 @@ const App: React.FC = () => {
       },
     );
 
+
+    // Real-time message updates (Fix 1)
+    socket.on('message_added', (data: { session_id: string, message: Message }) => {
+      console.log('📨 message_added event received:', data);
+      if (data.session_id === activeChatId) {
+        setMessages(prev => [...prev, data.message]);
+      }
+    });
+
+    // Dedicated media event channel (Fix 3)
+    socket.on('media_update', (data: { 
+      session_id: string, 
+      event_type: string, 
+      data: { url?: string, title?: string, description?: string, videoId?: string }
+    }) => {
+      console.log('🎬 media_update event received:', data);
+      
+      if (data.session_id === activeChatId && data.event_type === 'play') {
+        if (data.data.url) {
+          setMediaPlaybackUrl(data.data.url);
+          setMediaTitle(data.data.title || '');
+          setMediaDescription(data.data.description || '');
+          setRightPanelMode('media-player');
+          ensurePanelActive('media-player');
+        }
+        
+        if (data.data.videoId) {
+          setYoutubeVideoId(data.data.videoId);
+          setYoutubeUrl(data.data.url || '');
+          setRightPanelMode('youtube');
+          ensurePanelActive('youtube');
+        }
+      }
+    });
     return () => {
 
       socket.disconnect();
@@ -1104,8 +1163,119 @@ const App: React.FC = () => {
       socket.off('file_saved');
       socket.off('file_content');
       socket.off("low_confidence_warning");
+      socket.off('message_added');
+      socket.off('media_update');
     };
   }, [handleFileContent]);
+
+  // Restore UI state from localStorage on mount (Fix 2)
+  useEffect(() => {
+    console.log('🔄 Restoring UI state from localStorage...');
+    const saved = loadUIState();
+    
+    if (saved) {
+      if (saved.selectedBackend) {
+        console.log(`📦 Restoring backend: ${saved.selectedBackend}`);
+        setCurrentBackend(saved.selectedBackend);
+      }
+      
+      if (saved.apiProvider) {
+        console.log(`🔌 Restoring API provider: ${saved.apiProvider}`);
+        setApiProvider(saved.apiProvider);
+      }
+      
+      if (saved.selectedModel) {
+        console.log(`🤖 Restoring model: ${saved.selectedModel}`);
+        setSelectedModel(saved.selectedModel);
+      }
+      
+      if (saved.rightPanelMode) {
+        setRightPanelMode(saved.rightPanelMode);
+      }
+      
+      if (saved.leftPanelMode && saved.leftPanelMode !== 'closed') {
+        setLeftPanelMode(saved.leftPanelMode);
+      }
+      
+      if (saved.activePanels && Array.isArray(saved.activePanels)) {
+        setActivePanels(saved.activePanels);
+      }
+      
+      if (saved.mediaPlaybackUrl) {
+        console.log(`▶️ Restoring media playback: ${saved.mediaTitle}`);
+        setMediaPlaybackUrl(saved.mediaPlaybackUrl);
+        setMediaTitle(saved.mediaTitle || '');
+        setMediaDescription(saved.mediaDescription || '');
+      }
+      
+      if (saved.youtubeVideoId) {
+        console.log(`📺 Restoring YouTube video: ${saved.youtubeVideoId}`);
+        setYoutubeVideoId(saved.youtubeVideoId);
+        setYoutubeUrl(saved.youtubeUrl || '');
+      }
+      
+      console.log('✅ UI state restoration complete');
+    } else {
+      console.log('ℹ️ No saved UI state to restore');
+    }
+  }, []);
+
+  // Save UI state to localStorage when it changes (Fix 2)
+  useEffect(() => {
+    const timeoutId = setTimeout(() => {
+      saveUIState({
+        selectedBackend: currentBackend,
+        selectedModel,
+        apiProvider,
+        rightPanelMode,
+        leftPanelMode,
+        activePanels,
+        mediaPlaybackUrl,
+        mediaTitle,
+        mediaDescription,
+        youtubeVideoId,
+        youtubeUrl,
+      });
+    }, 500);
+
+    return () => clearTimeout(timeoutId);
+  }, [
+    currentBackend,
+    selectedModel,
+    apiProvider,
+    rightPanelMode,
+    leftPanelMode,
+    activePanels,
+    mediaPlaybackUrl,
+    mediaTitle,
+    mediaDescription,
+    youtubeVideoId,
+    youtubeUrl,
+  ]);
+
+  // Validate model compatibility when backend changes (Fix 2)
+  useEffect(() => {
+    if (selectedModel && currentBackend && availableModels.length > 0) {
+      const validation = validateModelForBackend(selectedModel, availableModels);
+      
+      if (!validation.valid) {
+        console.warn(
+          `⚠️ Selected model "${selectedModel}" is not available for backend "${currentBackend}"`
+        );
+        
+        if (validation.suggestedModel) {
+          console.log(`🔄 Auto-correcting to: ${validation.suggestedModel}`);
+          handleModelChange(validation.suggestedModel);
+          toast.success(
+            `Switched to ${validation.suggestedModel} (previous model unavailable)`,
+            { icon: '🔄' }
+          );
+        }
+      } else {
+        console.log(`✅ Model "${selectedModel}" is valid for backend "${currentBackend}"`);
+      }
+    }
+  }, [selectedModel, currentBackend, availableModels]);
 
   const handleApiProviderChange = (provider: string) => {
     setApiProvider(provider);
@@ -1334,8 +1504,13 @@ const App: React.FC = () => {
 
       case "media":
       case "m":
-        setMediaBrowserQuery(args.trim());
-        setRightPanelMode("media");
+        if (args.trim()) {
+          sendSlashToBackend(`/media ${args.trim()}`);
+          toast(`Opening media browser: ${args.trim()}`);
+        } else {
+          sendSlashToBackend(`/media`);
+          toast("Opening media browser");
+        }
         break;
       case "tools":
       case "t":
@@ -1512,7 +1687,8 @@ const App: React.FC = () => {
         mediaType,
         session_id: activeChatId,
       });
-      setRightPanelMode("closed");
+      // Close the media browser
+      setShowMediaBrowser(false);
     }
   };
   const handleLoadModel = () => {
@@ -1664,6 +1840,37 @@ const App: React.FC = () => {
         : [...prev, panelId],
     );
   };
+
+  useEffect(() => {
+    const saved = localStorage.getItem(ACTIVE_PANEL_STORAGE_KEY);
+    if (!saved) return;
+    try {
+      const parsed = JSON.parse(saved);
+      if (Array.isArray(parsed)) {
+        const sanitized = Array.from(
+          new Set(
+            parsed.filter((id): id is string => typeof id === "string"),
+          ),
+        );
+        if (sanitized.length > 0) {
+          setActivePanels(sanitized);
+        }
+      }
+    } catch (error) {
+      console.warn("Failed to restore panel state", error);
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        ACTIVE_PANEL_STORAGE_KEY,
+        JSON.stringify(activePanels),
+      );
+    } catch (error) {
+      console.warn("Failed to persist panel state", error);
+    }
+  }, [activePanels]);
 
   const handleExecuteCommand = (command: string) => {
     // Set the command in the message input and trigger processing
@@ -2107,6 +2314,9 @@ const App: React.FC = () => {
           youtubeVideoId={youtubeVideoId}
           youtubeUrl={youtubeUrl}
           // Code mode props
+          mediaPlaybackUrl={mediaPlaybackUrl}
+          mediaTitle={mediaTitle}
+          mediaDescription={mediaDescription}
           codeContent={codeContent}
           codeLanguage={codeLanguage}
           onCodeChange={handleCodeEditorChange}
@@ -2176,6 +2386,9 @@ const App: React.FC = () => {
           }}
           youtubeVideoId={youtubeVideoId}
           youtubeUrl={youtubeUrl}
+          mediaPlaybackUrl={mediaPlaybackUrl}
+          mediaTitle={mediaTitle}
+          mediaDescription={mediaDescription}
           codeContent={codeContent}
           codeLanguage={codeLanguage}
           onCodeChange={handleCodeEditorChange}
@@ -2227,6 +2440,9 @@ const App: React.FC = () => {
           youtubeVideoId={youtubeVideoId}
           youtubeUrl={youtubeUrl}
           onPopOutVideo={(videoId) => setMiniPlayerVideoId(videoId)}
+          mediaPlaybackUrl={mediaPlaybackUrl}
+          mediaTitle={mediaTitle}
+          mediaDescription={mediaDescription}
           codeContent={codeContent}
           codeLanguage={codeLanguage}
           onCodeChange={handleCodeEditorChange}
@@ -2277,6 +2493,9 @@ const App: React.FC = () => {
           onHandsFreeModeChange={setIsHandsFreeMode}
           youtubeVideoId={youtubeVideoId}
           youtubeUrl={youtubeUrl}
+          mediaPlaybackUrl={mediaPlaybackUrl}
+          mediaTitle={mediaTitle}
+          mediaDescription={mediaDescription}
           codeContent={codeContent}
           codeLanguage={codeLanguage}
           onCodeChange={handleCodeEditorChange}
@@ -2315,7 +2534,60 @@ const App: React.FC = () => {
         />
       ),
     },
-  ].filter((panel) => visiblePanelIds.includes(panel.id));
+    {
+      id: "media-player",
+      title: "Media Player",
+      component: (
+        <RightPanel
+          mode="media-player"
+          onClose={() => handleTogglePanel("media-player")}
+          socket={socketRef.current}
+          isHandsFreeMode={isHandsFreeMode}
+          onHandsFreeModeChange={setIsHandsFreeMode}
+          youtubeVideoId={youtubeVideoId}
+          youtubeUrl={youtubeUrl}
+          mediaPlaybackUrl={mediaPlaybackUrl}
+          mediaTitle={mediaTitle}
+          mediaDescription={mediaDescription}
+          codeContent={codeContent}
+          codeLanguage={codeLanguage}
+          onCodeChange={handleCodeEditorChange}
+          onCodeLanguageChange={setCodeLanguage}
+          fileTree={fileTree}
+          workspaceRoot={workspaceRoot}
+          onRefreshFileTree={() => requestFileTree(".")}
+          onOpenFileFromTree={openFileFromTree}
+          openFiles={openFiles}
+          activeFilePath={activeFilePath}
+          onSelectOpenFile={selectOpenFile}
+          onCloseFile={closeOpenFile}
+          onSaveActiveFile={saveActiveFile}
+          isLoadingFileTree={isLoadingFileTree}
+          onCreateFile={createFile}
+          onCreateFolder={createFolder}
+          onRenameFile={renamePath}
+          onDeleteFile={deletePath}
+          onChangeWorkspace={requestWorkspaceChange}
+          toolQuery={toolQuery}
+          onToolQueryChange={setToolQuery}
+          onRunToolSearch={runToolSearch}
+          toolResults={toolResults}
+          toolLoading={toolLoading}
+          toolError={toolError}
+          toolList={toolList}
+          selectedTool={selectedTool}
+          onSelectTool={setSelectedTool}
+          toolArgsText={toolArgsText}
+          onToolArgsChange={setToolArgsText}
+          onRunToolCall={runToolCall}
+          toolCallResult={toolCallResult}
+          mediaBrowserQuery={mediaBrowserQuery}
+          onPlayMedia={handlePlayMedia}
+          novaSettings={novaSettings}
+        />
+      ),
+    },
+    ].filter((panel) => visiblePanelIds.includes(panel.id));
 
   return (
     <div
@@ -2341,6 +2613,14 @@ const App: React.FC = () => {
           prompt={imageGenerationPrompt}
           onGenerate={handleGenerateImage}
           onClose={() => setShowImageGenerator(false)}
+        />
+      )}
+      {showMediaBrowser && (
+        <MediaBrowser
+          query={mediaBrowserQuery}
+          onPlay={handlePlayMedia}
+          onClose={() => setShowMediaBrowser(false)}
+          settings={novaSettings}
         />
       )}
       <CommandPalette

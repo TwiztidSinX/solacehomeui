@@ -29,11 +29,13 @@ from bson.objectid import ObjectId
 from pymongo.errors import PyMongoError
 from sentence_transformers import SentenceTransformer
 from llama_agent_integration import LlamaCppAgenticOrchestrator
+from system_state import SYSTEM_STATE
 from model_loader import (
-    get_available_models, load_model, unload_model,
-    stream_gpt, stream_llamacpp, stream_ollama, stream_safetensors,
+    get_available_models, load_model, unload_model)
+from model_streaming import (
+    stream_llamacpp, stream_ollama, stream_safetensors, stream_vllm, stream_llamacpp_server,
     stream_google, stream_openai, stream_anthropic, stream_meta,
-    stream_xai, stream_qwen, stream_deepseek, stream_perplexity, stream_openrouter
+    stream_xai, stream_qwen, stream_deepseek, stream_perplexity, stream_openrouter, stream_with_react_tool_calling
 )
 from upgraded_memory_manager import memory_manager as memory, beliefs_manager as beliefs, db
 from token_utils import (
@@ -83,12 +85,27 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKSPACE_ROOT = Path(BASE_DIR).resolve()
 ORIGINAL_WORKSPACE_ROOT = WORKSPACE_ROOT
 
-logging.basicConfig(
-    level=logging.INFO,
-    filename=os.path.join(BASE_DIR, "nova.log"),
-    format='[%(asctime)s] %(levelname)s %(message)s',
-    encoding='utf-8'
-)
+
+log_path = os.path.join(BASE_DIR, "nova.log")
+
+# Remove ANY default handlers installed by Python or Tauri
+root_logger = logging.getLogger()
+root_logger.handlers.clear()
+
+# Create file handler (emoji-safe)
+file_handler = logging.FileHandler(log_path, encoding="utf-8")
+file_handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(message)s'))
+
+# Create console handler (emoji-safe)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(message)s'))
+
+# Attach handlers
+root_logger.setLevel(logging.INFO)
+root_logger.addHandler(file_handler)
+root_logger.addHandler(console_handler)
+
+# Create named logger
 logger = logging.getLogger(__name__)
 
 system_prompts = {
@@ -172,6 +189,183 @@ def merge_text_into_content(content, extra_text):
     return f"{extra_text}\n\n{base_text}".strip()
 
 
+
+
+def serialize_message_for_socket(msg):
+    """
+    Convert a message dict to be JSON-serializable for socket emission.
+    Handles datetime objects and other non-serializable types.
+    """
+    serialized = {}
+    for key, value in msg.items():
+        if isinstance(value, datetime):
+            serialized[key] = value.isoformat()
+        elif key == '_id':
+            # Skip MongoDB _id fields
+            continue
+        else:
+            serialized[key] = value
+    return serialized
+
+
+def sanitize_metadata_for_json(metadata):
+    """
+    Recursively sanitize metadata to remove non-JSON-serializable types.
+    Handles datetime objects, converts them to ISO strings.
+    """
+    if metadata is None:
+        return None
+    
+    if isinstance(metadata, dict):
+        sanitized = {}
+        for key, value in metadata.items():
+            if isinstance(value, datetime):
+                sanitized[key] = value.isoformat()
+            elif isinstance(value, dict):
+                sanitized[key] = sanitize_metadata_for_json(value)
+            elif isinstance(value, list):
+                sanitized[key] = [sanitize_metadata_for_json(item) if isinstance(item, (dict, datetime)) else item for item in value]
+            else:
+                sanitized[key] = value
+        return sanitized
+    elif isinstance(metadata, datetime):
+        return metadata.isoformat()
+    else:
+        return metadata
+
+def emit_media_context(session_id, title, description="", metadata=None, embed_url=""):
+    """
+    Send media context as both command_response AND chat message.
+    This ensures media info appears in chat immediately without requiring refresh.
+    
+    MORE IMPORTANTLY: Sends rich metadata to the model so it can discuss the content
+    intelligently even if it wasn't trained on it.
+    """
+    try:
+        # Sanitize metadata to ensure JSON serialization works
+        metadata = sanitize_metadata_for_json(metadata)
+        
+        # 1. Send command_response for UI panel updates
+        socketio.emit('command_response', {
+            'type': 'media_embed',
+            'title': title,
+            'description': description,
+            'metadata': metadata,
+            'embed_url': embed_url,
+            'message': f'Now playing: {title}'
+        })
+        
+        # 2. Build RICH context message for the model
+        # This is the key - give the model enough context to discuss the content
+        context_lines = [f"Now watching: {title}"]
+        
+        if description:
+            context_lines.append(f"\nDescription: {description}")
+        
+        # Add rich metadata if available
+        if metadata:
+            # Series info
+            if metadata.get('SeriesName'):
+                context_lines.append(f"Series: {metadata.get('SeriesName')}")
+            
+            # Season/Episode
+            season = metadata.get('ParentIndexNumber')
+            episode = metadata.get('IndexNumber')
+            if season is not None and episode is not None:
+                context_lines.append(f"Season {season}, Episode {episode}")
+            
+            # Genres
+            genres = metadata.get('Genres', [])
+            if genres:
+                context_lines.append(f"Genres: {', '.join(genres[:3])}")  # First 3 genres
+            
+            # Year and Rating
+            year = metadata.get('ProductionYear')
+            rating = metadata.get('OfficialRating')
+            if year or rating:
+                info_parts = []
+                if year:
+                    info_parts.append(str(year))
+                if rating:
+                    info_parts.append(f"Rated {rating}")
+                if info_parts:
+                    context_lines.append(' | '.join(info_parts))
+            
+            # Runtime
+            runtime_ticks = metadata.get('RunTimeTicks')
+            if runtime_ticks:
+                runtime_minutes = int(runtime_ticks / 600000000)
+                context_lines.append(f"Runtime: {runtime_minutes} minutes")
+            
+            # Cast (first few)
+            people = metadata.get('People', [])
+            actors = [p.get('Name') for p in people if p.get('Type') == 'Actor'][:4]
+            if actors:
+                context_lines.append(f"Starring: {', '.join(actors)}")
+        
+        # Join all context into a rich message
+        context_message = '\n'.join(context_lines)
+        
+        # Create message object for database (MongoDB handles datetime)
+        message_obj_db = {
+            "sender": "System",
+            "message": context_message,
+            "type": "info",
+            "imageB64": None,
+            "timestamp": datetime.now(),  # MongoDB can handle datetime objects
+            "metadata": metadata  # Attach full metadata for model access
+        }
+        
+        # Create message object for socket emission (needs ISO string)
+        message_obj_socket = {
+            "sender": "System",
+            "message": context_message,
+            "type": "info",
+            "imageB64": None,
+            "timestamp": datetime.now().isoformat(),  # Convert to ISO string for JSON
+            "metadata": metadata
+        }
+        
+        # Add to database if session exists
+        if session_id and chat_sessions_collection is not None:
+            try:
+                chat_sessions_collection.update_one(
+                    {"_id": ObjectId(session_id)},
+                    {"$push": {"messages": message_obj_db}}
+                )
+                logger.info(f"✅ Saved rich media context to session {session_id}")
+            except Exception as e:
+                logger.error(f"❌ Failed to save media message to DB: {e}")
+        
+        # Emit to frontend for immediate display - send to ALL connected clients for this session
+        socketio.emit('message_added', {
+            'session_id': session_id,
+            'message': message_obj_socket
+        })
+        
+        logger.info(f"📺 Sent rich media context for: {title}")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to emit media context: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def emit_media_update(session_id, event_type, data):
+    """
+    Send media updates on a dedicated channel to avoid blocking chat.
+    """
+    try:
+        socketio.emit('media_update', {
+            'session_id': session_id,
+            'event_type': event_type,
+            'data': data,
+            'timestamp': datetime.now().isoformat()
+        })
+        logger.debug(f"🎬 Media update sent: {event_type}")
+    except Exception as e:
+        logger.error(f"❌ Failed to emit media update: {e}")
+
 def is_question_like(text: str) -> bool:
     """
     Rough heuristic to decide if a user input is an info-seeking query.
@@ -250,7 +444,7 @@ def get_agent_coding_model_client():
     try:
         if orchestrator_module.orchestrator_model is not None:
             return orchestrator_module.orchestrator_model
-        return current_model
+        return SYSTEM_STATE['current_model']
     except Exception as e:
         print(f"[AgentCoding] Failed to resolve model client: {e}")
         return None
@@ -559,9 +753,11 @@ def run_agentic_chat_task(data, sid, forced: bool = False):
             }
             _save_message_to_db(session_id, ai_message)
 
-current_model = None
-current_model_path_string = None
-current_backend = "llama.cpp"
+
+# The following global variables are now managed in system_state.py
+# current_model = None
+# current_model_path_string = None
+# current_backend = "llama.cpp"
 model_lock = threading.Lock()
 model_configs = {}
 stop_streaming = False
@@ -569,17 +765,17 @@ stop_lock = threading.Lock()
 
 @socketio.on('connect')
 def handle_connect():
-    global current_backend
     with model_lock:
-        backend = model_configs.get("backend", "llama.cpp")
+        backend = model_configs.get("backend", "llama-cpp-python")
+        SYSTEM_STATE['current_backend'] = backend # Ensure state is synced on connect
         provider = model_configs.get("api_provider") if backend == "api" else None
         models = get_available_models(backend, provider=provider)
         emit('models', {'backend': backend, 'models': models})
         emit('configs', model_configs)
         emit('backend_set', {'backend': backend})
         emit('nova_settings_loaded', nova_settings) # Emit loaded settings
-        if current_model_path_string:
-            emit('model_loaded', {'model': current_model_path_string})
+        if SYSTEM_STATE['current_model_path_string']:
+            emit('model_loaded', {'model': SYSTEM_STATE['current_model_path_string']})
 
 def fetch_models_task(backend, provider, sid):
     """Background task to fetch models without blocking."""
@@ -594,7 +790,7 @@ def fetch_models_task(backend, provider, sid):
 
 @socketio.on('set_backend')
 def handle_set_backend(data):
-    global current_backend, model_configs
+    global model_configs
     sid = request.sid
     with model_lock:
         backend = data.get('backend')
@@ -602,11 +798,11 @@ def handle_set_backend(data):
         
         print(f"🎯 Received set_backend: backend={backend}, provider={provider}")
         
-        if backend not in ["llama.cpp", "ollama", "api", "safetensors"]:
+        if backend not in ["llama-cpp-python", "llama.cpp", "ollama", "api", "transformers", "vllm"]:
             emit('error', {'message': 'Invalid backend selected'})
             return
 
-        current_backend = backend
+        SYSTEM_STATE['current_backend'] = backend
         model_configs["backend"] = backend
 
         if backend == "api":
@@ -627,26 +823,25 @@ def handle_set_backend(data):
         with open('config.json', 'w') as f:
             json.dump(model_configs, f, indent=4)
 
-        emit('backend_set', {'backend': current_backend})
+        emit('backend_set', {'backend': SYSTEM_STATE['current_backend']})
         
-        provider_for_models = model_configs.get("api_provider") if current_backend == "api" else None
-        socketio.start_background_task(fetch_models_task, current_backend, provider_for_models, sid)
+        provider_for_models = model_configs.get("api_provider") if SYSTEM_STATE['current_backend'] == "api" else None
+        socketio.start_background_task(fetch_models_task, SYSTEM_STATE['current_backend'], provider_for_models, sid)
 
 def load_model_task(data, sid):
     """Background task to load a model without blocking."""
-    global current_model, current_model_path_string, current_backend
     with model_lock:
         try:
             # If a model is already loaded, unload it using the proper task.
-            if current_model:
+            if SYSTEM_STATE['current_model']:
                 print("Unloading existing model before loading new one...")
                 # This is a blocking call within the locked task, which is what we want.
                 unload_model_task(sid)
             
             print("Loading new model...")
-            current_model = load_model(**data)
-            current_model_path_string = data['model_path']
-            current_backend = data.get('backend', current_backend) # Ensure backend is updated
+            SYSTEM_STATE['current_model'] = load_model(**data)
+            SYSTEM_STATE['current_model_path_string'] = data['model_path']
+            SYSTEM_STATE['current_backend'] = data.get('backend', SYSTEM_STATE['current_backend']) # Ensure backend is updated
             
             socketio.emit('model_loaded', {'model': data['model_path']}, room=sid)
             print(f"✅ New model loaded: {data['model_path']}")
@@ -659,7 +854,7 @@ def load_model_task(data, sid):
 def handle_load_model(data):
     sid = request.sid
     # The backend is now sent with the request, ensuring the correct one is used.
-    backend = data.get('backend', current_backend)
+    backend = data.get('backend', SYSTEM_STATE['current_backend'])
     
     # --- Hotfix for frontend parameter name mismatch ---
     if 'gpuLayers' in data:
@@ -735,8 +930,10 @@ def handle_get_session_messages(data):
             {'_id': ObjectId(session_id), 'user_id': user_id}
         )
         if session:
-            # Ensure messages have a consistent format if needed (e.g., converting timestamps)
-            emit('session_messages_loaded', {'session_id': session_id, 'messages': session.get('messages', [])}, room=sid)
+            # Serialize messages to be JSON-compatible
+            messages = session.get('messages', [])
+            serialized_messages = [serialize_message_for_socket(msg) for msg in messages]
+            emit('session_messages_loaded', {'session_id': session_id, 'messages': serialized_messages}, room=sid)
         else:
             emit('error', {'message': 'Session not found or access denied.'}, room=sid)
     except PyMongoError as e:
@@ -921,7 +1118,7 @@ def handle_agent_command(data):
 
 @socketio.on('chat')
 def handle_chat(data):
-    backend = data.get('backend', current_backend)
+    backend = data.get('backend', SYSTEM_STATE['current_backend'])
     provider = data.get('provider')
     timezone = data.get('timezone', 'UTC')
     raw_user_input = data.get('text', '')
@@ -1109,15 +1306,22 @@ def handle_chat(data):
 
         elif command_name == 'media':
             try:
+                # Open media browser
                 response_payload = {
                     'type': 'media_browser', 
-                    'message': f"Opening media browser for: '{query}'",
+                    'message': f"Opening media browser for: '{query}'" if query else "Opening media browser",
                     'query': query,
                     'sender': 'Nova'
                 }
                 emit('command_response', response_payload)
-                if session_id:
-                    _save_message_to_db(session_id, {"sender": "Nova", **response_payload, "type": "ai"})
+                
+                # Also add to chat for context
+                emit_media_context(
+                    session_id=session_id,
+                    title=f"Media Search: {query}" if query else "Media Browser",
+                    description="Searching media library..." if query else "Browse your media collection",
+                    metadata={'action': 'search' if query else 'open_browser', 'query': query}
+                )
                 return
             except Exception as e:
                 response_payload = {'type': 'error', 'message': f"An unexpected error occurred: {e}", 'sender': 'Nova'}
@@ -1378,16 +1582,16 @@ def handle_chat(data):
                 # Fall through to the main model logic below
 
     # 3. If neither, bypass orchestrator and go directly to the main model
-    if not current_model:
+    if not SYSTEM_STATE['current_model']:
         emit('error', {'message': 'No model loaded.'})
         return
     
     # Get the config for the current model to pass thinking level
-    if current_model_path_string in model_configs:
-        data['thinking_level'] = model_configs[current_model_path_string].get('thinking_level', 'medium')
+    if SYSTEM_STATE['current_model_path_string'] in model_configs:
+        data['thinking_level'] = model_configs[SYSTEM_STATE['current_model_path_string']].get('thinking_level', 'medium')
 
     # Ensure backend and provider are correctly set for streaming
-    data['backend'] = model_configs.get("backend", "llama.cpp")
+    data['backend'] = model_configs.get("backend", "llama-cpp-python")
     if data['backend'] == "api":
         data['provider'] = model_configs.get("api_provider")
     else:
@@ -1398,7 +1602,6 @@ def handle_chat(data):
 
     sid = request.sid
     socketio.start_background_task(stream_response, data, sid)
-
 
 def _detect_provider_from_model(model_name, provider_hint=None, backend_hint=None):
     """
@@ -1429,8 +1632,8 @@ def _detect_provider_from_model(model_name, provider_hint=None, backend_hint=Non
         return backend_hint
     return "unknown"
 
-
 def stream_response(data, sid):
+    from model_loader import model_states
     global stop_streaming
     full_response = ""
     full_thought = ""
@@ -1439,7 +1642,7 @@ def stream_response(data, sid):
     current_sender = data.get('aiName', 'Nova')  # Get the actual AI name
 
     # Initialize token tracking
-    model_name = data.get('model_name', current_model_path_string)
+    model_name = data.get('model_name', SYSTEM_STATE['current_model_path_string'])
     token_tracker = TokenTracker(model_name=model_name)
     raw_user_input = data.get('text', '')
     user_input_text = extract_text_from_content(raw_user_input)
@@ -1456,14 +1659,16 @@ def stream_response(data, sid):
         socketio.emit('stream_start', {'sender': current_sender}, room=sid)
         socketio.sleep(0)
 
-        backend = data.get('backend', current_backend)
+        backend = data.get('backend', SYSTEM_STATE['current_backend'])
         provider = data.get('provider')
         
         # --- Stream Router ---
         streamer_map = {
-            "llama.cpp": stream_llamacpp,
+            "llama-cpp-python": stream_llamacpp,
+            "llama.cpp": stream_llamacpp_server,
             "ollama": stream_ollama,
-            "safetensors": stream_safetensors,
+            "transformers": stream_safetensors,
+            "vllm": stream_vllm,
             "api": {
                 "google": stream_google,
                 "openai": stream_openai,
@@ -1495,15 +1700,16 @@ def stream_response(data, sid):
             }
 
         args = {
-            "model_instance": current_model if backend != 'ollama' else current_model_path_string,
-            "model_id_str": current_model_path_string,
+            "model_instance": SYSTEM_STATE['current_model'] if backend != 'ollama' else SYSTEM_STATE['current_model_path_string'],
+            "model_id_str": SYSTEM_STATE['current_model_path_string'],
             "user_input": data['text'],
             "conversation_history": data.get('history', []),
             "should_stop": lambda: stop_streaming,
             "image_data": image_payload,
             "timezone": data.get('timezone', 'UTC'),
             "debug_mode": data.get('debug_mode', False),
-            "thinking_level": data.get('thinking_level', 'medium') # Pass thinking level
+            "thinking_level": data.get('thinking_level', 'medium'), # Pass thinking level
+            "model_states": model_states
         }
         
         # Add backend-specific arguments
@@ -1520,7 +1726,7 @@ def stream_response(data, sid):
             # Fallback to original args if inspection fails
             filtered_args = args
 
-        model_response_generator = streamer(**filtered_args)
+        model_response_generator = stream_with_react_tool_calling(streamer, **filtered_args)
 
         # --- Universal Response Handling with Consistent Thinking Blocks ---
         for chunk in model_response_generator:
@@ -1613,7 +1819,7 @@ def stream_response(data, sid):
             try:
                 normalized_model = normalize_model_name(model_name)
                 provider_value = _detect_provider_from_model(
-                    model_name, data.get('provider'), data.get('backend', current_backend)
+                    model_name, data.get('provider'), data.get('backend', SYSTEM_STATE['current_backend'])
                 )
                 input_tokens = token_metrics.get('inputTokens', 0)
                 output_tokens = token_metrics.get('outputTokens', 0)
@@ -1632,7 +1838,7 @@ def stream_response(data, sid):
                     "estimatedCost": estimated_cost,
                     "meta": {
                         "aiName": current_sender,
-                        "backend": data.get('backend', current_backend),
+                        "backend": data.get('backend', SYSTEM_STATE['current_backend']),
                         "timezone": data.get('timezone'),
                         "rawModelName": model_name,
                     }
@@ -1671,7 +1877,7 @@ def stream_response(data, sid):
                     result = memory.learn_from_text(
                         fact,
                         source="conversation_summary",
-                        model_id=current_model_path_string,
+                        model_id=SYSTEM_STATE['current_model_path_string'],
                         user_id=user_id
                     )
                     if result:
@@ -1687,7 +1893,7 @@ def stream_response(data, sid):
                 memory.learn_from_text(
                     full_response,
                     source=current_sender.lower(),
-                    model_id=current_model_path_string,
+                    model_id=SYSTEM_STATE['current_model_path_string'],
                     user_id=user_id
                 )
 
@@ -1749,19 +1955,18 @@ def handle_stop():
 
 def unload_model_task(sid):
     """Background task to unload a model without blocking."""
-    global current_model, current_model_path_string, current_backend
     with model_lock:
         # Allow unload as long as we have a tracked model path, even if the in-memory object was GC'ed
-        if current_model_path_string:
-            model_path_to_unload = current_model_path_string
-            backend_to_unload = current_backend
-            model_to_unload = current_model
+        if SYSTEM_STATE['current_model_path_string']:
+            model_path_to_unload = SYSTEM_STATE['current_model_path_string']
+            backend_to_unload = SYSTEM_STATE['current_backend']
+            model_to_unload = SYSTEM_STATE['current_model']
 
             print(f"[DEBUG] Unloading task: current_model object id is {id(model_to_unload)}")
 
-            # Set globals to None *before* cleanup to break the main reference
-            current_model = None
-            current_model_path_string = None
+            # Set state to None *before* cleanup to break the main reference
+            SYSTEM_STATE['current_model'] = None
+            SYSTEM_STATE['current_model_path_string'] = None
             
             if unload_model(model_to_unload, model_path_to_unload, backend=backend_to_unload):
                 socketio.emit('model_unloaded', {'model': model_path_to_unload}, room=sid)
@@ -2145,9 +2350,10 @@ def handle_generate_image(data):
 
 @socketio.on('play_media')
 def handle_play_media(data):
-    """Handles media playback requests by returning an embeddable URL."""
+    """Handles media playback requests by returning an embeddable URL with metadata."""
     try:
         media_id = data.get('mediaId')
+        media_type = data.get('mediaType')
         session_id = data.get('session_id')
 
         # Load media server settings
@@ -2155,26 +2361,175 @@ def handle_play_media(data):
             nova_settings = json.load(f)
         media_server_url = nova_settings.get('mediaServerUrl')
         media_server_api_key = nova_settings.get('mediaServerApiKey')
+        media_server_user_id = nova_settings.get('mediaServerUserId')
 
         if not media_server_url or not media_server_api_key:
             emit('error', {'message': 'Media server URL or API key not configured in nova_settings.json'})
             return
+        
+        if not media_server_user_id:
+            emit('error', {'message': 'Media server User ID not configured in nova_settings.json. Add "mediaServerUserId": "your-user-id" to the file.'})
+            return
 
-        # Construct the Jellyfin direct stream URL
-        embed_url = f"{media_server_url.rstrip('/')}/Videos/{media_id}/stream?api_key={media_server_api_key}"
+        # Fetch metadata from Jellyfin using the USER-CONTEXTUAL endpoint
+        # CRITICAL: /Users/{userId}/Items/{itemId} returns full metadata including MediaSources
+        # The generic /Items/{itemId} endpoint returns minimal data without user context
+        try:
+            metadata_url = f"{media_server_url.rstrip('/')}/Users/{media_server_user_id}/Items/{media_id}"
+            headers = {'X-Emby-Token': media_server_api_key}
+            metadata_response = requests.get(metadata_url, headers=headers, timeout=10)
+            
+            if metadata_response.ok:
+                metadata = metadata_response.json()
+                print(f"📺 Fetched full metadata for {media_id}: {metadata.get('Name', 'Unknown')}")
+            else:
+                print(f"⚠️ Jellyfin returned status {metadata_response.status_code}: {metadata_response.text[:200]}")
+                metadata = {}
+        except Exception as e:
+            print(f"⚠️ Failed to fetch media metadata: {e}")
+            metadata = {}
+
+        # Extract MediaSourceId from the metadata (CRITICAL for Jellyfin streaming)
+        media_source_id = media_id  # Default to media_id
+        media_sources = metadata.get('MediaSources', [])
+        if media_sources and len(media_sources) > 0:
+            media_source_id = media_sources[0].get('Id', media_id)
+            print(f"📺 Using MediaSourceId: {media_source_id}")
+        
+        # Generate a unique DeviceId for session tracking
+        device_id = f"SolaceOS-{media_id[:8]}"
+        play_session_id = str(uuid.uuid4()).replace('-', '')
+
+        # Extract useful info for display and AI context
+        title = metadata.get('Name', 'Unknown Title')
+        description = metadata.get('Overview', '')
+        
+        # For TV shows, include series and episode info
+        series_name = ''
+        season_number = None
+        episode_number = None
+        
+        if media_type in ['Episode', 'Series'] or metadata.get('Type') == 'Episode':
+            series_name = metadata.get('SeriesName', '')
+            season_number = metadata.get('ParentIndexNumber')
+            episode_number = metadata.get('IndexNumber')
+            
+            if series_name and season_number is not None and episode_number is not None:
+                title = f"{series_name} - S{season_number:02d}E{episode_number:02d}: {title}"
+                print(f"📺 TV Show: {title}")
+
+        # Build rich context for Solace to understand what the user is watching
+        # This enables the AI to discuss the content intelligently
+        ai_context = {
+            'title': title,
+            'description': description,
+            'type': metadata.get('Type', media_type),
+            'series_name': series_name,
+            'season_number': season_number,
+            'episode_number': episode_number,
+            'genres': metadata.get('Genres', []),
+            'year': metadata.get('ProductionYear'),
+            'rating': metadata.get('OfficialRating'),
+            'community_rating': metadata.get('CommunityRating'),
+            'runtime_minutes': int(metadata.get('RunTimeTicks', 0) / 600000000) if metadata.get('RunTimeTicks') else None,
+            'studios': [s.get('Name') for s in metadata.get('Studios', [])],
+            'people': [{'name': p.get('Name'), 'role': p.get('Role'), 'type': p.get('Type')} 
+                      for p in metadata.get('People', [])[:10]],  # Limit to first 10 people
+            'taglines': metadata.get('Taglines', []),
+        }
+        
+        # Log the rich context for debugging
+        print(f"📺 AI Context: {ai_context.get('type')} - {ai_context.get('title')}")
+        if description:
+            print(f"📺 Description: {description[:200]}...")
+
+        # Construct the Jellyfin HLS streaming URL with ALL required parameters
+        embed_url = (
+            f"{media_server_url.rstrip('/')}/Videos/{media_id}/master.m3u8"
+            f"?api_key={media_server_api_key}"
+            f"&MediaSourceId={media_source_id}"
+            f"&DeviceId={device_id}"
+            f"&PlaySessionId={play_session_id}"
+            f"&VideoCodec=h264"
+            f"&AudioCodec=aac"
+            f"&AudioStreamIndex=0"
+            f"&VideoBitrate=20000000"
+            f"&AudioBitrate=320000"
+            f"&MaxWidth=1920"
+            f"&MaxHeight=1080"
+            f"&TranscodingMaxAudioChannels=2"
+            f"&RequireAvc=false"
+            f"&SegmentContainer=ts"
+            f"&MinSegments=1"
+            f"&BreakOnNonKeyFrames=true"
+        )
+        
+        print(f"📺 Stream URL generated successfully")
 
         result = {
             'type': 'media_embed',
-            'message': f'Playing media item {media_id}.',
-            'embed_url': embed_url
+            'message': f'Now playing: {title}',
+            'embed_url': embed_url,
+            'title': title,
+            'description': description,
+            'metadata': metadata,
+            'ai_context': ai_context,  # Rich context for Solace
+            'sender': 'Nova'
         }
         
-        emit('command_response', result)
-        if session_id:
-            _save_message_to_db(session_id, {"sender": "Nova", **result, "type": "ai"})
+        print(f"✅ Sending media playback: {title}")
+        
+        # Use emit_media_context to send both command_response AND chat message
+        emit_media_context(
+            session_id=session_id,
+            title=title,
+            description=description,
+            metadata=metadata,
+            embed_url=embed_url
+        )
+        
+        # Also emit media_update for state tracking
+        emit_media_update(
+            session_id=session_id,
+            event_type='play',
+            data={
+                'url': embed_url,
+                'title': title,
+                'description': description,
+                'type': 'video'
+            }
+        )
+        
+        # TRIGGER SOLACE TO RESPOND AUTOMATICALLY (like /search does)
+        # Build a rich prompt for Solace to comment on what the user is watching
+        media_prompt = f"I just started watching: {title}"
+        
+        # Small delay to ensure the media context message is saved to DB
+        # This is critical - handle_chat() loads history from DB, so we need the write to complete
+        time.sleep(0.5)
+        
+        # Create a chat payload to trigger Solace's response
+        chat_data = {
+            'text': media_prompt,
+            'session_id': session_id,
+            'backend': data.get('backend', 'api'),  # Use whatever backend user has selected
+            'provider': data.get('provider', 'deepseek'),
+            'model_name': data.get('model_name', 'deepseek-chat'),
+            'userName': data.get('userName', 'User'),
+            'aiName': data.get('aiName', 'Solace'),
+            'timezone': data.get('timezone', 'UTC')
+        }
+        
+        # Call the chat handler to trigger Solace's response
+        # This is the key - we're programmatically triggering a chat just like /search does
+        handle_chat(chat_data)
 
     except Exception as e:
+        import traceback
+        print(f"❌ Media playback failed: {e}")
+        traceback.print_exc()
         emit('error', {'message': f'Media playback failed: {str(e)}'})
+
 
 # ---- Code panel file operations ----
 def _is_safe_path(target: Path) -> bool:
@@ -2460,9 +2815,11 @@ def handle_parliament_request(data):
 
         # Stream router map (same as regular chat)
         streamer_map = {
-            "llama.cpp": stream_llamacpp,
+            "llama-cpp-python": stream_llamacpp,
+            "llama.cpp": stream_llamacpp_server,
             "ollama": stream_ollama,
-            "safetensors": stream_safetensors,
+            "transformers": stream_safetensors,
+            "vllm": stream_vllm,
             "api": {
                 "google": stream_google,
                 "openai": stream_openai,

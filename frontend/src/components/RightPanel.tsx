@@ -1,17 +1,17 @@
 import React, { useRef, useEffect } from "react";
 import { VoiceVisualizer } from "../VoiceVisualizer";
 import { Socket } from "socket.io-client";
-import MediaBrowser from "./MediaBrowser";
 import MonacoCodeEditor from "./MonacoCodeEditor";
 import FileBrowser from "./FileBrowser";
 import { type OpenFile, type FileNode } from "../types/files";
+import Hls from "hls.js";
 
 export type RightPanelMode =
   | "voice"
   | "youtube"
   | "code"
-  | "media"
   | "tools"
+  | "media-player"
   | "closed";
 
 interface RightPanelProps {
@@ -29,6 +29,11 @@ interface RightPanelProps {
   youtubeVideoId?: string;
   youtubeUrl?: string;
   onPopOutVideo?: (videoId: string) => void;
+
+  // Media player props
+  mediaPlaybackUrl?: string;
+  mediaTitle?: string;
+  mediaDescription?: string;
 
   // Code editor mode props
   codeContent?: string;
@@ -79,7 +84,7 @@ interface RightPanelProps {
 
 const RightPanel: React.FC<RightPanelProps> = ({
   mode,
-  onClose,
+  onClose: _onClose,
   panelWidth: _panelWidth,
   socket,
   isHandsFreeMode = false,
@@ -88,6 +93,9 @@ const RightPanel: React.FC<RightPanelProps> = ({
   youtubeVideoId,
   youtubeUrl,
   onPopOutVideo,
+  mediaPlaybackUrl,
+  mediaTitle,
+  mediaDescription,
   codeContent = "",
   codeLanguage = "javascript",
   onCodeChange,
@@ -124,9 +132,9 @@ const RightPanel: React.FC<RightPanelProps> = ({
   toolSchema,
   onRunToolCall,
   toolCallResult = null,
-  mediaBrowserQuery = "",
-  onPlayMedia,
-  novaSettings,
+  mediaBrowserQuery: _mediaBrowserQuery = "",
+  onPlayMedia: _onPlayMedia,
+  novaSettings: _novaSettings,
 }) => {
   // Voice mode refs
   const visualizerRef = useRef<VoiceVisualizer | null>(null);
@@ -136,6 +144,10 @@ const RightPanel: React.FC<RightPanelProps> = ({
   const dotsRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const statusLabelRef = useRef<HTMLParagraphElement>(null);
+  
+  // Media player ref for HLS
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const hlsRef = useRef<Hls | null>(null);
 
   const [isRecording, setIsRecording] = React.useState(false);
 
@@ -317,6 +329,98 @@ const RightPanel: React.FC<RightPanelProps> = ({
     };
   }, [mode, onVisualizerReady]);
 
+  // HLS setup for media player
+  useEffect(() => {
+    if (mode !== "media-player" || !mediaPlaybackUrl || !videoRef.current) {
+      return;
+    }
+
+    const video = videoRef.current;
+
+    // Clean up previous HLS instance
+    if (hlsRef.current) {
+      hlsRef.current.destroy();
+      hlsRef.current = null;
+    }
+
+    // Check if URL is HLS (.m3u8)
+    const isHls = mediaPlaybackUrl.includes('.m3u8');
+
+    if (isHls) {
+      if (Hls.isSupported()) {
+        console.log("📺 Using HLS.js for playback");
+        const hls = new Hls({
+          enableWorker: true,
+          lowLatencyMode: false,
+          backBufferLength: 90,
+        });
+        
+        hlsRef.current = hls;
+        
+        hls.on(Hls.Events.MEDIA_ATTACHED, () => {
+          console.log("📺 HLS media attached");
+        });
+        
+        hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
+          console.log(`📺 HLS manifest parsed, ${data.levels.length} quality levels`);
+          video.play().catch(err => {
+            console.log("📺 Autoplay prevented:", err);
+          });
+        });
+        
+        hls.on(Hls.Events.ERROR, (_event, data) => {
+          console.error("📺 HLS Error:", data);
+          if (data.fatal) {
+            switch (data.type) {
+              case Hls.ErrorTypes.NETWORK_ERROR:
+                console.log("📺 Network error, trying to recover...");
+                hls.startLoad();
+                break;
+              case Hls.ErrorTypes.MEDIA_ERROR:
+                console.log("📺 Media error, trying to recover...");
+                hls.recoverMediaError();
+                break;
+              default:
+                console.error("📺 Fatal error, cannot recover");
+                hls.destroy();
+                break;
+            }
+          }
+        });
+        
+        hls.loadSource(mediaPlaybackUrl);
+        hls.attachMedia(video);
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        // Safari native HLS support
+        console.log("📺 Using native HLS support (Safari)");
+        video.src = mediaPlaybackUrl;
+        video.addEventListener('loadedmetadata', () => {
+          video.play().catch(err => {
+            console.log("📺 Autoplay prevented:", err);
+          });
+        });
+      } else {
+        console.error("📺 HLS not supported in this browser");
+      }
+    } else {
+      // Direct stream (MP4, etc.)
+      console.log("📺 Using direct video playback");
+      video.src = mediaPlaybackUrl;
+      video.load();
+      video.play().catch(err => {
+        console.log("📺 Autoplay prevented:", err);
+      });
+    }
+
+    // Cleanup on unmount or URL change
+    return () => {
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
+      }
+    };
+  }, [mode, mediaPlaybackUrl]);
+
   const startRecording = async () => {
     if (isRecording) return;
     try {
@@ -488,6 +592,35 @@ const RightPanel: React.FC<RightPanelProps> = ({
           </div>
         );
 
+
+      case "media-player":
+        return (
+          <div className="flex-grow flex flex-col">
+            {mediaTitle && (
+              <div className="mb-2 p-3 bg-gray-900/50 rounded-lg">
+                <h3 className="text-lg font-bold text-white">{mediaTitle}</h3>
+                {mediaDescription && (
+                  <p className="text-sm text-gray-400 mt-1">{mediaDescription}</p>
+                )}
+              </div>
+            )}
+            {mediaPlaybackUrl ? (
+              <video
+                ref={videoRef}
+                className="w-full h-full rounded-lg bg-black"
+                controls
+                autoPlay
+                playsInline
+                title="Media Player"
+              />
+            ) : (
+              <div className="flex-grow flex items-center justify-center text-gray-400">
+                <p>No media loaded</p>
+              </div>
+            )}
+          </div>
+        );
+
       case "code":
         return (
           <div className="flex-grow flex flex-col h-full">
@@ -619,23 +752,6 @@ const RightPanel: React.FC<RightPanelProps> = ({
                 </div>
               </div>
             </div>
-          </div>
-        );
-
-      case "media":
-        if (onPlayMedia && novaSettings) {
-          return (
-            <MediaBrowser
-              query={mediaBrowserQuery}
-              onPlay={onPlayMedia}
-              onClose={onClose}
-              settings={novaSettings}
-            />
-          );
-        }
-        return (
-          <div className="flex-grow flex items-center justify-center text-gray-400">
-            <p>Media browser not configured</p>
           </div>
         );
 
@@ -827,11 +943,6 @@ const RightPanel: React.FC<RightPanelProps> = ({
 
   if (mode === "closed") {
     return null;
-  }
-
-  // Special handling for media browser (full overlay)
-  if (mode === "media") {
-    return renderContent();
   }
 
   return (

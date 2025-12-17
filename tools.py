@@ -1748,8 +1748,8 @@ def get_system_state(session_id: str = None):
     if session_id:
         agent_state = _get_agent_state(session_id) or {}
     try:
-        from main_server import current_backend, current_model_path_string
-        return {"backend": current_backend, "model": current_model_path_string, "agent_state": agent_state}
+        from system_state import SYSTEM_STATE
+        return {"backend": SYSTEM_STATE['current_backend'], "model": SYSTEM_STATE['current_model_path_string'], "agent_state": agent_state}
     except Exception:
         return {"backend": None, "model": None, "agent_state": agent_state}
 

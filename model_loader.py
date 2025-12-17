@@ -1,4 +1,6 @@
 import json, os, time, gc, re
+import subprocess
+import signal
 from llama_cpp import Llama, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16
 from llama_cpp.llama_chat_format import Jinja2ChatFormatter, get_chat_completion_handler
 import ollama
@@ -16,7 +18,38 @@ from openai import OpenAI as OpenAIClient
 from upgraded_memory_manager import get_context_for_model
 import requests
 import base64
-
+try:
+    from vllm import LLM, SamplingParams
+    VLLM_AVAILABLE = True
+    print("✅ vLLM loaded successfully")
+except ImportError as e:
+    VLLM_AVAILABLE = False
+    if "vllm._C" in str(e):
+        print("⚠️ vLLM installed but CUDA extensions not found.")
+        print("   vLLM requires proper CUDA environment and may need to be built from source.")
+        print("   For now, use 'transformers' backend instead for HuggingFace models.")
+    else:
+        print(f"⚠️ vLLM not installed: {e}")
+        print("   Install with: pip install vllm")
+except Exception as e:
+    VLLM_AVAILABLE = False
+    print(f"⚠️ vLLM import failed: {e}")
+from model_streaming import (
+    stream_with_react_tool_calling,  # ReAct wrapper
+    stream_openai_compatible,
+    stream_deepseek,
+    stream_xai,
+    stream_qwen,
+    stream_meta,
+    stream_perplexity,
+    stream_openrouter,
+    stream_openai,
+    stream_anthropic,
+    stream_google,
+    stream_ollama,
+    stream_llamacpp,
+    stream_safetensors
+)
 
 def _coerce_image_data(image_data, default_media_type: str = "image/png"):
     """
@@ -252,9 +285,14 @@ model_load_times = {}
 models_lock = Lock()
 current_backend = "llama.cpp" # or "ollama"
 
+# llama.cpp server subprocess tracking
+llamacpp_server_process = None
+llamacpp_server_port = 8081
+llamacpp_server_host = "http://127.0.0.1:8081"
+
 def load_model(
-    model_path, 
-    backend="llama.cpp", 
+    model_path,
+    backend="llama-cpp-python", 
     context_tokens=32678, 
     gpu_layers=0, 
     temperature=0.7, 
@@ -308,33 +346,33 @@ def load_model(
 
             print(f"🟢 LOADING MODEL: {model_id} with backend {backend} and provider {provider}")
 
-            if backend == "llama.cpp":
-                model_states[model_id]['uses_chat_handler'] = True
+            if backend == "llama-cpp-python":
+                model_states[model_id]['uses_chat_handler'] = False
                 model_basename = os.path.basename(model_id).lower()
-                chat_handler = None
-                
-                if "lfm2" in model_basename:
-                    print("🗨️ Using custom chat format: LFM2")
-                    chat_handler = Jinja2ChatFormatter(template=LFM2_TEMPLATE, bos_token="<|startoftext|>", eos_token="<|im_end|>")
-                elif "apriel" in model_basename:
-                    print("🗨️ Using custom chat format: Apriel")
-                    chat_handler = Jinja2ChatFormatter(template=APRIEL_TEMPLATE, bos_token="<|im_start|>", eos_token="<|im_end|>")
-                elif "jamba" in model_basename:
-                    print("🗨️ Using custom chat format: Jamba")
-                    chat_handler = Jinja2ChatFormatter(template=JAMBA_TEMPLATE, bos_token="<|startoftext|>", eos_token="<|endoftext|>")
-                else:
-                    chat_format_name = "llama-2"  # Default
-                    if "qwen" in model_basename:
-                        chat_format_name = "chatml"
-                    elif "gemma" in model_basename:
-                        chat_format_name = "gemma"
-                    elif "llama-3" in model_basename or "llama3" in model_basename:
-                        chat_format_name = "llama-3"
-                    print(f"🗨️ Using built-in chat format: {chat_format_name}")
-                    chat_handler = get_chat_completion_handler(chat_format_name)
 
+                # Determine chat format from model name or metadata
+                chat_format = None  # None = use GGUF embedded template
+                
+                # Only specify chat_format if we need to override the GGUF template
+                # Most modern GGUF files have correct templates embedded
+                if "qwen" in model_basename and "chatml" not in model_basename:
+                    chat_format = "chatml"
+                elif "gemma" in model_basename:
+                    chat_format = "gemma"
+                elif "llama-3" in model_basename or "llama3" in model_basename:
+                    chat_format = "llama-3"
+                # For DeepSeek and other models, let the GGUF template handle it (chat_format=None)
+                
+                if chat_format:
+                    print(f"🗨️ Using specified chat format: {chat_format}")
+                else:
+                    print("🗨️ Using GGUF-embedded chat template (auto-detect)")
+
+                # KV cache quantization
                 type_k = GGML_TYPE_F16 if kv_cache_quant == 'fp16' else GGML_TYPE_Q4_0 if kv_cache_quant == 'int4' else GGML_TYPE_Q8_0
                 type_v = GGML_TYPE_F16 if kv_cache_quant == 'fp16' else GGML_TYPE_Q4_0 if kv_cache_quant == 'int4' else GGML_TYPE_Q8_0
+
+                # Load model WITHOUT custom chat_handler - let llama-cpp-python handle it
                 models[model_id] = Llama(
                     model_path=model_id,
                     n_ctx=context_tokens,
@@ -344,7 +382,7 @@ def load_model(
                     verbose=True,
                     type_k=type_k,
                     type_v=type_v,
-                    chat_handler=chat_handler
+                    chat_format=chat_format  # None means use GGUF embedded template
                 )
             elif backend == "ollama":
                 model_name = setup_ollama_kv_cache(model_id, kv_cache_quant)
@@ -371,7 +409,7 @@ def load_model(
                 else:
                     models[model_id] = model_id
 
-            elif backend == "safetensors":
+            elif backend == "transformers":
                 try:
                     from transformers import AutoTokenizer, TextStreamer, AutoProcessor, AutoModelForCausalLM, TextIteratorStreamer
                     from qwen_omni_utils import process_mm_info # Ensure this is available
@@ -468,6 +506,139 @@ def load_model(
                     import traceback
                     traceback.print_exc()
                     return None
+
+            elif backend == "vllm":
+                if not VLLM_AVAILABLE:
+                    error_msg = (
+                        "vLLM backend is not available. vLLM requires CUDA extensions (_C module) which are missing. "
+                        "This typically means vLLM needs to be built from source with proper CUDA support. "
+                        "For now, please use the 'transformers' backend instead for HuggingFace models."
+                    )
+                    print(f"🔴 {error_msg}")
+                    raise ValueError(error_msg)
+
+                try:
+                    print(f"🚀 Loading vLLM model from {model_path}")
+
+                    # Get vLLM-specific configs
+                    tensor_parallel_size = kwargs.get('tensor_parallel_size', 1)
+                    gpu_memory_utilization = kwargs.get('gpu_memory_utilization', 0.9)
+                    max_tokens = kwargs.get('max_tokens', 4096)
+
+                    # Initialize vLLM engine
+                    vllm_model = LLM(
+                        model=model_path,
+                        tensor_parallel_size=tensor_parallel_size,
+                        gpu_memory_utilization=gpu_memory_utilization,
+                        max_model_len=context_tokens,
+                        trust_remote_code=True
+                    )
+
+                    # Store the model and tokenizer
+                    models[model_id] = vllm_model
+
+                    print(f"✅ vLLM model loaded successfully!")
+                    return models[model_id]
+
+                except Exception as e:
+                    print(f"🔴 vLLM load error: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    return None
+
+            elif backend == "llama.cpp":
+                global llamacpp_server_process, llamacpp_server_port, llamacpp_server_host
+
+                try:
+                    # Kill any existing server process
+                    if llamacpp_server_process is not None:
+                        print("🟡 Stopping existing llama.cpp server...")
+                        try:
+                            llamacpp_server_process.terminate()
+                            llamacpp_server_process.wait(timeout=5)
+                        except:
+                            llamacpp_server_process.kill()
+                        llamacpp_server_process = None
+
+                    print(f"🚀 Starting llama.cpp server for {model_path}")
+
+                    # Find llama-server executable
+                    server_dir = os.path.join(BASE_DIR, "llama-cpp-server", "bin")
+                    if os.name == 'nt':  # Windows
+                        server_exe = os.path.join(server_dir, "llama-server.exe")
+                    else:  # Unix-like
+                        server_exe = os.path.join(server_dir, "llama-server")
+
+                    if not os.path.exists(server_exe):
+                        raise FileNotFoundError(
+                            f"llama-server not found at {server_exe}\n"
+                            f"Download from: https://github.com/ggerganov/llama.cpp/releases\n"
+                            f"Place the binary in: {server_dir}"
+                        )
+
+                    # Build command
+                    cmd = [
+                        server_exe,
+                        "--model", model_path,
+                        "--port", str(llamacpp_server_port),
+                        "--ctx-size", str(context_tokens),
+                        "--n-gpu-layers", str(gpu_layers),
+                        "--threads", str(kwargs.get('threads', 8)),
+                    ]
+
+                    # Add flash attention if requested
+                    if kwargs.get('use_flash_attention', False):
+                        cmd.append("--flash-attn")
+
+                    print(f"🔧 Command: {' '.join(cmd)}")
+
+                    # Start the server process
+                    llamacpp_server_process = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+                    )
+
+                    # Wait for server to be ready (check health endpoint)
+                    print("⏳ Waiting for llama.cpp server to start...")
+                    import requests
+                    max_retries = 30
+                    for i in range(max_retries):
+                        try:
+                            response = requests.get(f"{llamacpp_server_host}/health", timeout=1)
+                            if response.status_code == 200:
+                                print(f"✅ llama.cpp server ready at {llamacpp_server_host}")
+                                break
+                        except:
+                            pass
+                        time.sleep(1)
+                    else:
+                        raise TimeoutError("llama.cpp server failed to start within 30 seconds")
+
+                    # Store the server info
+                    models[model_id] = {
+                        "type": "llamacpp-server",
+                        "host": llamacpp_server_host,
+                        "process": llamacpp_server_process
+                    }
+
+                    print(f"✅ llama.cpp server loaded successfully!")
+                    return models[model_id]
+
+                except Exception as e:
+                    print(f"🔴 llama.cpp server load error: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    # Cleanup on failure
+                    if llamacpp_server_process is not None:
+                        try:
+                            llamacpp_server_process.terminate()
+                        except:
+                            pass
+                        llamacpp_server_process = None
+                    return None
+
             return models.get(model_id)
         except Exception as e:
             print(f"🔴 Model load error: {str(e)}")
@@ -504,6 +675,36 @@ def unload_model(model_obj, model_path, backend="llama.cpp"):
                 requests.post('http://localhost:11434/api/generate', json=payload, timeout=0.5)
             except Exception as e:
                 print("ℹ️ Ollama unload issue:", e)
+
+        # vLLM backend
+        elif backend == "vllm":
+            if model_obj is not None:
+                try:
+                    # vLLM doesn't have a specific unload method, just delete the object
+                    del model_obj
+                    print("🟡 vLLM model unloaded")
+                except Exception as e:
+                    print(f"⚠️ vLLM unload issue: {e}")
+
+        # llama.cpp server backend
+        elif backend == "llama.cpp":
+            global llamacpp_server_process
+            try:
+                if llamacpp_server_process is not None:
+                    print("🟡 Stopping llama.cpp server...")
+                    try:
+                        # Try graceful shutdown first
+                        llamacpp_server_process.terminate()
+                        llamacpp_server_process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        # Force kill if graceful shutdown fails
+                        print("⚠️ Forcefully killing llama.cpp server...")
+                        llamacpp_server_process.kill()
+                        llamacpp_server_process.wait()
+                    llamacpp_server_process = None
+                    print("✅ llama.cpp server stopped")
+            except Exception as e:
+                print(f"⚠️ llama.cpp server unload issue: {e}")
 
         else:
             # For llama.cpp or other models loaded in memory
@@ -895,940 +1096,6 @@ def get_system_prompt(model_path):
         load_configs()
     return model_configs.get(model_path, {}).get('system_prompt', '')
 
-def stream_google(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None, timezone='UTC'):
-    try:
-        from datetime import datetime
-        from PIL import Image
-        import io
-        import base64
-
-        memory_context = get_context_for_model(user_input, model_id=model_id_str)
-        
-        now = datetime.now()
-        time_message = f"This is a system message. Do not refer to this message unless asked. This message is to give you a live update of the Current Date and Time. The User's Timezone is {timezone}. The Current time is {now.strftime('%H:%M')} and The Current Date is {now.strftime('%m/%d/%Y')}."
-        
-        # Inject time message into the history
-        conversation_history.insert(0, {"role": "system", "content": time_message})
-        
-        # Manage the context window
-        conversation_history = manage_context_window(conversation_history, 32768 - 2048) # Gemini 1.5 Pro has 32k context
-
-        normalized_image = _coerce_image_data(image_data)
-        # Add the current image to the last user message
-        if normalized_image:
-            for msg in reversed(conversation_history):
-                if msg['role'] == 'user':
-                    if 'image' not in msg:
-                         msg['image'] = []
-                    msg['image'].append(normalized_image["data"])
-                    break
-
-        system_prompt = model_states.get(model_id_str, {}).get("system_prompt", "You are a helpful AI assistant.")
-        messages = build_gemini_prompt(user_input, conversation_history, memory_context, normalized_image["data"] if normalized_image else None, system_prompt)
-
-        stream = model_instance.generate_content(
-            messages,
-            generation_config=genai.types.GenerationConfig(temperature=0.7),
-            stream=True
-        )
-
-        for chunk in stream:
-            if should_stop():
-                yield {'type': 'reply', 'token': "\n[Generation stopped by user]"}
-                break
-            # The final chunk may not have any parts, causing chunk.text to fail.
-            if chunk.parts and hasattr(chunk.parts[0], 'text'):
-                yield {'type': 'reply', 'token': chunk.text}
-
-    except Exception as e:
-        import traceback
-        error_details = traceback.format_exc()
-        print(f"--- GOOGLE STREAM ERROR --- \n{error_details}\n--------------------------")
-        yield {'type': 'error', 'token': f"[STREAM ERROR (Google): {repr(e)} - Check logs for details]"}
-
-def stream_gpt(model, model_path, user_input, conversation_history, should_stop, backend, provider=None, image_data=None, timezone='UTC', tools=None, debug_mode=False, thinking_level='medium'):
-    """
-    Streams a response from a GPT-style model.
-    Handles different backends and prompt formatting.
-    """
-    # --- Prompt Construction ---
-    messages = []
-    
-    if debug_mode:
-        print("\n--- RAW HISTORY FROM FRONTEND ---")
-        print(json.dumps(conversation_history, indent=2))
-        print("---------------------------------\n")
-
-    system_prompt_text = get_system_prompt(model_path)
-    
-    # The frontend history now includes the latest user message, so we use it directly
-    # We also need to normalize the roles from 'sender'/'type' to 'role'
-    normalized_history = []
-    for entry in conversation_history:
-        role = "user" if entry.get("sender", "").lower() == "user" or entry.get("type", "").lower() == "user" else "assistant"
-        content = entry.get("message", "")
-        print("Point 1")
-        if content:
-            normalized_history.append({"role": role, "content": content})
-
-    # --- Gemma System Prompt Fix ---
-    is_gemma = 'gemma' in model_path.lower()
-    if is_gemma and system_prompt_text:
-        if normalized_history and normalized_history[0]['role'] == 'user':
-            normalized_history[0]['content'] = f"{system_prompt_text}\n\n{normalized_history[0]['content']}"
-        else:
-            print("⚠️ Gemma model detected, but no initial user message to prepend system prompt to.")
-    elif system_prompt_text:
-        messages.insert(0, {"role": "system", "content": system_prompt_text})
-    
-    messages.extend(normalized_history)
-
-    # CRITICAL FIX: Append the current user input to the messages list
-    if user_input:
-        messages.append({"role": "user", "content": user_input})
-    print("Point 2")
-    if debug_mode:
-        print("\n--- FINAL PROMPT TO MODEL ---")
-        print(json.dumps(messages, indent=2))
-        print("-----------------------------\n")
-
-    # --- Model Streaming ---
-    try:
-        if backend == "llama.cpp":
-            # The chat_handler set during model load will correctly format the prompt.
-            response_generator = model.create_chat_completion(
-                messages=messages,
-                temperature=0.7,
-                stream=True,
-                tools=tools,
-                tool_choice="auto"
-            )
-            print("Point 3")
-            # This loop now correctly handles both text and tool call responses from llama.cpp
-            for chunk in response_generator:
-                if should_stop(): break
-                delta = chunk['choices'][0].get('delta', {})
-                if not delta: continue
-
-                if 'tool_calls' in delta and delta['tool_calls']:
-                    # NOTE: This handles streaming tool calls. A more robust implementation
-                    # might need to aggregate chunks if a single call is split.
-                    full_tool_call = delta['tool_calls'][0]
-                    yield {'type': 'tool_call', 'tool_call': full_tool_call}
-                    continue
-
-                token = delta.get('content')
-                if token:
-                    yield {'type': 'reply', 'token': token}
-        
-        elif backend == "ollama":
-            # For Ollama, the 'model' is the model name string
-            # Explicitly create a client with the correct host to override any faulty defaults
-            client = ollama.Client(host='http://127.0.0.1:11434')
-
-            # CRITICAL FIX: Ensure the system prompt is the first message for Ollama
-            if not messages or messages[0].get('role') != 'system':
-                messages.insert(0, {"role": "system", "content": system_prompt_text})
-
-            stream = client.chat(
-                model=model,
-                messages=messages,
-                stream=True
-            )
-            for chunk in stream:
-                if should_stop(): break
-                token = chunk['message']['content']
-                if token:
-                    yield {'type': 'reply', 'token': token}
-
-        elif backend == "safetensors":
-            # For safetensors, 'model' is a tuple (model, tokenizer, streamer, processor)
-            _model, tokenizer, streamer, _ = model
-            
-            # Use the tokenizer's chat template for robust and accurate prompt formatting
-            prompt_string = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-            inputs = tokenizer(prompt_string, return_tensors="pt").to(_model.device)
-            generation_kwargs = dict(inputs, streamer=streamer, max_new_tokens=4096)
-            
-            thread = Thread(target=_model.generate, kwargs=generation_kwargs)
-            thread.start()
-
-            for token in streamer:
-                if should_stop(): break
-                if token:
-                    yield {'type': 'reply', 'token': token}
-            thread.join()
-        
-    except Exception as e:
-        print(f"🔴 Streaming Error: {e}")
-        import traceback
-        traceback.print_exc()
-        yield {'type': 'error', 'token': f"An error occurred: {e}"}
-
-def stream_llamacpp(model_instance, model_id_str, user_input, conversation_history, should_stop,
-                    image_data=None, timezone='UTC', tools=None, tool_outputs=None, debug_mode=False, thinking_level='medium'):
-    try:
-        import re
-        import json
-        from datetime import datetime
-        memory_context = get_context_for_model(user_input, model_id=model_id_str)
-        
-        # --- Hybrid Thinking Logic ---
-        model_state = model_states.get(model_id_str, {})
-        system_prompt = model_state.get("system_prompt", "You are a helpful AI assistant.")
-        thinking_style = model_state.get("thinking_style", "none")
-        force_think_prepend = False
-
-        if thinking_style in ['simple', 'advanced']:
-            force_think_prepend = True
-
-        if thinking_style == 'advanced':
-            thinking_instructions = {
-                "low": "Provide a direct answer with minimal reasoning. Avoid verbose chains of thought.",
-                "medium": "Briefly outline key reasoning steps, then give the final answer.",
-                "high": "Think step by step. Provide a short summary of the reasoning, then the final answer."
-            }
-            if thinking_level in thinking_instructions:
-                system_prompt += f"\n\n--- Reasoning Instructions ---\n{thinking_instructions[thinking_level]}"
-        # --- End Hybrid Logic ---
-
-        config_path = os.path.join(BASE_DIR, "config.json")
-        with open(config_path, "r", encoding="utf-8-sig") as f:
-            all_configs = json.load(f)
-        config = all_configs.get(model_id_str, {})
-        now = datetime.now()
-        time_message = f"Current Time: {now.strftime('%H:%M')} | Current Date: {now.strftime('%m/%d/%Y')} | User Timezone: {timezone}"
-        full_system_prompt = f"{time_message}\n\n{system_prompt}"
-
-        messages = clean_and_normalize_history(conversation_history, user_input)
-
-        if memory_context and memory_context.strip().lower() not in ["none", "null", "[]"]:
-            messages.insert(0, {"role": "system", "content": f"Relevant Memories:\n{memory_context}"})
-        
-        if conversation_history and conversation_history[0].get("role") == "user" and "web_search" in conversation_history[0].get("content", ""):
-            web_search_context = conversation_history.pop(0)["content"]
-            full_system_prompt = (
-                "You have been provided with the following real-time web search results..."
-            )
-        
-        messages.insert(0, {"role": "system", "content": full_system_prompt})
-
-        if debug_mode:
-            print("\n--- EXACT PROMPT SENT TO MODEL (llama.cpp) ---")
-            print(json.dumps(messages, indent=2))
-            print("==============================================")
-
-        if tool_outputs:
-            for tool_output in tool_outputs:
-                messages.append({
-                    "role": "tool",
-                    "content": json.dumps(tool_output['output'])
-                })
-
-        total_context_tokens = config.get('context_tokens', 8192)
-        max_tokens_for_history = int(total_context_tokens * 0.4)
-        messages = manage_context_window(messages, max_tokens_for_history)
-
-        normalized_image = _coerce_image_data(image_data)
-        if normalized_image:
-            for msg in reversed(messages):
-                if msg['role'] == 'user' and isinstance(msg['content'], str):
-                    msg['content'] = [
-                        {"type": "text", "text": msg['content']},
-                        {"type": "image_url", "image_url": {"url": f"data:{normalized_image['media_type']};base64,{normalized_image['data']}"}}
-                    ]
-                    break
-
-        request_params = {
-            "messages": messages,
-            "max_tokens": config.get("max_tokens", 4096),
-            "temperature": config.get("temperature", 0.7) or 0.7,
-            "stream": True
-        }
-        if tools:
-            request_params["tools"] = tools
-            request_params["tool_choice"] = "auto"
-
-        stream = model_instance.create_chat_completion(**request_params)
-        # --- FINAL ROBUST GUARD FIX: Handle malformed response object ---
-        # If 'stream' is not a generator, we process it manually.
-        # Check if it lacks the generator's __iter__ method OR if it has the full object's 'choices' attribute.
-        if not hasattr(stream, '__iter__') or hasattr(stream, 'choices'):
-            
-            full_response = stream
-            
-            # CRITICAL: We must guard the access to 'choices' because the object 
-            # might be a malformed ChatFormatterResponse with no valid structure.
-            try:
-                # 1. Prepend <think> if required
-                if force_think_prepend:
-                    yield {'type': 'reply', 'token': '<think>'}
-
-                # 2. Extract and yield content
-                # This is the line that caused the crash, now safely inside try block.
-                content = full_response.choices[0].message.get("content", "") 
-                if content:
-                    if "apriel" in model_id_str.lower():
-                        content = re.sub(r'\s*\[/?(BEGIN|END) FINAL RESPONSE\]\s*', '', content, flags=re.IGNORECASE).strip()
-                    yield {'type': 'reply', 'token': content}
-                
-                # 3. Extract and yield tool calls
-                tool_calls = full_response.choices[0].message.get("tool_calls", [])
-                for tool_call in tool_calls:
-                    try:
-                        arguments = json.loads(tool_call['function']['arguments'])
-                    except json.JSONDecodeError:
-                        arguments = {"error": "Failed to decode arguments", "raw": tool_call['function']['arguments']}
-                    
-                    yield {
-                        'type': 'tool_call', 
-                        'tool_call': {
-                            'id': tool_call.get('id', 'tool_call_id'), 
-                            'name': tool_call['function']['name'],
-                            'arguments': arguments
-                        }
-                    }
-            
-            except (AttributeError, IndexError) as e:
-                # Catch the 'AttributeError: ... has no attribute choices' or IndexError
-                # if choices is empty. This means the model template process failed.
-                if debug_mode:
-                    print(f"DEBUG: Caught expected non-streaming object error: {e}")
-                # Yield a specific error token so the UI doesn't hang.
-                yield {'type': 'error', 'token': "[Chat Format Error: Apriel template failed to generate a valid response structure.]"}
-
-            # CRITICAL: Exit the function if it was not a generator!
-            return 
-        # --- END FINAL ROBUST GUARD FIX ---
-        if force_think_prepend:
-            yield {'type': 'reply', 'token': '<think>'}
-
-        active_tool_calls = {}
-        for chunk in stream:
-            if should_stop():
-                yield {'type': 'reply', 'token': "\n[Generation stopped by user]"}
-                break
-
-            delta = chunk.get("choices", [{}])[0].get("delta", {})
-            if not delta: continue
-
-            if delta.get("content"):
-                token = str(delta["content"])
-                if "apriel" in model_id_str.lower():
-                    token = re.sub(r'\[/?(BEGIN|END) FINAL RESPONSE\]', '', token, flags=re.IGNORECASE)
-                yield {'type': 'reply', 'token': token}
-
-            if delta.get("tool_calls"):
-                for tool_call_chunk in delta["tool_calls"]:
-                    index = tool_call_chunk.get("index")
-                    if index is None: continue
-
-                    if index not in active_tool_calls:
-                        active_tool_calls[index] = {"id": "", "function": {"name": "", "arguments": ""}, "type": "function"}
-                    
-                    if tool_call_chunk.get("id"):
-                        active_tool_calls[index]['id'] = tool_call_chunk["id"]
-                    if tool_call_chunk.get("function", {}).get("name"):
-                        active_tool_calls[index]['function']['name'] = tool_call_chunk["function"]["name"]
-                    if tool_call_chunk.get("function", {}).get("arguments"):
-                        active_tool_calls[index]['function']['arguments'] += tool_call_chunk["function"]["arguments"]
-        
-        for index, tool_call in active_tool_calls.items():
-            try:
-                arguments = json.loads(tool_call['function']['arguments'])
-            except json.JSONDecodeError:
-                arguments = {"error": "Failed to decode arguments", "raw": tool_call['function']['arguments']}
-
-            yield {
-                'type': 'tool_call', 
-                'tool_call': {
-                    'id': tool_call['id'],
-                    'name': tool_call['function']['name'],
-                    'arguments': arguments
-                }
-            }
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        yield {'type': 'error', 'token': f"[STREAM ERROR (llama.cpp): {str(e)}]"}
-
-def stream_ollama(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None, timezone='UTC', debug_mode=False, thinking_level='medium'):
-    try:
-        from datetime import datetime
-        import json
-        memory_context = get_context_for_model(user_input, model_id=model_id_str)
-        
-        # --- Hybrid Thinking Logic ---
-        model_state = model_states.get(model_id_str, {})
-        system_prompt = model_state.get("system_prompt", "You are a helpful AI assistant.")
-        thinking_style = model_state.get("thinking_style", "none")
-
-        if thinking_style == 'advanced':
-            thinking_instructions = {
-                "low": "Provide a direct answer with minimal reasoning. Avoid verbose chains of thought.",
-                "medium": "Briefly outline key reasoning steps, then give the final answer.",
-                "high": "Think step by step. Provide a short summary of the reasoning, then the final answer."
-            }
-            if thinking_level in thinking_instructions:
-                system_prompt += f"\n\n--- Reasoning Instructions ---\n{thinking_instructions[thinking_level]}"
-        # Encourage consistent think-tag usage across providers
-        system_prompt += "\n\nWhen you need to reason, wrap your internal reasoning between <think> and </think> tags, then provide the final answer after the closing tag."
-        # Per user request, we don't force-prepend <think> for Ollama.
-        # --- End Hybrid Logic ---
-
-        now = datetime.now()
-        time_message = f"This is a system message. Do not refer to this message unless asked. This message is to give you a live update of the Current Date and Time. The User's Timezone is {timezone}. The Current time is {now.strftime('%H:%M')} and The Current Date is {now.strftime('%m/%d/%Y')}."
-
-        system_prompt_with_time = f"{time_message}\n\n{system_prompt}"
-
-        messages = clean_and_normalize_history(conversation_history, user_input)
-
-        if memory_context and memory_context.strip().lower() not in ["none", "null", "[]"]:
-            messages.insert(0, {"role": "system", "content": f"Relevant Memories:\n{memory_context}"})
-        messages.insert(0, {"role": "system", "content": system_prompt_with_time})
-
-        messages = manage_context_window(messages, 8192 - 1024)
-
-        # Force a think block for GPT-OSS models via Ollama so reasoning is visible
-        force_think_prepend = ('gpt-oss' in str(model_id_str).lower()) or ('gpt_oss' in str(model_id_str).lower())
-
-        if debug_mode:
-            print("\n--- OLLAMA PROMPT DEBUG ---")
-            print(json.dumps(messages, indent=2))
-            print("---------------------------\n")
-
-        stream = ollama._client.chat(
-            model=model_instance,
-            messages=messages,
-            stream=True
-        )
-
-        opened_think = False
-        if force_think_prepend:
-            opened_think = True
-            yield {'type': 'reply', 'token': '<think>'}
-
-        for chunk in stream:
-            if should_stop():
-                yield {'type': 'reply', 'token': "\n[Generation stopped by user]"}
-                break
-
-            token = str(chunk['message']['content'])
-            if token:
-                yield {'type': 'reply', 'token': token}
-
-        if opened_think:
-            # Ensure the think block is closed if the model didn't
-            yield {'type': 'reply', 'token': '</think>'}
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        yield {'type': 'error', 'token': f"[STREAM ERROR (Ollama): {str(e)}]"}
-    finally:
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-def stream_safetensors(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None, timezone='UTC', debug_mode=False, thinking_level='medium'):
-    """Universal streaming for ALL safetensors models with hybrid thinking support."""
-    try:
-        from transformers import TextIteratorStreamer
-        from threading import Thread
-        from PIL import Image
-        import io
-        import base64
-        from datetime import datetime
-        from qwen_omni_utils import process_mm_info
-        import json
-
-        if len(model_instance) == 4:
-            model, tokenizer, _, processor = model_instance  # streamer is recreated each time
-        elif len(model_instance) == 3:
-            model, tokenizer, _ = model_instance  # streamer is recreated each time
-            processor = None
-        else:
-            raise ValueError("Invalid model_instance tuple size")
-
-        memory_context = get_context_for_model(user_input, model_id=model_id_str)
-        
-        # --- Hybrid Thinking Logic ---
-        model_state = model_states.get(model_id_str, {})
-        system_prompt = model_state.get("system_prompt", "You are a helpful AI assistant.")
-        thinking_style = model_state.get("thinking_style", "none")
-        force_think_prepend = False
-
-        if thinking_style in ['simple', 'advanced']:
-            force_think_prepend = True
-        
-        if thinking_style == 'advanced':
-            thinking_instructions = {
-                "low": "Provide a direct answer with minimal reasoning. Avoid verbose chains of thought.",
-                "medium": "Briefly outline key reasoning steps, then give the final answer.",
-                "high": "Think step by step. Provide a short summary of the reasoning, then the final answer."
-            }
-            if thinking_level in thinking_instructions:
-                system_prompt += f"\n\n--- Reasoning Instructions ---\n{thinking_instructions[thinking_level]}"
-        # Encourage consistent think-tag usage
-        system_prompt += "\n\nWhen you need to reason, wrap your internal reasoning between <think> and </think> tags, then provide the final answer after the closing tag."
-        # --- End Hybrid Logic ---
-
-        now = datetime.now()
-        time_message = f"System Time: {now.strftime('%Y-%m-%d %H:%M:%S')} (Timezone: {timezone})"
-        system_prompt_with_time = f"{time_message}\n\n{system_prompt}"
-
-        messages = clean_and_normalize_history(conversation_history, user_input)
-
-        if memory_context and memory_context.strip().lower() not in ["none", "null", "[]"]:
-            messages.insert(0, {"role": "system", "content": f"Relevant Memories:\n{memory_context}"})
-        messages.insert(0, {"role": "system", "content": system_prompt_with_time})
-
-        model_context_window = model_states.get(model_id_str, {}).get('context_tokens', 8192)
-        messages = manage_context_window(messages, model_context_window - 1024)
-
-        if debug_mode:
-            print("\n--- SafeTensors PROMPT DEBUG ---")
-            print(json.dumps(messages, indent=2))
-            print("--------------------------------\n")
-
-        normalized_image = _coerce_image_data(image_data)
-        if normalized_image and processor:
-            try:
-                for msg in reversed(messages):
-                    if msg['role'] == 'user':
-                        if isinstance(msg['content'], str):
-                            msg['content'] = [{"type": "text", "text": msg['content']}]
-                        image_bytes = base64.b64decode(normalized_image["data"])
-                        pil_image = Image.open(io.BytesIO(image_bytes))
-                        msg['content'].append({"type": "image", "image": pil_image})
-                        break
-                
-                text_prompt = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-                _, images, _ = process_mm_info(messages, use_audio_in_video=False)
-                inputs = processor(text=text_prompt, images=images, return_tensors="pt").to(model.device)
-
-            except Exception as e:
-                yield {'type': 'error', 'token': f"[ERROR processing image: {e}]"}
-                return
-        else:
-            prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-
-        # Create fresh streamer for this generation (cannot be reused)
-        # Increased timeout to 60s for first token (4B models can be slow with long prompts)
-        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True, timeout=60)
-
-        print(f"🔧 DEBUG: Setting up SafeTensors generation for {model_id_str}")
-        print(f"🔧 DEBUG: Input shape: {inputs['input_ids'].shape}")
-
-        # Build generation kwargs properly without unpacking inputs directly
-        generation_kwargs = {
-            "input_ids": inputs['input_ids'],
-            "attention_mask": inputs.get('attention_mask'),
-            "streamer": streamer,
-            "max_new_tokens": 4096,
-            "temperature": 0.7,
-            "do_sample": True,
-            "pad_token_id": tokenizer.eos_token_id if tokenizer.eos_token_id else tokenizer.pad_token_id,
-            "eos_token_id": tokenizer.eos_token_id
-        }
-
-        # Remove None values
-        generation_kwargs = {k: v for k, v in generation_kwargs.items() if v is not None}
-        print(f"🔧 DEBUG: Generation kwargs keys: {list(generation_kwargs.keys())}")
-
-        # Start generation in background thread
-        print(f"🔧 DEBUG: Starting generation thread...")
-        thread = Thread(target=model.generate, kwargs=generation_kwargs, daemon=True)
-        thread.start()
-        print(f"🔧 DEBUG: Generation thread started, waiting for tokens...")
-
-        if force_think_prepend:
-            yield {'type': 'reply', 'token': '<think>'}
-
-        token_count = 0
-        try:
-            # Non-blocking polling of streamer queue (safetensors-specific)
-            from queue import Empty
-            while True:
-                if should_stop():
-                    print(f"🔧 DEBUG: Stop signal received after {token_count} tokens")
-                    yield {'type': 'reply', 'token': "\n[Generation stopped by user]"}
-                    break
-
-                try:
-                    token = streamer.text_queue.get(timeout=0.05)
-                except Empty:
-                    if not thread.is_alive():
-                        break
-                    continue
-
-                if token is None:
-                    break
-
-                token_count += 1
-                if token_count == 1:
-                    print(f"🔧 DEBUG: First token received!")
-                if token:
-                    yield {'type': 'reply', 'token': str(token)}
-
-            # Legacy blocking iteration (kept for reference)
-            return
-            # Stream tokens as they're generated
-            for token in streamer:
-                token_count += 1
-                if token_count == 1:
-                    print(f"🔧 DEBUG: First token received!")
-
-                if should_stop():
-                    print(f"🔧 DEBUG: Stop signal received after {token_count} tokens")
-                    yield {'type': 'reply', 'token': "\n[Generation stopped by user]"}
-                    break
-
-                if token:
-                    yield {'type': 'reply', 'token': str(token)}
-        except StopIteration:
-            print(f"🔧 DEBUG: Streamer stopped normally after {token_count} tokens")
-        except Exception as stream_error:
-            print(f"⚠️ Streaming error after {token_count} tokens: {stream_error}")
-            import traceback
-            traceback.print_exc()
-            yield {'type': 'error', 'token': f"[Streaming interrupted: {str(stream_error)}]"}
-
-        print(f"🔧 DEBUG: Streaming complete. Total tokens: {token_count}")
-
-        # Wait for generation to complete (with timeout)
-        thread.join(timeout=300)  # 5 minute max
-        if thread.is_alive():
-            print("⚠️ Generation thread did not complete in time")
-            yield {'type': 'error', 'token': "\n[Generation timeout - thread still running]"}
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        yield {'type': 'error', 'token': f"[STREAM ERROR (SafeTensors): {str(e)} ]"}
-    finally:
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-def stream_google(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None, timezone='UTC'):
-    try:
-        from datetime import datetime
-        from PIL import Image
-        import io
-        import base64
-
-        memory_context = get_context_for_model(user_input, model_id=model_id_str)
-        
-        now = datetime.now()
-        time_message = f"This is a system message. Do not refer to this message unless asked. This message is to give you a live update of the Current Date and Time. The User's Timezone is {timezone}. The Current time is {now.strftime('%H:%M')} and The Current Date is {now.strftime('%m/%d/%Y')}."
-        
-        # Inject time message into the history
-        conversation_history.insert(0, {"role": "system", "content": time_message})
-        
-        # Manage the context window
-        conversation_history = manage_context_window(conversation_history, 32768 - 2048) # Gemini 1.5 Pro has 32k context
-
-        normalized_image = _coerce_image_data(image_data)
-        # Add the current image to the last user message
-        if normalized_image:
-            for msg in reversed(conversation_history):
-                if msg['role'] == 'user':
-                    if 'image' not in msg:
-                         msg['image'] = []
-                    msg['image'].append(normalized_image["data"])
-                    break
-
-        system_prompt = model_states.get(model_id_str, {}).get("system_prompt", "You are a helpful AI assistant.")
-        messages = build_gemini_prompt(user_input, conversation_history, memory_context, normalized_image["data"] if normalized_image else None, system_prompt)
-
-        stream = model_instance.generate_content(
-            messages,
-            generation_config=genai.types.GenerationConfig(temperature=0.7),
-            stream=True
-        )
-
-        for chunk in stream:
-            if should_stop():
-                yield {'type': 'reply', 'token': "\n[Generation stopped by user]"}
-                break
-            # The final chunk may not have any parts, causing chunk.text to fail.
-            if chunk.parts and hasattr(chunk.parts[0], 'text'):
-                yield {'type': 'reply', 'token': str(chunk.parts[0].text)}
-
-    except Exception as e:
-        import traceback
-        error_details = traceback.format_exc()
-        print(f"--- GOOGLE STREAM ERROR --- \n{error_details}\n--------------------------")
-        yield {'type': 'error', 'token': f"[STREAM ERROR (Google): {repr(e)} - Check logs for details]"}
-
-def stream_openai(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None, timezone='UTC'):
-    import openai
-    import os
-    try:
-        from datetime import datetime
-        memory_context = get_context_for_model(user_input, model_id=model_id_str)
-        system_prompt = model_states.get(model_id_str, {}).get("system_prompt", "You are a helpful AI assistant.")
-
-        now = datetime.now()
-        time_message = f"This is a system message. Do not refer to this message unless asked. This message is to give you a live update of the Current Date and Time. The User's Timezone is {timezone}. The Current time is {now.strftime('%H:%M')} and The Current Date is {now.strftime('%m/%d/%Y')}."
-
-        # Normalize history from frontend shape to OpenAI format
-        normalized_history = []
-        try:
-            for entry in (conversation_history or []):
-                if isinstance(entry, dict) and 'role' in entry and 'content' in entry:
-                    role = entry.get('role')
-                    content = entry.get('content', '')
-                else:
-                    role = 'user' if (str(entry.get('type', '')).lower() == 'user') else 'assistant'
-                    content = entry.get('message', '')
-                if role and (content or entry.get('imageB64')):
-                    normalized_history.append({'role': role, 'content': content})
-        except Exception:
-            normalized_history = []
-
-        normalized_image = _coerce_image_data(image_data)
-        # If there's image data, append to the last user message
-        if normalized_image and normalized_history:
-            for msg in reversed(normalized_history):
-                if msg.get('role') == 'user':
-                    if isinstance(msg.get('content'), str):
-                        msg['content'] = [
-                            {"type": "text", "text": msg['content']},
-                            {"type": "image_url", "image_url": {"url": f"data:{normalized_image['media_type']};base64,{normalized_image['data']}"}}
-                        ]
-                    break
-        # Ensure the latest user input is present at the end
-        if user_input:
-            if not normalized_history or normalized_history[-1].get('content') != user_input or normalized_history[-1].get('role') != 'user':
-                normalized_history.append({"role": "user", "content": user_input})
-
-        messages = [
-            {"role": "system", "content": time_message},
-            {"role": "system", "content": system_prompt},
-            {"role": "system", "content": f"Relevant Memories:\n{memory_context}"},
-            *manage_context_window(normalized_history, 128000 - 4096), # GPT-4o has 128k context
-        ]
-
-        client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        stream = client.chat.completions.create(
-            model=model_instance,
-            messages=messages,
-            stream=True
-        )
-
-        for chunk in stream:
-            if should_stop():
-                yield {'type': 'reply', 'token': "\n[Generation stopped by user]"}
-                break
-        
-            delta = chunk.choices[0].delta.content
-            if delta:
-                yield {'type': 'reply', 'token': str(delta)}
-    except Exception as e:
-        yield {'type': 'error', 'token': f"[STREAM ERROR (OpenAI): {str(e)}]"}
-
-def stream_anthropic(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None, timezone='UTC'):
-    try:
-        from datetime import datetime
-        memory_context = get_context_for_model(user_input, model_id=model_id_str)
-        system_prompt = model_states.get(model_id_str, {}).get("system_prompt", "You are a helpful AI assistant.")
-        model_name = model_id_str or model_instance
-
-        if not model_name:
-            yield {'type': 'error', 'token': "[STREAM ERROR (Anthropic): missing model name]"}
-            return
-
-        now = datetime.now()
-        time_message = f"This is a system message. Do not refer to this message unless asked. This message is to give you a live update of the Current Date and Time. The User's Timezone is {timezone}. The Current time is {now.strftime('%H:%M')} and The Current Date is {now.strftime('%m/%d/%Y')}."
-        system_prompt_with_time = f"{time_message}\n\n{system_prompt}"
-
-        # Build messages in Anthropic format
-        messages = []
-        for msg in manage_context_window(conversation_history, 200000 - 4096):
-            role = "user" if msg["role"] == "user" else "assistant"
-            messages.append({"role": role, "content": msg["content"]})
-        
-        normalized_image = _coerce_image_data(image_data)
-        # Add the current user message with optional image
-        if normalized_image:
-            messages.append({
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": normalized_image.get("media_type", "image/jpeg"),
-                            "data": normalized_image["data"]
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": user_input
-                    }
-                ]
-            })
-        else:
-            messages.append({"role": "user", "content": user_input})
-        
-        client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        
-        with client.messages.stream(
-            model=model_name,  # Use the string ID, not the instance
-            max_tokens=4096,
-            system=f"{system_prompt_with_time}\nRelevant Memories:\n{memory_context}",
-            messages=messages
-        ) as stream:
-            for text in stream.text_stream:
-                if should_stop():
-                    yield {'type': 'reply', 'token': "\n[Generation stopped by user]"}
-                    break
-                yield {'type': 'reply', 'token': str(text)}
-
-    except Exception as e:
-        yield {'type': 'error', 'token': f"[STREAM ERROR (Anthropic): {str(e)}]"}
-
-def stream_meta(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None):
-    return stream_openai_compatible(
-        model_instance, model_id_str, user_input, conversation_history, should_stop,
-        base_url="https://api.groq.com/openai/v1",
-        api_key_env="GROQ_API_KEY", 
-        image_data=image_data
-    )
-
-def stream_xai(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None):
-    return stream_openai_compatible(
-        model_instance, model_id_str, user_input, conversation_history, should_stop,
-        base_url="https://api.x.ai/v1",
-        api_key_env="XAI_API_KEY",
-        image_data=image_data
-    )
-
-def stream_qwen(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None):
-    return stream_openai_compatible(
-        model_instance, model_id_str, user_input, conversation_history, should_stop,
-        base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-        api_key_env="QWEN_API_KEY",
-        image_data=image_data
-    )
-
-def stream_deepseek(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None, timezone='UTC'):
-    return stream_openai_compatible(
-        model_instance, model_id_str, user_input, conversation_history, should_stop,
-        base_url="https://api.deepseek.com/v1",
-        api_key_env="DEEPSEEK_API_KEY",
-        image_data=image_data,
-        timezone=timezone
-    )
-
-def stream_perplexity(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None):
-    return stream_openai_compatible(
-        model_instance, model_id_str, user_input, conversation_history, should_stop,
-        base_url="https://api.perplexity.ai",
-        api_key_env="PERPLEXITY_API_KEY",
-        image_data=image_data
-    )
-
-def stream_openrouter(model_instance, model_id_str, user_input, conversation_history, should_stop, image_data=None):
-    return stream_openai_compatible(
-        model_instance, model_id_str, user_input, conversation_history, should_stop,
-        base_url="https://openrouter.ai/api/v1",
-        api_key_env="OPENROUTER_API_KEY",
-        extra_headers={"HTTP-Referer": "NovaAI", "X-Title": "NovaAI"},
-        image_data=image_data
-    )
-
-def stream_openai_compatible(model_instance, model_id_str, user_input, conversation_history, should_stop, 
-                           base_url, api_key_env, extra_headers=None, image_data=None, timezone='UTC'):
-    try:
-        from datetime import datetime
-        memory_context = get_context_for_model(user_input, model_id=model_id_str)
-        system_prompt = model_states.get(model_id_str, {}).get("system_prompt", "You are a helpful AI assistant.")
-        model_name = model_instance or model_id_str
-
-        if not model_name:
-            yield {'type': 'error', 'token': f"[STREAM ERROR ({api_key_env}): missing model name]"}
-            return
-
-        now = datetime.now()
-        time_message = f"This is a system message. Do not refer to this message unless asked. This message is to give you a live update of the Current Date and Time. The User's Timezone is {timezone}. The Current time is {now.strftime('%H:%M')} and The Current Date is {now.strftime('%m/%d/%Y')}."
-
-        # Normalize history from frontend shape (sender/message/type) to OpenAI format (role/content)
-        normalized_history = []
-        try:
-            for entry in (conversation_history or []):
-                if isinstance(entry, dict) and 'role' in entry and 'content' in entry:
-                    role = entry.get('role')
-                    content = entry.get('content', '')
-                else:
-                    role = 'user' if (str(entry.get('type', '')).lower() == 'user') else 'assistant'
-                    content = entry.get('message', '')
-                if role and (content or entry.get('imageB64')):
-                    normalized_history.append({'role': role, 'content': content})
-        except Exception:
-            normalized_history = []
-
-        normalized_image = _coerce_image_data(image_data)
-        # If there's an image attached to this turn, append it to the last user message
-        if normalized_image and normalized_history:
-            for msg in reversed(normalized_history):
-                if msg.get('role') == 'user':
-                    if isinstance(msg.get('content'), str):
-                        msg['content'] = [
-                            {"type": "text", "text": msg['content']},
-                            {"type": "image_url", "image_url": {"url": f"data:{normalized_image['media_type']};base64,{normalized_image['data']}"}}
-                        ]
-                    break
-
-        # Ensure the latest user input is present at the end
-        if user_input:
-            if not normalized_history or normalized_history[-1].get('content') != user_input or normalized_history[-1].get('role') != 'user':
-                normalized_history.append({"role": "user", "content": user_input})
-
-        truncated_history = manage_context_window(normalized_history, 8192 - 2048)
-        combined_system = (
-            f"{system_prompt}\n\n"
-            f"Relevant Memories:\n{memory_context}\n\n"
-            f"[SYSTEM TIME] User's timezone: {timezone}. Current time: {now.strftime('%H:%M')}, date: {now.strftime('%m/%d/%Y')}."
-        )
-        messages = [
-            {"role": "system", "content": combined_system},
-            *truncated_history,
-        ]
-
-
-        api_key = os.getenv(api_key_env)
-        if not api_key:
-            yield f"[ERROR: {api_key_env} not set]"
-            return
-
-        client = OpenAIClient(
-            api_key=api_key, 
-            base_url=base_url,
-            default_headers=extra_headers if extra_headers else None
-        )
-
-        stream = client.chat.completions.create(
-            model=model_name,
-            messages=messages,
-            stream=True
-        )
-
-        for chunk in stream:
-            if should_stop():
-                yield {'type': 'reply', 'token': "\n[Generation stopped by user]"}
-                break
-            if chunk.choices[0].delta.content:
-                yield {'type': 'reply', 'token': str(chunk.choices[0].delta.content)}
-
-    except Exception as e:
-        yield {'type': 'error', 'token': f"[STREAM ERROR ({api_key_env}): {str(e)}]"}
-
 def detect_safetensors_model_family(model_path):
     """Universal model family detection for ANY model"""
     try:
@@ -1944,17 +1211,17 @@ def _get_deepseek_models_from_api():
         # Fallback safe list (based on known public models)
         return ["deepseek-chat", "deepseek-coder", "deepseek-reasoner"]
 
-def get_available_models(backend="llama.cpp", provider=None):
+def get_available_models(backend="llama-cpp-python", provider=None):
     print(f"🔍 Getting available models for backend: {backend}, provider: {provider}")
-    
-    if backend == "llama.cpp":
+
+    if backend == "llama-cpp-python":
         model_dir = os.path.join(BASE_DIR, "models", "llama")
         models = []
         if os.path.exists(model_dir):
             for filename in os.listdir(model_dir):
                 if filename.endswith(".gguf"):
                     models.append(os.path.join(model_dir, filename).replace("\\", "/"))
-        print(f"📁 Found {len(models)} llama.cpp models")
+        print(f"📁 Found {len(models)} llama-cpp-python models")
         return models
 
     elif backend == "ollama":
@@ -2185,7 +1452,7 @@ def get_available_models(backend="llama.cpp", provider=None):
         else:
             return [] # No provider selected or unknown
 
-    elif backend == "safetensors":
+    elif backend == "transformers":
         model_dir = os.path.join(BASE_DIR, "models", "safetensors")
         models = []
         if os.path.exists(model_dir):
@@ -2197,9 +1464,38 @@ def get_available_models(backend="llama.cpp", provider=None):
                     has_model_files = any(f.endswith((".bin", ".pt", ".pth", ".index.json")) for f in os.listdir(item_path))
                     if has_safetensors or has_model_files:
                         models.append(item_path.replace("\\", "/"))
-        print(f"📁 Found {len(models)} SafeTensors models")
+        print(f"📁 Found {len(models)} HuggingFace Transformers models")
         return models
-    
+
+    elif backend == "vllm":
+        # vLLM uses the same model directory as safetensors
+        # since both load HuggingFace format models
+        model_dir = os.path.join(BASE_DIR, "models", "safetensors")
+        models = []
+        if os.path.exists(model_dir):
+            for item in os.listdir(model_dir):
+                item_path = os.path.join(model_dir, item)
+                if os.path.isdir(item_path):
+                    # Check if this is a valid model directory
+                    has_safetensors = any(f.endswith(".safetensors") for f in os.listdir(item_path))
+                    has_model_files = any(f.endswith((".bin", ".pt", ".pth", ".index.json")) for f in os.listdir(item_path))
+                    has_config = os.path.exists(os.path.join(item_path, "config.json"))
+                    if (has_safetensors or has_model_files) and has_config:
+                        models.append(item_path.replace("\\", "/"))
+        print(f"📁 Found {len(models)} vLLM models")
+        return models
+
+    elif backend == "llama.cpp":
+        # llama.cpp server uses the same GGUF models as llama.cpp
+        model_dir = os.path.join(BASE_DIR, "models", "llama")
+        models = []
+        if os.path.exists(model_dir):
+            for filename in os.listdir(model_dir):
+                if filename.endswith(".gguf"):
+                    models.append(os.path.join(model_dir, filename).replace("\\", "/"))
+        print(f"📁 Found {len(models)} llama.cpp server models (GGUF)")
+        return models
+
     return []
 
 def setup_ollama_kv_cache(model_name, kv_cache_quant="fp16"):

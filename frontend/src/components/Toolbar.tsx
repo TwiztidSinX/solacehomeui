@@ -6,15 +6,16 @@ interface ToolbarProps {
 }
 
 const panelButtons = [
-  { id: "chats", label: "Chats", icon: "️" },
-  { id: "browser", label: "Browser", icon: "" },
-  { id: "search", label: "Search", icon: "" },
-  { id: "parliament", label: "Parliament", icon: "️" },
-  { id: "code", label: "Code", icon: "" },
-  { id: "agent-coding", label: "Agent Coding", icon: "" },
-  { id: "voice", label: "Voice", icon: "" },
-  { id: "youtube", label: "YouTube", icon: "" },
-  { id: "tools", label: "Tools", icon: "" },
+  { id: "chats", label: "Chats", icon: "💬" },
+  { id: "browser", label: "Browser", icon: "🌐" },
+  { id: "search", label: "Search", icon: "🔍" },
+  { id: "parliament", label: "Parliament", icon: "🏛️" },
+  { id: "code", label: "Code", icon: "💻" },
+  { id: "agent-coding", label: "Agent Coding", icon: "🤖" },
+  { id: "voice", label: "Voice", icon: "🎤" },
+  { id: "youtube", label: "YouTube", icon: "▶️" },
+  { id: "media-player", label: "Media Player", icon: "🎬" },
+  { id: "tools", label: "Tools", icon: "🔧" },
 ];
 
 export const Toolbar: React.FC<ToolbarProps> = ({

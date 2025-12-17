@@ -435,6 +435,16 @@ body {
   font-weight: 600;
   border-bottom: 1px solid #3a3a3a;
   flex-shrink: 0; /* Prevent header from shrinking */
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.panel-header-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .panel-content {
@@ -496,4 +506,51 @@ body {
 }
 #chat-container {
   overscroll-behavior: contain;
+}
+
+.panel-hidden-when-focused {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.panel-focus-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+}
+
+.panel-focus-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(8px);
+}
+
+.panel-focus-shell {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 2001;
+  background: #1b1b1b;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 25px 80px rgba(0, 0, 0, 0.65);
+}
+
+.panel-exit-focus {
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid #4a4a4a;
+  background: #1f1f1f;
+  color: #f5f5f5;
+  cursor: pointer;
+  font-size: 12px;
+  transition: background 0.15s, transform 0.15s;
+}
+
+.panel-exit-focus:hover {
+  background: #2a2a2a;
+  transform: translateY(-1px);
 }

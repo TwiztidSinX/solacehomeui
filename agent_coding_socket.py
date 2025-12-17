@@ -73,16 +73,43 @@ class AgentCodingSocketHandler:
                     except ImportError:
                         pass  # No async runtime, continue anyway
             
-            # Get model client if factory provided
-            model_client = None
+            # PHASE 1: Use the already-loaded models
+            # The model_client_factory returns the user's selected model
+            # which is already loaded and working in the main chat
+            
+            coding_model = None
+            orchestrator_model = None
+            
             if self.model_client_factory:
                 try:
-                    model_client = self.model_client_factory()
+                    print("🔧 Getting model for agentic coding...")
+                    # Just get the model - it's already configured and wrapped
+                    coding_model = self.model_client_factory()
+                    
+                    # Use same model for orchestrator for now
+                    # (both will be the user's selected model - deepseek-chat in your case)
+                    orchestrator_model = coding_model
+                    
+                    print(f"✅ Using model: {getattr(coding_model, 'model', 'unknown')}")
+                    
                 except Exception as e:
-                    print(f"Failed to create model client: {e}")
+                    print(f"⚠️ Failed to get model: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Create orchestrator
+            if not coding_model or not orchestrator_model:
+                emit('agent_coding_message', {
+                    'type': 'session_error',
+                    'sessionId': None,
+                    'timestamp': 0,
+                    'data': {'error': 'Failed to load models. Check console for details.'}
+                })
+                return
             
             orchestrator = AgenticCodingOrchestrator(
-                model_client=model_client,
+                coding_model=coding_model,
+                orchestrator_model=orchestrator_model,
                 workspace_root=workspace_root,
                 on_message=on_message,
                 max_iterations=20
@@ -176,6 +203,97 @@ class AgentCodingSocketHandler:
                     }, room=sid)
                     return
         
+        @self.socketio.on('agent_coding_answer')
+        def handle_answer(data):
+            """
+            PHASE 3: User provides answer to agent's question.
+            """
+            session_id = data.get('sessionId')
+            question_id = data.get('questionId')
+            answer = data.get('answer', '')
+            sid = flask_request.sid
+            
+            if not session_id or not question_id:
+                self.socketio.emit('agent_coding_message', {
+                    'type': 'error',
+                    'data': {'error': 'Missing sessionId or questionId'}
+                }, room=sid)
+                return
+            
+            # Find orchestrator by session ID
+            for oid, orchestrator in self.orchestrators.items():
+                if orchestrator.current_session and orchestrator.current_session.id == session_id:
+                    result = orchestrator.answer_question(session_id, question_id, answer)
+                    
+                    if result.get('success'):
+                        # Answer received, continue execution
+                        # Re-run the session to continue from where it left off
+                        self.socketio.start_background_task(
+                            self._continue_session,
+                            orchestrator,
+                            session_id
+                        )
+                    else:
+                        self.socketio.emit('agent_coding_message', {
+                            'type': 'error',
+                            'data': result
+                        }, room=sid)
+                    return
+            
+            # Session not found
+            self.socketio.emit('agent_coding_message', {
+                'type': 'error',
+                'data': {'error': f'Session {session_id} not found'}
+            }, room=sid)
+        
+        @self.socketio.on('agent_coding_pause')
+        def handle_pause(data):
+            """
+            PHASE 3: User requests to pause execution.
+            """
+            session_id = data.get('sessionId')
+            reason = data.get('reason')
+            sid = flask_request.sid
+            
+            # Find orchestrator by session ID
+            for oid, orchestrator in self.orchestrators.items():
+                if orchestrator.current_session and orchestrator.current_session.id == session_id:
+                    result = orchestrator.pause_session(session_id, reason)
+                    
+                    self.socketio.emit('agent_coding_message', {
+                        'type': 'session_paused' if result.get('success') else 'error',
+                        'sessionId': session_id,
+                        'data': result
+                    }, room=sid)
+                    return
+        
+        @self.socketio.on('agent_coding_resume')
+        def handle_resume(data):
+            """
+            PHASE 3: User requests to resume paused execution.
+            """
+            session_id = data.get('sessionId')
+            sid = flask_request.sid
+            
+            # Find orchestrator by session ID
+            for oid, orchestrator in self.orchestrators.items():
+                if orchestrator.current_session and orchestrator.current_session.id == session_id:
+                    result = orchestrator.resume_session(session_id)
+                    
+                    if result.get('success'):
+                        # Session resumed, continue execution
+                        self.socketio.start_background_task(
+                            self._continue_session,
+                            orchestrator,
+                            session_id
+                        )
+                    else:
+                        self.socketio.emit('agent_coding_message', {
+                            'type': 'error',
+                            'data': result
+                        }, room=sid)
+                    return
+        
         @self.socketio.on('agent_coding_get_tools')
         def handle_get_tools(data):
             """Get the available coding tools schema."""
@@ -217,6 +335,36 @@ class AgentCodingSocketHandler:
             # Cleanup temp_id entry
             if temp_id in self.orchestrators:
                 del self.orchestrators[temp_id]
+    
+    def _continue_session(self, orchestrator: AgenticCodingOrchestrator, session_id: str):
+        """
+        PHASE 3: Continue a session after user answered a question or resumed from pause.
+        
+        This picks up where the session left off and continues the execution loop.
+        """
+        try:
+            session = orchestrator.current_session
+            if not session or session.id != session_id:
+                print(f"[AgentCodingSocket] Cannot continue session {session_id} - not found")
+                return
+            
+            print(f"[AgentCodingSocket] Continuing session {session_id} from phase {session.phase.value}")
+            
+            # The session is already set up, just need to re-run the execution loop
+            # This will continue from where it left off based on the phase
+            result = orchestrator.run(session.user_request, session.workspace_root)
+            
+        except Exception as e:
+            print(f"[AgentCodingSocket] Error continuing session {session_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            self.socketio.emit('agent_coding_message', {
+                'type': 'session_error',
+                'sessionId': session_id,
+                'timestamp': 0,
+                'data': {'error': f'Failed to continue: {str(e)}'}
+            })
 
 
 def register_agent_coding_handlers(socketio, model_client_factory=None):
@@ -248,95 +396,207 @@ class AgentCodingTools:
     
     Use this when you want Nova or another orchestrator to call
     individual tools without the full ReAct loop.
+    
+    This does NOT require models - it just provides direct file system operations.
     """
     
     def __init__(self, workspace_root: str = "."):
         self.workspace_root = os.path.abspath(workspace_root)
-        self._orchestrator = AgenticCodingOrchestrator(
-            workspace_root=workspace_root,
-            on_message=lambda x: None  # Silent
-        )
         
-        # Create a dummy session for tool execution
-        self._session = self._orchestrator.create_session(
-            "standalone_tools",
-            workspace_root
-        )
+        # PHASE 1 FIX: Don't create an orchestrator for standalone tools
+        # Just store workspace root and use direct operations
+        # The orchestrator is only needed for full ReAct loops
+        
+    def _resolve_path(self, path: str) -> str:
+        """Resolve a path relative to workspace root."""
+        if not path:
+            return self.workspace_root
+        
+        # Normalize path
+        path = path.replace('\\\\', '\\')
+        path = os.path.normpath(path)
+        
+        # Make absolute
+        if os.path.isabs(path):
+            return path
+        
+        return os.path.normpath(os.path.join(self.workspace_root, path))
     
     def read_file(self, path: str, start_line: int = None, end_line: int = None) -> Dict[str, Any]:
         """Read a file."""
-        return self._orchestrator._action_read_file(self._session, {
-            'path': path,
-            'startLine': start_line,
-            'endLine': end_line
-        })
+        try:
+            full_path = self._resolve_path(path)
+            with open(full_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            lines = content.split('\n')
+            if start_line is not None:
+                start_idx = start_line - 1
+                end_idx = end_line if end_line else len(lines)
+                lines = lines[start_idx:end_idx]
+                content = '\n'.join(lines)
+            
+            return {'success': True, 'content': content, 'path': path}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
     
     def write_file(self, path: str, content: str) -> Dict[str, Any]:
         """Write a file."""
-        return self._orchestrator._action_write_file(self._session, {
-            'path': path,
-            'content': content
-        })
+        try:
+            full_path = self._resolve_path(path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            return {'success': True, 'path': path}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
     
     def edit_file(self, path: str, edits: list) -> Dict[str, Any]:
         """Apply surgical edits to a file."""
-        return self._orchestrator._action_edit_file(self._session, {
-            'path': path,
-            'edits': edits
-        })
+        try:
+            full_path = self._resolve_path(path)
+            with open(full_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Apply edits (simple search/replace)
+            for edit in edits:
+                old_text = edit.get('oldText', '')
+                new_text = edit.get('newText', '')
+                content = content.replace(old_text, new_text, 1)
+            
+            with open(full_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            
+            return {'success': True, 'path': path}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
     
     def create_file(self, path: str, content: str) -> Dict[str, Any]:
         """Create a new file."""
-        return self._orchestrator._action_create_file(self._session, {
-            'path': path,
-            'content': content
-        })
+        try:
+            full_path = self._resolve_path(path)
+            if os.path.exists(full_path):
+                return {'success': False, 'error': f'File already exists: {path}'}
+            
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            return {'success': True, 'path': path}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
     
     def delete_file(self, path: str) -> Dict[str, Any]:
         """Delete a file."""
-        return self._orchestrator._action_delete_file(self._session, {
-            'path': path
-        })
+        try:
+            full_path = self._resolve_path(path)
+            os.remove(full_path)
+            return {'success': True, 'path': path}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
     
     def rename_file(self, old_path: str, new_path: str) -> Dict[str, Any]:
         """Rename/move a file."""
-        return self._orchestrator._action_rename_file(self._session, {
-            'oldPath': old_path,
-            'newPath': new_path
-        })
+        try:
+            old_full = self._resolve_path(old_path)
+            new_full = self._resolve_path(new_path)
+            os.rename(old_full, new_full)
+            return {'success': True, 'oldPath': old_path, 'newPath': new_path}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
     
     def list_directory(self, path: str = ".", recursive: bool = False, max_depth: int = 2) -> Dict[str, Any]:
         """List directory contents."""
-        return self._orchestrator._action_list_directory(self._session, {
-            'path': path,
-            'recursive': recursive,
-            'maxDepth': max_depth
-        })
+        try:
+            full_path = self._resolve_path(path)
+            entries = []
+            
+            for item in os.listdir(full_path):
+                item_path = os.path.join(full_path, item)
+                if os.path.isdir(item_path):
+                    entries.append({'name': item, 'type': 'directory'})
+                else:
+                    entries.append({'name': item, 'type': 'file', 'size': os.path.getsize(item_path)})
+            
+            return {'success': True, 'entries': entries, 'path': path}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
     
     def search_files(self, pattern: str, directory: str = ".", exclude_patterns: list = None) -> Dict[str, Any]:
         """Search for files by name."""
-        return self._orchestrator._action_search_files(self._session, {
-            'pattern': pattern,
-            'directory': directory,
-            'excludePatterns': exclude_patterns or []
-        })
+        try:
+            import fnmatch
+            full_dir = self._resolve_path(directory)
+            matches = []
+            
+            for root, dirs, files in os.walk(full_dir):
+                for filename in files:
+                    if fnmatch.fnmatch(filename, pattern):
+                        rel_path = os.path.relpath(os.path.join(root, filename), self.workspace_root)
+                        matches.append(rel_path)
+            
+            return {'success': True, 'matches': matches}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
     
     def search_in_files(self, query: str, directory: str = ".", file_pattern: str = None, is_regex: bool = False) -> Dict[str, Any]:
         """Search for text in files."""
-        return self._orchestrator._action_search_in_files(self._session, {
-            'query': query,
-            'directory': directory,
-            'filePattern': file_pattern,
-            'isRegex': is_regex
-        })
+        try:
+            import fnmatch
+            import re
+            full_dir = self._resolve_path(directory)
+            results = []
+            
+            pattern = re.compile(query) if is_regex else None
+            
+            for root, dirs, files in os.walk(full_dir):
+                for filename in files:
+                    if file_pattern and not fnmatch.fnmatch(filename, file_pattern):
+                        continue
+                    
+                    filepath = os.path.join(root, filename)
+                    try:
+                        with open(filepath, 'r', encoding='utf-8') as f:
+                            for line_num, line in enumerate(f, 1):
+                                if is_regex:
+                                    if pattern.search(line):
+                                        results.append({'file': filepath, 'line': line_num, 'content': line.strip()})
+                                else:
+                                    if query in line:
+                                        results.append({'file': filepath, 'line': line_num, 'content': line.strip()})
+                    except:
+                        pass
+            
+            return {'success': True, 'results': results}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
     
     def run_command(self, command: str, cwd: str = None, timeout: int = 30) -> Dict[str, Any]:
         """Run a shell command."""
-        return self._orchestrator._action_run_command(self._session, {
-            'command': command,
-            'cwd': cwd,
-            'timeout': timeout
-        })
+    def run_command(self, command: str, cwd: str = None, timeout: int = 30) -> Dict[str, Any]:
+        """Run a shell command."""
+        try:
+            import subprocess
+            work_dir = self._resolve_path(cwd) if cwd else self.workspace_root
+            
+            result = subprocess.run(
+                command,
+                shell=True,
+                cwd=work_dir,
+                timeout=timeout,
+                capture_output=True,
+                text=True
+            )
+            
+            return {
+                'success': result.returncode == 0,
+                'stdout': result.stdout,
+                'stderr': result.stderr,
+                'returncode': result.returncode
+            }
+        except subprocess.TimeoutExpired:
+            return {'success': False, 'error': f'Command timed out after {timeout}s'}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
 
 
 # Tool registry for Nova integration

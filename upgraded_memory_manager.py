@@ -319,6 +319,22 @@ class Memory:
             # Get the most relevant memories
             recalled_memories = [valid_memories[i] for i in indices[0]]
             logger.debug(f"Recall query '{query}' -> {len(recalled_memories)}/{len(valid_memories)} memories after similarity search")
+            if recalled_memories:
+                # Emit an INFO-level summary so it shows in the backend console
+                summary_lines = []
+                for mem in recalled_memories:
+                    mid = str(mem.get("_id"))
+                    snippet = mem.get("content", "")[:120].replace("\n", " ")
+                    summary_lines.append(f"{mid}: {snippet}")
+                logger.info(
+                    f"MEMORY RECALL -> query='{query[:80]}' model_id='{model_id}' "
+                    f"returned {len(recalled_memories)} memories:\n  " + "\n  ".join(summary_lines)
+                )
+            else:
+                logger.info(
+                    f"MEMORY RECALL -> query='{query[:80]}' model_id='{model_id}' returned 0 memories "
+                    f"(eligible pool: {len(valid_memories)})"
+                )
             
             # Add emotional context if requested
             if include_emotional_context:

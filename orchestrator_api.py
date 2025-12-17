@@ -46,7 +46,8 @@ class APIOrchestrator:
         urls = {
             "openai": "https://api.openai.com/v1",
             "deepseek": "https://api.deepseek.com/v1",
-            "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+            "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "xai": "https://api.x.ai/v1"
         }
         return urls.get(self.provider, "https://api.openai.com/v1")
     
@@ -55,7 +56,6 @@ class APIOrchestrator:
         prompt: str,
         max_tokens: int = 1000,
         temperature: float = 0.7,
-        stop: Optional[List[str]] = None,
         stream: bool = False
     ) -> Dict[str, Any]:
         """
@@ -65,7 +65,6 @@ class APIOrchestrator:
             prompt: The prompt text
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
-            stop: Stop sequences
             stream: Whether to stream (not implemented for orchestrator)
             
         Returns:
@@ -88,8 +87,6 @@ class APIOrchestrator:
         else:
             payload["max_tokens"] = max_tokens
         
-        if stop:
-            payload["stop"] = stop
         
         # Make request
         try:
@@ -118,7 +115,7 @@ class APIOrchestrator:
                 "choices": [
                     {
                         "text": data["choices"][0]["message"]["content"],
-                        "finish_reason": data["choices"][0].get("finish_reason", "stop")
+                        "finish_reason": data["choices"][0].get("finish_reason")
                     }
                 ]
             }
@@ -132,7 +129,6 @@ class APIOrchestrator:
         prompt: str,
         max_tokens: int = 1000,
         temperature: float = 0.7,
-        stop: Optional[List[str]] = None,
         stream: bool = False
     ) -> Dict[str, Any]:
         """Make the object callable like llama.cpp models."""
@@ -140,7 +136,6 @@ class APIOrchestrator:
             prompt=prompt,
             max_tokens=max_tokens,
             temperature=temperature,
-            stop=stop,
             stream=stream
         )
     def create_chat_completion(
@@ -148,7 +143,6 @@ class APIOrchestrator:
         messages: List[Dict[str, str]],
         temperature: float = 0.7,
         max_tokens: int = 1000,
-        stop: Optional[List[str]] = None,
         stream: bool = False,
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[str] = None,
@@ -160,7 +154,6 @@ class APIOrchestrator:
             messages: List of message dicts with 'role' and 'content'
             temperature: Sampling temperature
             max_tokens: Maximum tokens to generate
-            stop: Stop sequences
             stream: Whether to stream (not implemented)
             
         Returns:
@@ -182,8 +175,6 @@ class APIOrchestrator:
         else:
             payload["max_tokens"] = max_tokens
         
-        if stop:
-            payload["stop"] = stop
         if tools:
             payload["tools"] = tools
         if tool_choice:
@@ -219,7 +210,7 @@ class APIOrchestrator:
                             "role": "assistant",
                             "content": data["choices"][0]["message"]["content"]
                         },
-                        "finish_reason": data["choices"][0].get("finish_reason", "stop")
+                        "finish_reason": data["choices"][0].get("finish_reason")
                     }
                 ]
             }
@@ -231,7 +222,7 @@ class APIOrchestrator:
 class OpenAIOrchestrator(APIOrchestrator):
     """Convenience wrapper for OpenAI models."""
     
-    def __init__(self, model: str = "gpt-4o-mini", api_key: Optional[str] = None):
+    def __init__(self, model: str = "gpt-5-mini", api_key: Optional[str] = None):
         super().__init__("openai", model, api_key)
 
 
@@ -245,9 +236,14 @@ class DeepSeekOrchestrator(APIOrchestrator):
 class QwenOrchestrator(APIOrchestrator):
     """Convenience wrapper for Qwen models."""
     
-    def __init__(self, model: str = "qwen-max", api_key: Optional[str] = None):
+    def __init__(self, model: str = "qwen3-max", api_key: Optional[str] = None):
         super().__init__("qwen", model, api_key)
 
+class XaiOrchestrator(APIOrchestrator):
+    """Convenience wrapper for Grok models."""
+    
+    def __init__(self, model: str = "grok-4-1-fast-non-reasoning", api_key: Optional[str] = None):
+        super().__init__("xai", model, api_key)
 
 def _normalize_model(provider: str, model: str) -> str:
     """Map friendly/legacy model names to provider-supported ones."""
@@ -273,7 +269,8 @@ def create_api_orchestrator(provider: str, model: str, api_key: Optional[str] = 
         APIOrchestrator instance
     """
     provider = provider.lower()
-    
+    if provider in ["grok", "grok4", "grok-4", "grok-4-1"]:
+        provider = "xai"
     model = _normalize_model(provider, model)
 
     if provider == "openai":
@@ -282,6 +279,8 @@ def create_api_orchestrator(provider: str, model: str, api_key: Optional[str] = 
         return DeepSeekOrchestrator(model, api_key)
     elif provider == "qwen":
         return QwenOrchestrator(model, api_key)
+    elif provider == "xai":
+        return XaiOrchestrator(model, api_key)
     else:
         # Generic API orchestrator
         return APIOrchestrator(provider, model, api_key)
@@ -289,4 +288,4 @@ def create_api_orchestrator(provider: str, model: str, api_key: Optional[str] = 
 
 if __name__ == "__main__":
     print("API Orchestrator module loaded.")
-    print("Available providers: openai, deepseek, qwen")
+    print("Available providers: openai, deepseek, qwen, xai")

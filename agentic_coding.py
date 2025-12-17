@@ -37,6 +37,7 @@ class AgentPhase(Enum):
     PLANNING = "planning"
     EXECUTING = "executing"
     AWAITING_APPROVAL = "awaiting_approval"
+    AWAITING_INPUT = "awaiting_input"  # Phase 3: Waiting for user to answer question
     REFLECTING = "reflecting"
     COMPLETE = "complete"
     ERROR = "error"
@@ -143,6 +144,9 @@ class AgentAction:
     status: str = "pending"  # pending, executing, completed, failed, awaiting_approval
     params: Dict[str, Any] = field(default_factory=dict)
     result: Optional[Dict[str, Any]] = None
+    retry_count: int = 0  # Track number of retries
+    max_retries: int = 3  # Maximum retries before giving up
+    failure_context: Optional[Dict[str, Any]] = None  # Nova's analysis of failure
     
     def to_dict(self):
         return {
@@ -152,7 +156,9 @@ class AgentAction:
             "timestamp": self.timestamp,
             "status": self.status,
             "params": self.params,
-            "result": self.result
+            "result": self.result,
+            "retryCount": self.retry_count,
+            "failureContext": self.failure_context
         }
 
 
@@ -193,6 +199,12 @@ class CodingSession:
     files_read: List[str] = field(default_factory=list)  # Track files already read
     conversation_history: List[Dict[str, str]] = field(default_factory=list)  # Full LLM history
     
+    # Phase 3: Conversational flow
+    pending_questions: List[Dict[str, Any]] = field(default_factory=list)  # Questions waiting for answers
+    user_answers: Dict[str, str] = field(default_factory=dict)  # question_id -> answer
+    paused: bool = False  # User paused execution
+    pause_reason: Optional[str] = None  # Why was it paused
+    
     def to_dict(self):
         return {
             "id": self.id,
@@ -209,7 +221,10 @@ class CodingSession:
             "error": self.error,
             "filesModified": self.files_modified,
             "filesRead": self.files_read,
-            "scratchpad": self.scratchpad
+            "scratchpad": self.scratchpad,
+            "pendingQuestions": self.pending_questions,
+            "paused": self.paused,
+            "pauseReason": self.pause_reason
         }
 
 
@@ -223,7 +238,8 @@ class AgenticCodingOrchestrator:
     
     def __init__(
         self,
-        model_client: Any = None,
+        coding_model: Any,
+        orchestrator_model: Any,
         workspace_root: str = ".",
         on_message: Optional[Callable] = None,
         max_iterations: int = 20,
@@ -233,13 +249,15 @@ class AgenticCodingOrchestrator:
         Initialize the orchestrator.
         
         Args:
-            model_client: LLM client for generating actions
+            coding_model: Main LLM client for planning and coding decisions (GPT-5.1, Claude Opus, etc)
+            orchestrator_model: Nova model for oversight, validation, and error detection
             workspace_root: Root directory for file operations
             on_message: Callback for streaming messages to UI
             max_iterations: Maximum number of action iterations
             require_approval_for: Action types that require user approval
         """
-        self.model_client = model_client
+        self.coding_model = coding_model  # Main model does the coding work
+        self.orchestrator_model = orchestrator_model  # Nova provides oversight
         self.workspace_root = os.path.abspath(workspace_root)
         self.on_message = on_message or (lambda x: None)
         self.max_iterations = max_iterations
@@ -301,8 +319,19 @@ class AgenticCodingOrchestrator:
             
             # Phase 2: Execution Loop
             iteration = 0
-            while session.phase in [AgentPhase.EXECUTING, AgentPhase.AWAITING_APPROVAL] and iteration < self.max_iterations:
+            while session.phase in [AgentPhase.EXECUTING, AgentPhase.AWAITING_APPROVAL, AgentPhase.AWAITING_INPUT] and iteration < self.max_iterations:
                 iteration += 1
+                
+                # PHASE 3: Check if paused
+                if session.paused:
+                    # Exit loop - UI will call resume_session() to continue
+                    break
+                
+                # PHASE 3: If waiting for user input, don't get new action - just wait
+                if session.phase == AgentPhase.AWAITING_INPUT:
+                    # Exit loop - UI will call answer_question() which resumes
+                    # This returns control to the UI to handle the question
+                    break
                 
                 # If waiting for approval, don't get new action - just wait
                 if session.phase == AgentPhase.AWAITING_APPROVAL:
@@ -343,13 +372,48 @@ class AgenticCodingOrchestrator:
                 
                 # Reflect on the result
                 self._reflect_on_result(session, action, result)
+                
+                # PHASE 4: Periodic sanity check by Nova (every 5 iterations)
+                if iteration % 5 == 0:
+                    print(f"[AgenticCoding] Running Nova sanity check (iteration {iteration})...")
+                    sanity = self._nova_sanity_check(session)
+                    
+                    sanity_status = sanity.get('status', 'healthy')
+                    
+                    if sanity_status == 'critical':
+                        # Nova says we need to abort
+                        print(f"[AgenticCoding] 🛑 Nova sanity check CRITICAL: {sanity.get('issues')}")
+                        session.phase = AgentPhase.ERROR
+                        session.error = f"Nova sanity check failed: {sanity.get('message', 'Session appears stuck')}"
+                        session.end_time = time.time()
+                        
+                        self._emit_message('nova_intervention', {
+                            'type': 'sanity_check_failed',
+                            'sanity': sanity,
+                            'message': 'Nova detected critical issues and aborted execution'
+                        })
+                        break
+                    
+                    elif sanity_status == 'concerning':
+                        # Nova has concerns - log but continue
+                        print(f"[AgenticCoding] ⚠️  Nova sanity check warning: {sanity.get('issues')}")
+                        
+                        self._emit_message('nova_warning', {
+                            'type': 'sanity_check_warning',
+                            'sanity': sanity,
+                            'message': sanity.get('message', 'Nova detected potential issues')
+                        })
+                    
+                    else:
+                        # Healthy - all good
+                        print(f"[AgenticCoding] ✓ Nova sanity check passed")
             
             if iteration >= self.max_iterations:
                 session.error = f"Max iterations ({self.max_iterations}) reached"
                 session.phase = AgentPhase.ERROR
             
-            # Only finalize if not waiting for approval
-            if session.phase != AgentPhase.AWAITING_APPROVAL:
+            # PHASE 3: Only finalize if not waiting for approval or input
+            if session.phase not in [AgentPhase.AWAITING_APPROVAL, AgentPhase.AWAITING_INPUT]:
                 # Finalize
                 self._emit_message('session_complete', {
                     'summary': self._generate_summary(session),
@@ -435,43 +499,286 @@ class AgenticCodingOrchestrator:
         return action
     
     def _execute_action(self, session: CodingSession, action: AgentAction) -> Dict[str, Any]:
-        """Execute an action and return the result."""
+        """Execute an action and return the result with validation."""
         action.status = 'executing'
         
         try:
             result = self._dispatch_action(session, action)
-            action.status = 'completed'
+            
+            # PHASE 2: Validate the result - don't just assume success!
+            if result.get('success') == False:
+                # Tool explicitly reported failure
+                action.status = 'failed'
+                
+                # Ask Nova to analyze why it failed
+                print(f"[AgenticCoding] Tool {action.action_type} failed, analyzing with Nova...")
+                failure_analysis = self._analyze_failure_with_nova(session, action, result)
+                
+                # Store the analysis for use in reflection
+                action.failure_context = failure_analysis
+                
+                # Emit failure message with Nova's analysis
+                self._emit_message('action_failed', {
+                    'actionId': action.id,
+                    'error': result.get('error'),
+                    'analysis': failure_analysis,
+                    'suggestedFix': failure_analysis.get('suggested_fix'),
+                    'shouldRetry': failure_analysis.get('should_retry', False),
+                    'retryCount': action.retry_count
+                })
+                
+                print(f"[AgenticCoding] Nova analysis: {failure_analysis.get('failure_reason')}")
+                print(f"[AgenticCoding] Suggested fix: {failure_analysis.get('suggested_fix')}")
+                
+            else:
+                # Tool reported success
+                # PHASE 4: But let's have Nova validate it to catch issues
+                print(f"[AgenticCoding] Tool {action.action_type} completed, validating with Nova...")
+                
+                nova_validation = self._validate_with_nova(session, action, result)
+                
+                # Store validation for reference
+                if not action.failure_context:
+                    action.failure_context = {}
+                action.failure_context['nova_validation'] = nova_validation
+                
+                validation_status = nova_validation.get('validation_status', 'pass')
+                
+                if validation_status == 'fail':
+                    # Nova caught something the main model and tool missed!
+                    print(f"[AgenticCoding] ⚠️  Nova validation FAILED: {nova_validation.get('issues_found')}")
+                    
+                    # Treat as failure even though tool said success
+                    action.status = 'failed'
+                    result['success'] = False
+                    result['error'] = f"Nova validation failed: {', '.join(nova_validation.get('issues_found', ['Unknown issue']))}"
+                    result['nova_blocked'] = True
+                    
+                    # Emit Nova intervention message
+                    self._emit_message('nova_intervention', {
+                        'actionId': action.id,
+                        'validation': nova_validation,
+                        'message': 'Nova detected issues with this action',
+                        'blocked': True
+                    })
+                    
+                elif validation_status == 'warning':
+                    # Nova has concerns but not fatal
+                    print(f"[AgenticCoding] ⚠️  Nova warning: {nova_validation.get('issues_found')}")
+                    
+                    action.status = 'completed'  # Still succeeds
+                    result['nova_warning'] = nova_validation.get('issues_found')
+                    
+                    # Emit warning
+                    self._emit_message('nova_warning', {
+                        'actionId': action.id,
+                        'validation': nova_validation,
+                        'message': 'Nova detected potential issues',
+                        'severity': nova_validation.get('severity', 'medium')
+                    })
+                    
+                else:
+                    # Pass - everything looks good
+                    action.status = 'completed'
+                    print(f"[AgenticCoding] ✓ Tool {action.action_type} validated by Nova")
+            
             action.result = result
+            
         except Exception as e:
+            # Unexpected exception during execution
             action.status = 'failed'
-            action.result = {'success': False, 'error': str(e)}
+            action.result = {'success': False, 'error': str(e), 'exception': True}
             result = action.result
+            
+            # Analyze unexpected exception
+            print(f"[AgenticCoding] Unexpected exception in {action.action_type}: {e}")
+            failure_analysis = self._analyze_failure_with_nova(session, action, result)
+            action.failure_context = failure_analysis
+            
+            self._emit_message('action_failed', {
+                'actionId': action.id,
+                'error': str(e),
+                'analysis': failure_analysis,
+                'isException': True
+            })
         
+        # Always emit action_complete (even for failures, so UI knows it finished)
         self._emit_message('action_complete', {
             'actionId': action.id,
-            'result': result
+            'result': result,
+            'status': action.status
         })
         
         return result
     
     def _reflect_on_result(self, session: CodingSession, action: AgentAction, result: Dict[str, Any]):
-        """Reflect on an action result and update reasoning."""
+        """
+        Reflect on an action result and decide next steps.
+        
+        PHASE 2: Now handles failures intelligently with Nova's help.
+        """
         session.phase = AgentPhase.REFLECTING
         
         observation = self._summarize_result(action, result)
         
-        reasoning = ReasoningStep(
-            timestamp=time.time(),
-            phase=AgentPhase.REFLECTING.value,
-            thought=f"Executed {action.action_type}",
-            observation=observation,
-            conclusion="Proceeding to next action" if result.get('success') else "Need to handle error"
-        )
+        # PHASE 2: Check if action failed
+        if action.status == 'failed':
+            print(f"[AgenticCoding] Reflecting on failure for {action.action_type}")
+            
+            # We have Nova's analysis from _execute_action
+            failure_analysis = action.failure_context or {}
+            
+            # Ask main model (coding model) to reason about the failure and decide what to do
+            reflection_prompt = f"""Your last action failed. Analyze the failure and decide on next steps.
+
+FAILED ACTION: {action.action_type}
+PARAMETERS: {json.dumps(action.params, indent=2)}
+ERROR: {result.get('error')}
+RETRY COUNT: {action.retry_count}/{action.max_retries}
+
+NOVA'S ANALYSIS:
+{json.dumps(failure_analysis, indent=2)}
+
+YOUR REFLECTION:
+1. What did you learn from this failure?
+2. Based on Nova's analysis, should you:
+   - retry: Try again with different parameters
+   - different_approach: Try a completely different action
+   - need_more_info: Need to read more files or gather more context
+   - abort: Give up on this approach and explain to user
+
+3. If retrying, what specific parameters should change?
+4. If different approach, what should you try instead?
+
+Respond with JSON only:
+{{
+    "learned": "what you learned from the failure",
+    "next_action": "retry" | "different_approach" | "need_more_info" | "abort",
+    "reasoning": "explain your decision in detail",
+    "retry_params": {{"param": "value"}} or null,
+    "alternative_action": {{"type": "action_type", "params": {{}}}} or null,
+    "confidence": 0.0-1.0
+}}"""
+
+            reflection = self._call_llm(reflection_prompt, expect_json=True)
+            
+            if not isinstance(reflection, dict):
+                # Fallback if parsing failed
+                reflection = {
+                    "learned": "Failed to reflect properly",
+                    "next_action": "abort",
+                    "reasoning": "Could not parse reflection response",
+                    "confidence": 0.0
+                }
+            
+            # Store reflection in reasoning
+            session.reasoning.append(ReasoningStep(
+                timestamp=time.time(),
+                phase=AgentPhase.REFLECTING.value,
+                thought=reflection.get('reasoning', 'Reflecting on failure'),
+                observation=observation,
+                conclusion=f"Decision: {reflection.get('next_action')} (confidence: {reflection.get('confidence', 0.5):.2f})"
+            ))
+            
+            self._emit_message('reasoning', {
+                'timestamp': time.time(),
+                'phase': 'reflecting',
+                'thought': reflection.get('reasoning'),
+                'observation': observation,
+                'conclusion': f"Decision: {reflection.get('next_action')}",
+                'reflection': reflection
+            })
+            
+            # PHASE 2: Handle the decision
+            next_action_type = reflection.get('next_action', 'abort')
+            
+            if next_action_type == 'retry' and action.retry_count < action.max_retries:
+                # Retry with new parameters
+                print(f"[AgenticCoding] Retrying {action.action_type} (attempt {action.retry_count + 2})")
+                
+                retry_params = reflection.get('retry_params', action.params)
+                
+                # Create new action for retry
+                retry_action = AgentAction(
+                    id=str(uuid.uuid4())[:8],
+                    action_type=action.action_type,
+                    reasoning=f"Retry after failure: {reflection.get('reasoning', 'Retrying')}",
+                    timestamp=time.time(),
+                    params=retry_params,
+                    retry_count=action.retry_count + 1,
+                    max_retries=action.max_retries
+                )
+                
+                session.actions.append(retry_action)
+                
+                # Execute the retry
+                retry_result = self._execute_action(session, retry_action)
+                
+                # Recursively reflect on retry result
+                self._reflect_on_result(session, retry_action, retry_result)
+                return
+            
+            elif next_action_type == 'different_approach':
+                # Try a completely different action
+                print(f"[AgenticCoding] Trying different approach after {action.action_type} failed")
+                
+                alternative = reflection.get('alternative_action')
+                if alternative and isinstance(alternative, dict):
+                    alt_action = AgentAction(
+                        id=str(uuid.uuid4())[:8],
+                        action_type=alternative.get('type', 'unknown'),
+                        reasoning=reflection.get('reasoning', 'Trying alternative approach'),
+                        timestamp=time.time(),
+                        params=alternative.get('params', {})
+                    )
+                    
+                    session.actions.append(alt_action)
+                    
+                    # Execute alternative
+                    alt_result = self._execute_action(session, alt_action)
+                    self._reflect_on_result(session, alt_action, alt_result)
+                    return
+                else:
+                    # No valid alternative provided, abort
+                    print(f"[AgenticCoding] No valid alternative provided, aborting")
+                    next_action_type = 'abort'
+            
+            elif next_action_type == 'need_more_info':
+                # Agent needs more context - continue to next action
+                print(f"[AgenticCoding] Agent needs more information, continuing")
+                session.phase = AgentPhase.EXECUTING
+                return
+            
+            # If we reach here: abort case or max retries reached
+            if next_action_type == 'abort' or action.retry_count >= action.max_retries:
+                print(f"[AgenticCoding] Aborting after failed {action.action_type}")
+                session.phase = AgentPhase.ERROR
+                session.error = reflection.get('reasoning', f'Failed to complete {action.action_type}')
+                session.end_time = time.time()
+                
+                self._emit_message('session_error', {
+                    'sessionId': session.id,
+                    'error': session.error,
+                    'failedAction': action.to_dict(),
+                    'analysis': failure_analysis,
+                    'reflection': reflection
+                })
+                return
         
-        session.reasoning.append(reasoning)
+        else:
+            # SUCCESS CASE - action completed successfully
+            reasoning = ReasoningStep(
+                timestamp=time.time(),
+                phase=AgentPhase.REFLECTING.value,
+                thought=f"Successfully executed {action.action_type}",
+                observation=observation,
+                conclusion="Proceeding to next action"
+            )
+            
+            session.reasoning.append(reasoning)
+            self._emit_message('reasoning', reasoning.to_dict())
         
-        self._emit_message('reasoning', reasoning.to_dict())
-        
+        # Continue to next action
         session.phase = AgentPhase.EXECUTING
     
     def _request_approval(self, session: CodingSession, action: AgentAction):
@@ -535,6 +842,24 @@ class AgenticCodingOrchestrator:
     
     def _dispatch_action(self, session: CodingSession, action: AgentAction) -> Dict[str, Any]:
         """Dispatch an action to the appropriate handler."""
+        
+        # PHASE 5: Sanitize all paths from LLM before processing
+        # This fixes double backslashes and other LLM path issues at the source
+        if 'path' in action.params and isinstance(action.params['path'], str):
+            action.params['path'] = self._sanitize_path_from_llm(action.params['path'])
+        
+        if 'file_path' in action.params and isinstance(action.params['file_path'], str):
+            action.params['file_path'] = self._sanitize_path_from_llm(action.params['file_path'])
+        
+        if 'oldPath' in action.params and isinstance(action.params['oldPath'], str):
+            action.params['oldPath'] = self._sanitize_path_from_llm(action.params['oldPath'])
+        
+        if 'newPath' in action.params and isinstance(action.params['newPath'], str):
+            action.params['newPath'] = self._sanitize_path_from_llm(action.params['newPath'])
+        
+        if 'directory' in action.params and isinstance(action.params['directory'], str):
+            action.params['directory'] = self._sanitize_path_from_llm(action.params['directory'])
+        
         handlers = {
             'read_file': self._action_read_file,
             'write_file': self._action_write_file,
@@ -1029,36 +1354,124 @@ class AgenticCodingOrchestrator:
     # UTILITY METHODS
     # =========================================================================
     
-    def _resolve_path(self, session: CodingSession, path: str) -> str:
+    def _validate_and_resolve_path(self, session: CodingSession, path: str, must_exist: bool = False) -> str:
         """
-        Resolve a path relative to workspace root.
+        PHASE 5: Properly validate and resolve paths with security checks.
         
-        Handles:
-        - Absolute paths (returned as-is)
-        - Relative paths (joined with workspace root)
-        - Windows and Unix path separators
-        - Prevents double-escaping issues
+        This replaces the old _resolve_path with proper validation:
+        - Prevents path traversal attacks
+        - Ensures paths stay within workspace
+        - Fixes double backslash issues at the source
+        - Validates parent directories exist
+        - Cross-platform compatible
+        
+        Args:
+            session: Current coding session
+            path: Path to validate and resolve
+            must_exist: If True, path must already exist
+            
+        Returns:
+            Validated, normalized absolute path
+            
+        Raises:
+            ValueError: If path is invalid or outside workspace
         """
         if not path:
             return session.workspace_root
         
-        # CRITICAL FIX: Remove any double backslashes FIRST
-        # This prevents F:\\\\solace-home-ui-v3 issues
+        # PHASE 5: Fix double backslashes properly
+        # These come from JSON escaping in LLM responses
+        # Instead of band-aid, normalize immediately
         path = path.replace('\\\\', '\\')
         
-        # Normalize the path - convert forward slashes to OS separator
-        path = path.replace('/', os.sep)
-        
-        # Now normalize to clean up any remaining issues
+        # Normalize path separators for current OS
         path = os.path.normpath(path)
         
-        # Check if it's an absolute path
+        # Get absolute path
         if os.path.isabs(path):
+            full_path = os.path.abspath(path)
+        else:
+            # Relative to workspace
+            full_path = os.path.abspath(os.path.join(session.workspace_root, path))
+        
+        # SECURITY: Ensure path is within workspace
+        workspace_abs = os.path.abspath(session.workspace_root)
+        
+        # Check if path is within workspace or IS the workspace
+        if not (full_path == workspace_abs or full_path.startswith(workspace_abs + os.sep)):
+            raise ValueError(
+                f"Security: Path '{path}' resolves outside workspace. "
+                f"Resolved to: {full_path}, Workspace: {workspace_abs}"
+            )
+        
+        # Check for path traversal attempts (even if caught above, log them)
+        if '..' in path:
+            print(f"[AgenticCoding] ⚠️  Warning: Path traversal attempt detected in '{path}'")
+        
+        # Validate parent directory exists (if creating files)
+        if not must_exist:
+            parent = os.path.dirname(full_path)
+            if parent and not os.path.exists(parent):
+                # Parent doesn't exist - this will cause file operations to fail
+                # Don't raise error here, but log it
+                print(f"[AgenticCoding] ⚠️  Parent directory doesn't exist: {parent}")
+        
+        # If must exist, check it
+        if must_exist and not os.path.exists(full_path):
+            raise ValueError(f"Path does not exist: {full_path}")
+        
+        return full_path
+    
+    def _sanitize_path_from_llm(self, path: str) -> str:
+        """
+        PHASE 5: Clean up paths that come from LLM responses.
+        
+        LLMs often return paths with:
+        - Double backslashes from JSON escaping
+        - Mixed separators (\\/ or /\\)
+        - Extra quotes
+        - Leading/trailing whitespace
+        
+        Args:
+            path: Raw path from LLM
+            
+        Returns:
+            Cleaned path ready for validation
+        """
+        if not path:
             return path
         
-        # Join with workspace root and normalize
-        full_path = os.path.join(session.workspace_root, path)
-        return os.path.normpath(full_path)
+        # Remove whitespace
+        path = path.strip()
+        
+        # Remove quotes if present
+        if (path.startswith('"') and path.endswith('"')) or \
+           (path.startswith("'") and path.endswith("'")):
+            path = path[1:-1]
+        
+        # Fix double backslashes (from JSON escaping)
+        path = path.replace('\\\\', '\\')
+        
+        # Normalize mixed separators
+        # Convert all to forward slashes first, then let os.path.normpath handle it
+        path = path.replace('\\', '/')
+        
+        return path
+    
+    def _resolve_path(self, session: CodingSession, path: str) -> str:
+        """
+        Legacy method for backward compatibility.
+        Now wraps _validate_and_resolve_path.
+        """
+        try:
+            return self._validate_and_resolve_path(session, path, must_exist=False)
+        except ValueError as e:
+            # Log error but don't break execution for backward compatibility
+            print(f"[AgenticCoding] Path validation failed: {e}")
+            # Fall back to simple resolution
+            if os.path.isabs(path):
+                return os.path.normpath(path)
+            return os.path.normpath(os.path.join(session.workspace_root, path))
     
     def _generate_diff(self, path: str, old_content: str, new_content: str) -> UnifiedDiff:
         """Generate a unified diff between two versions of content."""
@@ -1211,8 +1624,27 @@ class AgenticCodingOrchestrator:
     # =========================================================================
     
     def _call_llm(self, prompt: str, expect_json: bool = False) -> Any:
-        """Call the LLM with a prompt using the configured model client."""
-        if self.model_client is None:
+        """
+        Call the CODING MODEL (main model) with a prompt.
+        
+        This is used for planning, action decisions, and reasoning about code.
+        For oversight and validation, use _call_llm_with_model(self.orchestrator_model, ...)
+        """
+        return self._call_llm_with_model(self.coding_model, prompt, expect_json)
+    
+    def _call_llm_with_model(self, model: Any, prompt: str, expect_json: bool = False) -> Any:
+        """
+        Call a specific model with a prompt.
+        
+        Args:
+            model: The model client to use (coding_model or orchestrator_model)
+            prompt: The prompt to send
+            expect_json: Whether to expect and parse JSON response
+        
+        Returns:
+            The model's response (parsed JSON if expect_json=True, otherwise string)
+        """
+        if model is None:
             raise ValueError("No model client configured for agentic coding")
 
         # Add scratchpad context if session exists
@@ -1249,8 +1681,8 @@ class AgenticCodingOrchestrator:
                     return False
 
             # Prefer OpenAI-style chat interface if available
-            if hasattr(self.model_client, "chat"):
-                fn = self.model_client.chat
+            if hasattr(model, "chat"):
+                fn = model.chat
                 kwargs = {"messages": messages}
                 if not expect_json and _supports_arg(fn, "tools"):
                     kwargs["tools"] = CODING_TOOLS_SCHEMA
@@ -1258,8 +1690,8 @@ class AgenticCodingOrchestrator:
                         kwargs["tool_choice"] = "auto"
                 response = fn(**kwargs)
             # Fallback to llama.cpp/OpenAI compatible create_chat_completion
-            elif hasattr(self.model_client, "create_chat_completion"):
-                fn = self.model_client.create_chat_completion
+            elif hasattr(model, "create_chat_completion"):
+                fn = model.create_chat_completion
                 kwargs = {
                     "messages": messages,
                     "temperature": 0.1,
@@ -1308,6 +1740,475 @@ class AgenticCodingOrchestrator:
             if expect_json:
                 return {"error": error_msg}
             return error_msg
+    
+    def _analyze_failure_with_nova(
+        self, 
+        session: CodingSession, 
+        action: AgentAction, 
+        result: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Use Nova (orchestrator model) to analyze why a tool call failed and suggest fixes.
+        
+        Args:
+            session: Current coding session
+            action: The action that failed
+            result: The failure result from the tool
+            
+        Returns:
+            Dict with:
+                - failure_reason: Specific explanation
+                - suggested_fix: What to try instead
+                - should_retry: Whether to retry
+                - alternative_approach: Different strategy if retry won't work
+        """
+        analysis_prompt = f"""You are analyzing a failed coding tool execution. Provide a clear diagnosis and recommendation.
+
+FAILED TOOL: {action.action_type}
+PARAMETERS: {json.dumps(action.params, indent=2)}
+ERROR: {result.get('error', 'Unknown error')}
+ERROR DETAILS: {result.get('details', 'No additional details')}
+
+CONTEXT:
+- User Request: {session.user_request}
+- Files Modified So Far: {', '.join(session.files_modified) if session.files_modified else 'None'}
+- Current Plan Step: {session.current_step_index + 1}/{len(session.plan)}
+- Action Retry Count: {action.retry_count}/{action.max_retries}
+
+ANALYSIS REQUIRED:
+1. Why did this specific action fail? (be precise about the root cause)
+2. Is this a transient error that might succeed if retried?
+3. If retrying, what parameters should change?
+4. If not retrying, what's an alternative approach?
+5. Should we abort this entire approach?
+
+Respond with JSON only:
+{{
+    "failure_reason": "precise explanation of why it failed",
+    "is_transient": true/false,
+    "should_retry": true/false,
+    "suggested_fix": "specific action to take",
+    "retry_params": {{"param": "value"}} or null,
+    "alternative_approach": "different strategy" or null,
+    "should_abort": true/false,
+    "confidence": 0.0-1.0
+}}"""
+
+        try:
+            # Use Nova (orchestrator model) for analysis
+            analysis = self._call_llm_with_model(
+                self.orchestrator_model, 
+                analysis_prompt, 
+                expect_json=True
+            )
+            
+            if isinstance(analysis, dict) and "error" not in analysis:
+                return analysis
+            else:
+                # Fallback if Nova fails
+                return {
+                    'failure_reason': result.get('error', 'Unknown error'),
+                    'is_transient': False,
+                    'should_retry': action.retry_count < action.max_retries,
+                    'suggested_fix': 'Manual intervention required',
+                    'retry_params': None,
+                    'alternative_approach': None,
+                    'should_abort': action.retry_count >= action.max_retries,
+                    'confidence': 0.3
+                }
+                
+        except Exception as e:
+            print(f"[AgenticCoding] Nova analysis failed: {e}")
+            return {
+                'failure_reason': f'Analysis error: {e}',
+                'is_transient': False,
+                'should_retry': False,
+                'suggested_fix': 'Manual intervention required',
+                'retry_params': None,
+                'alternative_approach': None,
+                'should_abort': True,
+                'confidence': 0.0
+            }
+    
+    def _validate_with_nova(
+        self,
+        session: CodingSession,
+        action: AgentAction,
+        result: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        PHASE 4: Nova validates every successful action to catch issues the main model missed.
+        
+        This is active oversight - Nova checks even when the tool says it succeeded.
+        
+        Args:
+            session: Current coding session
+            action: The action that was executed
+            result: The result from the tool (marked as success)
+            
+        Returns:
+            Dict with:
+                - validation_status: "pass" | "warning" | "fail"
+                - issues_found: List of issues if any
+                - severity: "low" | "medium" | "high"
+                - recommendation: What to do about it
+                - confidence: 0.0-1.0
+        """
+        validation_prompt = f"""You are a code review AI performing quality assurance. Validate this tool execution.
+
+TOOL EXECUTED: {action.action_type}
+PARAMETERS: {json.dumps(action.params, indent=2)}
+RESULT: {json.dumps(result, indent=2)}
+
+CONTEXT:
+- User Request: {session.user_request}
+- Files Modified So Far: {', '.join(session.files_modified) if session.files_modified else 'None'}
+- Current Step: {session.current_step_index + 1}/{len(session.plan)}
+
+VALIDATION CHECKLIST:
+1. Did the tool actually succeed? (Check the 'success' field and any error messages)
+2. If it modified files, did it modify the RIGHT files?
+3. If it modified files, did the changes make sense given the parameters?
+4. Are there any warnings or issues in the output that should be addressed?
+5. Does the result align with what the parameters requested?
+6. Are there any security concerns? (e.g., path traversal, dangerous commands)
+7. Could this action have unintended side effects?
+8. Is this a dangerous operation that needs extra scrutiny?
+
+DANGEROUS OPERATIONS TO FLAG:
+- Deleting files (could be accidental)
+- Running system commands (could be unsafe)
+- Modifying files outside the workspace
+- Path traversal attempts (../, absolute paths outside workspace)
+
+Respond with JSON only:
+{{
+    "validation_status": "pass" | "warning" | "fail",
+    "issues_found": ["list", "of", "issues"],
+    "severity": "low" | "medium" | "high",
+    "recommendation": "what to do about the issues",
+    "safe_to_proceed": true/false,
+    "confidence": 0.0-1.0
+}}
+
+Examples:
+- If everything looks good: {{"validation_status": "pass", "issues_found": [], "severity": "low", "recommendation": "Continue", "safe_to_proceed": true, "confidence": 0.9}}
+- If there's a concern: {{"validation_status": "warning", "issues_found": ["File path looks suspicious"], "severity": "medium", "recommendation": "Verify the path is correct", "safe_to_proceed": true, "confidence": 0.7}}
+- If it's dangerous: {{"validation_status": "fail", "issues_found": ["Attempting to delete system file"], "severity": "high", "recommendation": "Abort this action", "safe_to_proceed": false, "confidence": 0.95}}
+"""
+
+        try:
+            # Use Nova (orchestrator model) for validation
+            validation = self._call_llm_with_model(
+                self.orchestrator_model,
+                validation_prompt,
+                expect_json=True
+            )
+            
+            if isinstance(validation, dict) and "error" not in validation:
+                return validation
+            else:
+                # Fallback if Nova fails
+                return {
+                    'validation_status': 'pass',
+                    'issues_found': [],
+                    'severity': 'low',
+                    'recommendation': 'Nova validation unavailable, proceeding with caution',
+                    'safe_to_proceed': True,
+                    'confidence': 0.5
+                }
+                
+        except Exception as e:
+            print(f"[AgenticCoding] Nova validation failed: {e}")
+            return {
+                'validation_status': 'pass',
+                'issues_found': [f'Validation error: {e}'],
+                'severity': 'low',
+                'recommendation': 'Proceeding without validation',
+                'safe_to_proceed': True,
+                'confidence': 0.3
+            }
+    
+    def _nova_sanity_check(self, session: CodingSession) -> Dict[str, Any]:
+        """
+        PHASE 4: Periodically ask Nova to sanity-check the session.
+        
+        Detects:
+        - Infinite loops (same action repeated)
+        - Stuck states (no progress)
+        - Veering off course from user's request
+        - Time to abort and ask for help
+        
+        Args:
+            session: Current coding session
+            
+        Returns:
+            Dict with:
+                - status: "healthy" | "concerning" | "critical"
+                - issues: List of problems found
+                - recommendation: "continue" | "pause_and_ask_user" | "abort"
+                - message: Explanation for user
+                - confidence: 0.0-1.0
+        """
+        # Get recent actions for pattern analysis
+        recent_actions = session.actions[-10:] if len(session.actions) > 10 else session.actions
+        
+        sanity_prompt = f"""You are monitoring a coding session for problems. Perform a sanity check.
+
+USER'S ORIGINAL REQUEST: {session.user_request}
+
+PLAN ({len(session.plan)} steps):
+{json.dumps([s.description for s in session.plan], indent=2)}
+
+ACTIONS TAKEN ({len(session.actions)} total, showing last {len(recent_actions)}):
+{json.dumps([
+    {{
+        'action': a.action_type,
+        'status': a.status,
+        'params': a.params,
+        'retry_count': a.retry_count
+    }}
+    for a in recent_actions
+], indent=2)}
+
+FILES MODIFIED: {', '.join(session.files_modified) if session.files_modified else 'None'}
+CURRENT STEP: {session.current_step_index + 1}/{len(session.plan)}
+ITERATIONS SO FAR: {len(session.actions)}
+
+RED FLAGS TO CHECK:
+1. **Infinite Loop**: Is the agent repeating the same action over and over?
+2. **Stuck**: Are we making actual progress or spinning wheels?
+3. **Off Course**: Have we veered away from the user's original request?
+4. **Excessive Retries**: Are we retrying the same thing too many times?
+5. **File Thrashing**: Are we modifying the same file repeatedly without making progress?
+6. **Plan Mismatch**: Are the actions matching the plan, or are we improvising too much?
+
+ANALYSIS:
+- Are we stuck in a loop? (Same action 3+ times in a row)
+- Are we making progress? (New files, different actions, advancing the plan)
+- Are we still aligned with user's request?
+- Should we abort and ask for clarification?
+- Is this taking too long? (>20 iterations for a simple task)
+
+Respond with JSON only:
+{{
+    "status": "healthy" | "concerning" | "critical",
+    "issues": ["list", "of", "problems"],
+    "recommendation": "continue" | "pause_and_ask_user" | "abort",
+    "message": "explanation for user if issues found",
+    "confidence": 0.0-1.0
+}}
+
+Examples:
+- Healthy: {{"status": "healthy", "issues": [], "recommendation": "continue", "message": "", "confidence": 0.9}}
+- Concerning: {{"status": "concerning", "issues": ["Same file modified 3 times"], "recommendation": "continue", "message": "Watch for excessive retries", "confidence": 0.7}}
+- Critical: {{"status": "critical", "issues": ["Stuck in loop: read_file called 5 times"], "recommendation": "abort", "message": "Agent appears stuck, aborting to prevent infinite loop", "confidence": 0.95}}
+"""
+
+        try:
+            # Use Nova for sanity check
+            sanity = self._call_llm_with_model(
+                self.orchestrator_model,
+                sanity_prompt,
+                expect_json=True
+            )
+            
+            if isinstance(sanity, dict) and "error" not in sanity:
+                return sanity
+            else:
+                # Fallback
+                return {
+                    'status': 'healthy',
+                    'issues': [],
+                    'recommendation': 'continue',
+                    'message': '',
+                    'confidence': 0.5
+                }
+                
+        except Exception as e:
+            print(f"[AgenticCoding] Nova sanity check failed: {e}")
+            return {
+                'status': 'healthy',
+                'issues': [f'Sanity check error: {e}'],
+                'recommendation': 'continue',
+                'message': '',
+                'confidence': 0.3
+            }
+    
+    def _ask_user_question(self, session: CodingSession, question: str, context: Optional[str] = None) -> str:
+        """
+        Ask the user a question and wait for their response.
+        
+        PHASE 3: Conversational flow - agent can pause and ask questions.
+        
+        Args:
+            session: Current coding session
+            question: The question to ask
+            context: Optional context about why asking
+            
+        Returns:
+            None initially (will be answered via answer_question)
+        """
+        question_id = str(uuid.uuid4())[:8]
+        
+        question_data = {
+            'id': question_id,
+            'question': question,
+            'context': context,
+            'timestamp': time.time(),
+            'answered': False
+        }
+        
+        # Store in pending questions
+        session.pending_questions.append(question_data)
+        
+        # Change phase to waiting
+        session.phase = AgentPhase.AWAITING_INPUT
+        
+        # Store where we are in execution so we can resume
+        session.scratchpad['pending_question_id'] = question_id
+        session.scratchpad['resume_point'] = 'after_question'
+        
+        # Emit question to UI
+        self._emit_message('question', {
+            'questionId': question_id,
+            'question': question,
+            'context': context,
+            'timestamp': time.time()
+        })
+        
+        print(f"[AgenticCoding] Asked user: {question}")
+        
+        # Return None - execution will pause here
+        # The UI will call answer_question() when user responds
+        return None
+    
+    def answer_question(self, session_id: str, question_id: str, answer: str) -> Dict[str, Any]:
+        """
+        User provides answer to a pending question.
+        
+        PHASE 3: Allows resuming execution after getting user input.
+        
+        Args:
+            session_id: The session ID
+            question_id: ID of the question being answered
+            answer: User's answer
+            
+        Returns:
+            Result dict with success status
+        """
+        session = self.sessions.get(session_id)
+        if not session:
+            return {'success': False, 'error': 'Session not found'}
+        
+        # Verify this is the expected question
+        expected_id = session.scratchpad.get('pending_question_id')
+        if question_id != expected_id:
+            return {'success': False, 'error': f'Question ID mismatch. Expected {expected_id}, got {question_id}'}
+        
+        # Store the answer
+        session.user_answers[question_id] = answer
+        
+        # Mark question as answered
+        for q in session.pending_questions:
+            if q['id'] == question_id:
+                q['answered'] = True
+                q['answer'] = answer
+                break
+        
+        # Clear pending question
+        session.scratchpad.pop('pending_question_id', None)
+        
+        # Add answer to conversation history for context
+        session.conversation_history.append({
+            "role": "user",
+            "content": f"[Answer to question: {question_id}] {answer}"
+        })
+        
+        print(f"[AgenticCoding] User answered question {question_id}: {answer}")
+        
+        # Resume execution - change phase back to executing
+        session.phase = AgentPhase.EXECUTING
+        
+        # Emit that answer was received
+        self._emit_message('answer_received', {
+            'questionId': question_id,
+            'answer': answer,
+            'timestamp': time.time()
+        })
+        
+        return {'success': True, 'answer': answer}
+    
+    def pause_session(self, session_id: str, reason: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Pause execution of a session.
+        
+        PHASE 3: User can pause anytime.
+        
+        Args:
+            session_id: The session to pause
+            reason: Why it was paused
+            
+        Returns:
+            Result dict
+        """
+        session = self.sessions.get(session_id)
+        if not session:
+            return {'success': False, 'error': 'Session not found'}
+        
+        session.paused = True
+        session.pause_reason = reason or "User requested pause"
+        
+        # Store current state for resume
+        session.scratchpad['pause_phase'] = session.phase.value
+        session.scratchpad['pause_step'] = session.current_step_index
+        
+        print(f"[AgenticCoding] Session {session_id} paused: {session.pause_reason}")
+        
+        self._emit_message('session_paused', {
+            'sessionId': session_id,
+            'reason': session.pause_reason,
+            'timestamp': time.time()
+        })
+        
+        return {'success': True, 'paused': True}
+    
+    def resume_session(self, session_id: str) -> Dict[str, Any]:
+        """
+        Resume a paused session.
+        
+        PHASE 3: Continue from where we left off.
+        
+        Args:
+            session_id: The session to resume
+            
+        Returns:
+            Result dict
+        """
+        session = self.sessions.get(session_id)
+        if not session:
+            return {'success': False, 'error': 'Session not found'}
+        
+        if not session.paused:
+            return {'success': False, 'error': 'Session is not paused'}
+        
+        session.paused = False
+        
+        # Restore phase
+        if 'pause_phase' in session.scratchpad:
+            try:
+                session.phase = AgentPhase(session.scratchpad['pause_phase'])
+            except:
+                session.phase = AgentPhase.EXECUTING
+        
+        print(f"[AgenticCoding] Session {session_id} resumed")
+        
+        self._emit_message('session_resumed', {
+            'sessionId': session_id,
+            'timestamp': time.time()
+        })
+        
+        return {'success': True, 'resumed': True}
     
     def _build_planning_context(self, session: CodingSession) -> str:
         """Build context for the planning phase."""

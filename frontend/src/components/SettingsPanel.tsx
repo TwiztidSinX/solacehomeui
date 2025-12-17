@@ -118,9 +118,16 @@ const SettingsPanel: React.FC<SettingsPanelProps> = (props) => {
     const contextTokenOptions = [2048, 4096, 8192, 16384, 32768, 65536, 131072];
 
     switch (currentBackend) {
-      case 'llama.cpp':
+      case 'llama-cpp-python':
         return (
           <>
+            <div className="bg-blue-900/30 p-3 rounded border border-blue-500/50 mb-4">
+              <p className="text-sm text-blue-200">
+                🚀 <strong>llama.cpp Server:</strong> Uses the latest llama.cpp features via subprocess.
+                Great for new model architectures like Qwen3-VL!
+              </p>
+            </div>
+
             <label className="block mt-2">Context Tokens</label>
             <select
               value={modelConfigOptions.context_tokens || 8192}
@@ -159,6 +166,28 @@ const SettingsPanel: React.FC<SettingsPanelProps> = (props) => {
               placeholder="35"
             />
 
+            <label className="block mt-2">Max Tokens</label>
+            <input
+              type="number"
+              value={modelConfigOptions.max_tokens || ''}
+              onChange={(e) =>
+                onModelConfigChange('max_tokens', parseInt(e.target.value))
+              }
+              className="w-full p-2 rounded inputfield-background"
+              placeholder="4096"
+            />
+
+            <label className="block mt-2">Threads</label>
+            <input
+              type="number"
+              value={modelConfigOptions.threads || ''}
+              onChange={(e) =>
+                onModelConfigChange('threads', parseInt(e.target.value))
+              }
+              className="w-full p-2 rounded inputfield-background"
+              placeholder="8"
+            />
+
             <label className="block mt-2">Thinking Level</label>
             <select
               value={modelConfigOptions.thinking_level || 'none'}
@@ -172,28 +201,97 @@ const SettingsPanel: React.FC<SettingsPanelProps> = (props) => {
               <option value="medium">Medium</option>
               <option value="high">High</option>
             </select>
+          </>
+        );
 
-            <label className="block mt-2">KV Cache Quantization</label>
+      case 'vllm':
+        return (
+          <>
+            <label className="block mt-2">Context Tokens</label>
             <select
-              value={modelConfigOptions.kv_cache_quant || 'fp16'}
+              value={modelConfigOptions.context_tokens || 8192}
               onChange={(e) =>
-                onModelConfigChange('kv_cache_quant', e.target.value)
+                onModelConfigChange('context_tokens', parseInt(e.target.value))
               }
               className="w-full p-2 rounded inputfield-background"
             >
-              <option value="fp16">FP16</option>
-              <option value="int8">INT8</option>
-              <option value="int4">INT4</option>
+              {contextTokenOptions.map((val) => (
+                <option key={val} value={val}>
+                  {val}
+                </option>
+              ))}
+            </select>
+
+            <label className="block mt-2">Temperature</label>
+            <input
+              type="number"
+              step="0.01"
+              value={modelConfigOptions.temperature || ''}
+              onChange={(e) =>
+                onModelConfigChange('temperature', parseFloat(e.target.value))
+              }
+              className="w-full p-2 rounded inputfield-background"
+              placeholder="0.7"
+            />
+
+            <label className="block mt-2">Max Tokens</label>
+            <input
+              type="number"
+              value={modelConfigOptions.max_tokens || ''}
+              onChange={(e) =>
+                onModelConfigChange('max_tokens', parseInt(e.target.value))
+              }
+              className="w-full p-2 rounded inputfield-background"
+              placeholder="4096"
+            />
+
+            <label className="block mt-2">Tensor Parallel Size</label>
+            <input
+              type="number"
+              value={modelConfigOptions.tensor_parallel_size || ''}
+              onChange={(e) =>
+                onModelConfigChange('tensor_parallel_size', parseInt(e.target.value))
+              }
+              className="w-full p-2 rounded inputfield-background"
+              placeholder="1"
+            />
+
+            <label className="block mt-2">GPU Memory Utilization</label>
+            <input
+              type="number"
+              step="0.05"
+              min="0"
+              max="1"
+              value={modelConfigOptions.gpu_memory_utilization || ''}
+              onChange={(e) =>
+                onModelConfigChange('gpu_memory_utilization', parseFloat(e.target.value))
+              }
+              className="w-full p-2 rounded inputfield-background"
+              placeholder="0.9"
+            />
+
+            <label className="block mt-2">Thinking Level</label>
+            <select
+              value={modelConfigOptions.thinking_level || 'none'}
+              onChange={(e) =>
+                onModelConfigChange('thinking_level', e.target.value)
+              }
+              className="w-full p-2 rounded inputfield-background"
+            >
+              <option value="none">None</option>
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
             </select>
           </>
         );
 
       case 'ollama':
-      case 'safetensors':
+      case 'transformers':
       case 'api':
         return (
           <>
-            {currentBackend !== 'api' && (
+            {(currentBackend as string) !== 'api' && (
               <>
                 <label className="block mt-2">Context Tokens</label>
                 <select
@@ -227,7 +325,7 @@ const SettingsPanel: React.FC<SettingsPanelProps> = (props) => {
               placeholder="0.7"
             />
 
-            {currentBackend === 'api' && (
+            {(currentBackend as string) === 'api' && (
               <>
                 <label className="block mt-2">Max Tokens</label>
                 <input
@@ -245,7 +343,7 @@ const SettingsPanel: React.FC<SettingsPanelProps> = (props) => {
               </>
             )}
 
-            {currentBackend === 'safetensors' && (
+            {(currentBackend as string) === 'transformers' && (
               <>
                 <label className="block mt-2">Use Flash Attention</label>
                 <input
@@ -285,7 +383,7 @@ const SettingsPanel: React.FC<SettingsPanelProps> = (props) => {
               </>
             )}
             
-            {(currentBackend === 'ollama' || currentBackend === 'safetensors') && (
+            {((currentBackend as string) === 'ollama' || (currentBackend as string) === 'transformers') && (
                  <>
                     <label className="block mt-2">Thinking Level</label>
                     <select
@@ -303,7 +401,7 @@ const SettingsPanel: React.FC<SettingsPanelProps> = (props) => {
                  </>
             )}
 
-            {currentBackend === 'ollama' && (
+            {(currentBackend as string) === 'ollama' && (
               <>
                 <div className="setting-section mt-4">
                   <h3 className="text-lg font-semibold mb-2">Ollama Server</h3>
@@ -448,18 +546,25 @@ const SettingsPanel: React.FC<SettingsPanelProps> = (props) => {
 
         <div className="bg-gray-800/50 p-4 rounded-lg mt-4" style={{ backgroundColor: 'var(--primary-color)' }}>
           <h3 className="text-xl mb-2 text-center">Backend Selection</h3>
-          <div className="flex items-center justify-center space-x-4">
-            {['llama.cpp', 'ollama', 'api', 'safetensors'].map((backend) => (
-              <label key={backend} className="inline-flex items-center">
+          <div className="grid grid-cols-3 gap-2 max-w-3xl mx-auto">
+            {[
+              { value: 'llama-cpp-python', label: 'Llama-cpp-python' },
+              { value: 'llama.cpp', label: 'Llama.cpp Server' },
+              { value: 'ollama', label: 'Ollama' },
+              { value: 'transformers', label: 'HF Transformers' },
+              { value: 'vllm', label: 'vLLM' },
+              { value: 'api', label: 'Cloud APIs' }
+            ].map((backend) => (
+              <label key={backend.value} className="inline-flex items-center justify-center">
                 <input
                   type="radio"
                   name="backend"
-                  value={backend}
-                  checked={currentBackend === backend}
-                  onChange={() => onBackendChange(backend)}
+                  value={backend.value}
+                  checked={currentBackend === backend.value}
+                  onChange={() => onBackendChange(backend.value)}
                   className="form-radio h-5 w-5 text-blue-500"
                 />
-                <span className="ml-2">{backend}</span>
+                <span className="ml-2 text-sm">{backend.label}</span>
               </label>
             ))}
           </div>
@@ -607,9 +712,10 @@ const SettingsPanel: React.FC<SettingsPanelProps> = (props) => {
                     })}
                     className="w-full p-2 rounded inputfield-background"
                   >
-                    <option value="openai">OpenAI (GPT-4o-mini recommended)</option>
+                    <option value="openai">OpenAI (GPT-5-mini recommended)</option>
                     <option value="deepseek">DeepSeek (Cheaper alternative)</option>
-                    <option value="qwen">Qwen (API)</option>
+                    <option value="grok">Grok 4.1 Non Reasoning (Cheap alternative)</option>
+                    <option value="qwen">Qwen3-Max (1T Parameter Overkill)</option>
                   </select>
                 </div>
 
@@ -623,7 +729,7 @@ const SettingsPanel: React.FC<SettingsPanelProps> = (props) => {
                       orchestratorApiModel: e.target.value 
                     })}
                     className="w-full p-2 rounded inputfield-background"
-                    placeholder="e.g., gpt-4o-mini, deepseek-chat, qwen-max"
+                    placeholder="e.g., gpt-5-mini, deepseek-chat, grok, qwen3-max"
                   />
                   <p className="text-xs text-gray-400 mt-1">
                     Model name from the API provider
@@ -641,8 +747,9 @@ const SettingsPanel: React.FC<SettingsPanelProps> = (props) => {
                     ⚠️ <strong>Cost Warning:</strong> API orchestrators use paid API calls for every tool decision.
                   </p>
                   <ul className="text-xs text-yellow-100 mt-2 ml-4 list-disc">
-                    <li>OpenAI GPT-4o-mini: ~$0.15 per 1M input tokens</li>
-                    <li>DeepSeek: ~$0.14 per 1M input tokens (cheaper!)</li>
+                    <li>OpenAI GPT-5-mini: ~$0.25 per 1M input tokens</li>
+                    <li>DeepSeek: ~$0.20 per 1M input tokens</li>
+                    <li>Grok 4.1 Non Reasoning: ~$0.20 per 1M input tokens</li>
                     <li>Qwen API: Check dashscope.aliyun.com for pricing</li>
                   </ul>
                 </div>

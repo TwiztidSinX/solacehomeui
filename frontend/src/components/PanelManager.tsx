@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
 import GridLayout, { type Layout } from "react-grid-layout";
 import "react-grid-layout/css/styles.css";
 import "react-resizable/css/styles.css";
@@ -27,96 +28,110 @@ const DEFAULT_LAYOUT: Layout[] = [
   { i: "agent-coding", x: 0, y: 36, w: 12, h: 14, minW: 3 },
 ];
 
-const TOP_ROW_IDS = ["chats", "chat", "code"];
 const COLS = 12;
+const STORAGE_KEY = "solace-panel-layout";
 
-const normalizeTopRow = (
+const rebalanceRow = (
   layout: Layout[],
+  rowY: number,
   changedId?: string,
 ): Layout[] => {
   const next = layout.map((item) => ({ ...item }));
-  const topItems = next.filter((item) => TOP_ROW_IDS.includes(item.i));
-  if (topItems.length === 0) return next;
+  const rowItems = next.filter((item) => item.y === rowY);
+  if (rowItems.length === 0) return next;
 
   const changed = changedId
-    ? topItems.find((item) => item.i === changedId)
+    ? rowItems.find((item) => item.i === changedId)
     : null;
 
-  const sumMinOthers = topItems
-    .filter((item) => item.i !== changedId)
-    .reduce((sum, item) => sum + (item.minW ?? 1), 0);
-
-  if (changed) {
-    // Clamp the changed item so the others can keep their minimum space.
-    const maxAllowed = Math.max(1, COLS - sumMinOthers);
-    if (changed.w > maxAllowed) changed.w = maxAllowed;
+  // If total width fits, just normalize x positions.
+  const totalWidth = rowItems.reduce((sum, item) => sum + item.w, 0);
+  if (totalWidth <= COLS) {
+    let cursor = 0;
+    rowItems
+      .sort((a, b) => a.x - b.x)
+      .forEach((item) => {
+        item.x = cursor;
+        item.y = rowY;
+        cursor += item.w;
+      });
+    return next;
   }
 
-  // After clamping the changed item, redistribute the remaining width across the rest.
-  const totalTopWidth = topItems.reduce((sum, item) => sum + item.w, 0);
-  if (totalTopWidth > COLS) {
-    const excess = totalTopWidth - COLS;
-    const others = topItems.filter((item) => item.i !== changedId);
-    const othersWidth = others.reduce((sum, item) => sum + item.w, 0) || 1;
+  // Distribute width so the row always sums to COLS.
+  if (changed) {
+    const others = rowItems.filter((i) => i.i !== changed.i);
+    const minOthers = others.reduce(
+      (sum, i) => sum + (i.minW ?? 1),
+      0,
+    );
+    const allowedForChanged = Math.max(1, COLS - minOthers);
+    if (changed.w > allowedForChanged) changed.w = allowedForChanged;
+
+    const remaining = COLS - changed.w;
+    const othersWidth = others.reduce((sum, i) => sum + i.w, 0) || 1;
     others.forEach((item, index) => {
-      const share = Math.round((item.w / othersWidth) * excess);
-      const newWidth = Math.max(item.minW ?? 1, item.w - share);
-      item.w = newWidth;
-      // If rounding left us with a mismatch, fix on last iteration.
+      const share = Math.max(
+        item.minW ?? 1,
+        Math.round((item.w / othersWidth) * remaining),
+      );
+      item.w = share;
       if (index === others.length - 1) {
-        const correctedTotal =
-          topItems.reduce((sum, i) => sum + i.w, 0) - (totalTopWidth - COLS);
-        const delta = COLS - correctedTotal;
+        const currentTotal = rowItems.reduce((sum, i) => sum + i.w, 0);
+        const delta = COLS - currentTotal;
         item.w = Math.max(item.minW ?? 1, item.w + delta);
+      }
+    });
+  } else {
+    // Scale all items proportionally.
+    const factor = COLS / totalWidth;
+    rowItems.forEach((item, index) => {
+      const minW = item.minW ?? 1;
+      const scaled = Math.max(minW, Math.round(item.w * factor));
+      item.w = scaled;
+      if (index === rowItems.length - 1) {
+        const currentTotal = rowItems.reduce((sum, i) => sum + i.w, 0);
+        const delta = COLS - currentTotal;
+        item.w = Math.max(minW, item.w + delta);
       }
     });
   }
 
-  // Re-pack the top row so they stay in a single line without overlaps.
+  // Re-pack x positions to keep the row tight.
   let cursor = 0;
-  TOP_ROW_IDS.forEach((id) => {
-    const item = topItems.find((i) => i.i === id);
-    if (!item) return;
-    item.x = cursor;
-    item.y = 0;
-    cursor += item.w;
-  });
-
+  rowItems
+    .sort((a, b) => a.x - b.x)
+    .forEach((item) => {
+      item.x = cursor;
+      item.y = rowY;
+      cursor += item.w;
+    });
   return next;
 };
 
 export const PanelManager: React.FC<PanelManagerProps> = ({ panels, onPanelMoveOrResize }) => {
-
   const [layout, setLayout] = useState<Layout[]>(DEFAULT_LAYOUT);
   const [gridWidth, setGridWidth] = useState<number>(
     typeof window !== "undefined" ? Math.max(window.innerWidth, 1600) : 1600,
   );
+  const [focusedPanelId, setFocusedPanelId] = useState<string | null>(null);
 
   useEffect(() => {
-    const savedLayout = localStorage.getItem("solace-panel-layout");
+    const savedLayout = localStorage.getItem(STORAGE_KEY);
     if (savedLayout) {
       try {
         const parsed = JSON.parse(savedLayout) as Layout[];
-        const sanitized = parsed.map((item) => {
-          const base = item.i === "chat" ? { ...item, static: false } : item;
-          // Reapply sane minimums for top-row items to avoid wrap/drop.
-          if (TOP_ROW_IDS.includes(item.i)) {
-            const defaults = DEFAULT_LAYOUT.find((d) => d.i === item.i);
-            return {
-              ...base,
-              minW: defaults?.minW ?? item.minW,
-              maxW: defaults?.maxW ?? item.maxW,
-            };
-          }
-          return base;
-        });
-        setLayout(normalizeTopRow(sanitized));
+        const sanitized = parsed.map((item) => ({
+          ...item,
+          static: false,
+        }));
+        setLayout(sanitized);
       } catch (error) {
         console.warn("Failed to parse saved layout, using default", error);
-        setLayout(normalizeTopRow(DEFAULT_LAYOUT));
+        setLayout(DEFAULT_LAYOUT);
       }
     } else {
-      setLayout(normalizeTopRow(DEFAULT_LAYOUT));
+      setLayout(DEFAULT_LAYOUT);
     }
   }, []);
 
@@ -126,6 +141,14 @@ export const PanelManager: React.FC<PanelManagerProps> = ({ panels, onPanelMoveO
     window.addEventListener("resize", handleResize);
     return () => window.removeEventListener("resize", handleResize);
   }, []);
+
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    document.body.style.overflow = focusedPanelId ? "hidden" : "";
+    return () => {
+      document.body.style.overflow = "";
+    };
+  }, [focusedPanelId]);
 
   useEffect(() => {
     setLayout((prevLayout) => {
@@ -138,17 +161,21 @@ export const PanelManager: React.FC<PanelManagerProps> = ({ panels, onPanelMoveO
       const nextY =
         prevLayout.reduce((max, item) => Math.max(max, item.y + item.h), 0) ||
         0;
-      const additions = missingPanels.map((panel, index) => ({
-        i: panel.id,
-        x: (index * 4) % 12,
-        y: nextY + index,
-        w: 3,
-        h: 12,
-      }));
+      const additions = missingPanels.map((panel, index) => {
+        const defaults = DEFAULT_LAYOUT.find((d) => d.i === panel.id);
+        if (defaults) return { ...defaults };
+        return {
+          i: panel.id,
+          x: (index * 4) % 12,
+          y: nextY + index,
+          w: 3,
+          h: 12,
+        };
+      });
 
-      const updatedLayout = normalizeTopRow([...prevLayout, ...additions]);
+      const updatedLayout = [...prevLayout, ...additions];
       localStorage.setItem(
-        "solace-panel-layout",
+        STORAGE_KEY,
         JSON.stringify(updatedLayout),
       );
       return updatedLayout;
@@ -169,55 +196,101 @@ export const PanelManager: React.FC<PanelManagerProps> = ({ panels, onPanelMoveO
 
   const handleLayoutChange = (newLayout: Layout[]) => {
     setLayout((prevLayout) => {
-      // Only normalize if a top-row panel changed
-      const topRowChanged = newLayout.some((newItem) => {
-        if (!TOP_ROW_IDS.includes(newItem.i)) return false;
-        const oldItem = prevLayout.find((p) => p.i === newItem.i);
-        if (!oldItem) return false;
-        return oldItem.w !== newItem.w || oldItem.x !== newItem.x;
-      });
-
-      const normalized = topRowChanged ? normalizeTopRow(newLayout) : newLayout;
       const otherItems = prevLayout.filter(
-        (item) => !normalized.find((layoutItem) => layoutItem.i === item.i),
+        (item) => !newLayout.find((layoutItem) => layoutItem.i === item.i),
       );
-      const updatedLayout = [...normalized, ...otherItems];
+      const updatedLayout = [...newLayout, ...otherItems];
       localStorage.setItem(
-        "solace-panel-layout",
+        STORAGE_KEY,
         JSON.stringify(updatedLayout),
       );
       return updatedLayout;
     });
   };
 
+  const handleResizeStop = (_layout: Layout[], _old: Layout, newItem: Layout) => {
+    onPanelMoveOrResize?.(newItem.i);
+    setLayout((prev) => {
+      const next = rebalanceRow(prev, newItem.y, newItem.i);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      return next;
+    });
+  };
+
+  const toggleFocus = (panelId: string) => {
+    setFocusedPanelId((prev) => (prev === panelId ? null : panelId));
+  };
+
+  const focusedPanel = useMemo(
+    () => panels.find((p) => p.id === focusedPanelId),
+    [focusedPanelId, panels],
+  );
+
   return (
-    <GridLayout
-      className="layout"
-      layout={mergedLayout}
-      cols={COLS}
-      rowHeight={32}
-      width={gridWidth}
-      onLayoutChange={handleLayoutChange}
-      draggableHandle=".panel-header"
-      draggableCancel=".panel-content"
-      isBounded={true}
-      compactType="vertical"
-      preventCollision={false}
-      resizeHandles={['s', 'w', 'e', 'n', 'sw', 'nw', 'se', 'ne']}
-      onResizeStop={(_layout, _old, newItem) => {
-        onPanelMoveOrResize?.(newItem.i);
-        setLayout((prev) => normalizeTopRow(prev, newItem.i));
-      }}
-      onDragStop={(_layout, _old, newItem) => {
-        onPanelMoveOrResize?.(newItem.i);
-      }}
-    >
-      {panels.map((panel) => (
-        <div key={panel.id} className="panel-container">
-          <div className="panel-header">{panel.title}</div>
-          <div className="panel-content">{panel.component}</div>
-        </div>
-      ))}
-    </GridLayout>
+    <>
+      {focusedPanelId && focusedPanel && createPortal(
+        <div className="panel-focus-layer">
+          <div
+            className="panel-focus-overlay"
+            onClick={() => toggleFocus(focusedPanelId)}
+          />
+          <div className="panel-focus-shell">
+            <div
+              className="panel-header"
+              onDoubleClick={() => toggleFocus(focusedPanelId)}
+              title="Double-click to exit focus"
+            >
+              <div className="panel-header-title">{focusedPanel.title}</div>
+              <button
+                className="panel-exit-focus"
+                onClick={() => toggleFocus(focusedPanelId)}
+                onMouseDown={(e) => e.stopPropagation()}
+                onDoubleClick={(e) => e.stopPropagation()}
+                type="button"
+              >
+                Exit focus
+              </button>
+            </div>
+            <div className="panel-content">{focusedPanel.component}</div>
+          </div>
+        </div>,
+        document.body,
+      )}
+
+      <GridLayout
+        className="layout"
+        layout={mergedLayout}
+        cols={COLS}
+        rowHeight={32}
+        width={gridWidth}
+        onLayoutChange={handleLayoutChange}
+        draggableHandle=".panel-header"
+        draggableCancel=".panel-content"
+        isBounded={true}
+        compactType={null}
+        preventCollision={false}
+        resizeHandles={['s', 'w', 'e', 'n', 'sw', 'nw', 'se', 'ne']}
+        onResizeStop={handleResizeStop}
+        onDragStop={(_layout, _old, newItem) => {
+          onPanelMoveOrResize?.(newItem.i);
+        }}
+      >
+        {panels.map((panel) => (
+          <div
+            key={panel.id}
+            className={`panel-container${focusedPanelId === panel.id ? " panel-hidden-when-focused" : ""}`}
+          >
+            <div
+              className="panel-header"
+              onDoubleClick={() => toggleFocus(panel.id)}
+              title="Double-click to focus"
+            >
+              <div className="panel-header-title">{panel.title}</div>
+            </div>
+            <div className="panel-content">{panel.component}</div>
+          </div>
+        ))}
+      </GridLayout>
+    </>
   );
 };

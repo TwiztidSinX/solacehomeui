@@ -18,7 +18,7 @@ orchestrator_model = None
 ORCHESTRATOR_CONFIG = {
     "type": "local",  # "local" or "api"
     "api_provider": "openai",  # "openai", "deepseek", or "qwen"
-    "api_model": "gpt-4o-mini",
+    "api_model": "gpt-5-nano",
     "local_model_path": ORCHESTRATOR_MODEL_PATH
 }
 
@@ -37,6 +37,9 @@ def load_config():
                     ORCHESTRATOR_CONFIG['api_provider'] = settings['orchestratorApiProvider']
                 if 'orchestratorApiModel' in settings:
                     ORCHESTRATOR_CONFIG['api_model'] = settings['orchestratorApiModel']
+                p = ORCHESTRATOR_CONFIG['api_provider'].lower()
+                if p in ["grok", "grok4", "grok-4", "grok-4-1"]:
+                    ORCHESTRATOR_CONFIG['api_provider'] = "xai"
                 
                 print(f"📋 Orchestrator config loaded: {ORCHESTRATOR_CONFIG['type']}")
     except Exception as e:
@@ -364,8 +367,7 @@ Remember: Think as much as you need, then output TITLE_START your title TITLE_EN
         response = orchestrator_model.create_chat_completion(
             messages=messages,
             temperature=0.3,
-            max_tokens=200,  # Allow thinking + final title for CoT models
-            stop=["---", "User:", "AI:"]
+            max_tokens=20000  # Allow thinking + final title for CoT models
         )
         raw_content = response.get('choices', [{}])[0].get('message', {}).get('content', '').strip()
 
@@ -687,8 +689,7 @@ Meaningful Facts (if any):"""
         response = orchestrator_model.create_chat_completion(
             messages=messages,
             temperature=0.1,
-            max_tokens=200,
-            stop=["---", "User:", "AI:"]
+            max_tokens=200
         )
 
         raw_content = response.get('choices', [{}])[0].get('message', {}).get('content', '').strip()
